@@ -1,0 +1,5 @@
+.cache/
+emby-transcoder
+config.local.json
+dist/
+tmp/

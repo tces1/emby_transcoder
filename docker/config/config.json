@@ -1,0 +1,36 @@
+{
+  "server": {
+    "listen": ":8097",
+    "public_url": "",
+    "debug": false
+  },
+  "upstream": {
+    "url": "http://127.0.0.1:8096"
+  },
+  "transcode": {
+    "enabled": true,
+    "ffmpeg_path": "/usr/bin/ffmpeg",
+    "temp_dir": "/var/lib/emby-transcoder/transcode",
+    "max_sessions": 2,
+    "buffer_pause_seconds": 300,
+    "buffer_resume_seconds": 120,
+    "idle_timeout_seconds": 60
+  },
+  "clients": [
+    {
+      "name": "emby_android_tv",
+      "match": ["Emby for Android TV", "Android TV"],
+      "transcode": true
+    },
+    {
+      "name": "yamby_tv",
+      "match": ["Yamby"],
+      "transcode": true
+    },
+    {
+      "name": "senplayer_macos",
+      "match": ["SenPlayer"],
+      "transcode": false
+    }
+  ]
+}

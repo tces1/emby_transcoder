@@ -1,0 +1,74 @@
+package transcode
+
+import (
+	"path/filepath"
+	"slices"
+	"testing"
+)
+
+func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testing.T) {
+	session := &Session{
+		ID:                "item123",
+		Dir:               t.TempDir(),
+		StartTimeTicks:    2403356050,
+		SegmentStartIndex: 60,
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	args := buildFFmpegArgs(session, request)
+
+	seekIndex := slices.Index(args, "-ss")
+	if seekIndex < 0 {
+		t.Fatalf("missing -ss in args: %v", args)
+	}
+	if args[seekIndex+1] != "240.335605" {
+		t.Fatalf("seek value = %q", args[seekIndex+1])
+	}
+	inputIndex := slices.Index(args, "-i")
+	if inputIndex < 0 {
+		t.Fatalf("missing -i in args: %v", args)
+	}
+	if seekIndex > inputIndex {
+		t.Fatalf("-ss should be an input seek before -i, args=%v", args)
+	}
+
+	offsetIndex := slices.Index(args, "-output_ts_offset")
+	if offsetIndex < 0 {
+		t.Fatalf("missing -output_ts_offset in args: %v", args)
+	}
+	if args[offsetIndex+1] != "240.335605" {
+		t.Fatalf("offset value = %q", args[offsetIndex+1])
+	}
+	startNumberIndex := slices.Index(args, "-start_number")
+	if startNumberIndex < 0 {
+		t.Fatalf("missing -start_number in args: %v", args)
+	}
+	if args[startNumberIndex+1] != "60" {
+		t.Fatalf("start number = %q", args[startNumberIndex+1])
+	}
+	listSizeIndex := slices.Index(args, "-hls_list_size")
+	if listSizeIndex < 0 || args[listSizeIndex+1] != "0" {
+		t.Fatalf("expected unbounded HLS list size, args=%v", args)
+	}
+	hlsTimeIndex := slices.Index(args, "-hls_time")
+	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "1" {
+		t.Fatalf("expected 1 second HLS segments, args=%v", args)
+	}
+	if args[len(args)-1] != filepath.Join(session.Dir, "master.m3u8") {
+		t.Fatalf("playlist output = %q", args[len(args)-1])
+	}
+}
+
+func TestBuildFFmpegArgsDoesNotThrottleInputWithRealtimeFlag(t *testing.T) {
+	session := &Session{
+		ID:             "item123",
+		Dir:            t.TempDir(),
+		StartTimeTicks: 0,
+	}
+
+	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
+
+	if slices.Contains(args, "-re") {
+		t.Fatalf("ffmpeg args should not include realtime throttling: %v", args)
+	}
+}

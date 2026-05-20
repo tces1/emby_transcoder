@@ -1,0 +1,12 @@
+services:
+  emby-transcoder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: emby-transcoder
+    restart: unless-stopped
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config/config.json:/app/config/config.json:ro
+      - ./data/transcode:/var/lib/emby-transcoder/transcode
