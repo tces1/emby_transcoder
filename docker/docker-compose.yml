@@ -3,6 +3,7 @@ services:
     image: tces1/emby_transcoder:latest
     container_name: emby-transcoder
     restart: unless-stopped
+    privileged: true
     ports:
       - "8097:8097"
     devices:
