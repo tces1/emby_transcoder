@@ -751,7 +751,10 @@ func defaultHardwareProbe(ffmpegPath string, options FFmpegOptions) error {
 		if err := probeFFmpegHWAccel(ffmpegPath, "vaapi"); err != nil {
 			return err
 		}
-		return probeDevice(options.HardwareDevice)
+		if err := probeDevice(options.HardwareDevice); err != nil {
+			return err
+		}
+		return probeFFmpegVAAPIDeviceInit(ffmpegPath, options.HardwareDevice)
 	default:
 		return fmt.Errorf("unsupported hardware decode mode %q", options.HardwareDecode)
 	}
@@ -774,6 +777,32 @@ func probeFFmpegHWAccel(ffmpegPath, name string) error {
 		}
 	}
 	return fmt.Errorf("ffmpeg does not list %s hwaccel", name)
+}
+
+func probeFFmpegVAAPIDeviceInit(ffmpegPath, device string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-init_hw_device", "vaapi=probe:"+device,
+		"-f", "lavfi",
+		"-i", "nullsrc=s=16x16:d=0.1",
+		"-frames:v", "1",
+		"-f", "null",
+		"-",
+	).CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("vaapi device init probe timed out")
+	}
+	if err != nil {
+		if message := strings.TrimSpace(string(output)); message != "" {
+			return fmt.Errorf("vaapi device init probe failed: %w: %s", err, message)
+		}
+		return fmt.Errorf("vaapi device init probe failed: %w", err)
+	}
+	return nil
 }
 
 func probeDevice(device string) error {

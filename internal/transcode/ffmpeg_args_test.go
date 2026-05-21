@@ -2,8 +2,11 @@ package transcode
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -169,6 +172,52 @@ func TestResolveHardwareDecodeFallsBackToSoftwareWhenProbeFails(t *testing.T) {
 
 	if options.HardwareDecode != "" || options.HardwareDevice != "" {
 		t.Fatalf("expected software fallback, options = %+v", options)
+	}
+}
+
+func TestDefaultHardwareProbeRejectsVAAPIWhenDeviceInitializationFails(t *testing.T) {
+	tempDir := t.TempDir()
+	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
+	callsPath := filepath.Join(tempDir, "calls")
+	script := fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %q
+case " $* " in
+  *" -hwaccels "*)
+    printf 'Hardware acceleration methods:\nvaapi\n'
+    exit 0
+    ;;
+  *" -init_hw_device "*)
+    echo 'Failed to initialise VAAPI connection' >&2
+    exit 1
+    ;;
+esac
+exit 0
+`, callsPath)
+	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	devicePath := filepath.Join(tempDir, "renderD128")
+	if err := os.WriteFile(devicePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := defaultHardwareProbe(ffmpegPath, FFmpegOptions{
+		HardwareDecode: "vaapi",
+		HardwareDevice: devicePath,
+	})
+
+	if err == nil {
+		t.Fatal("expected VAAPI device initialization failure")
+	}
+	if !strings.Contains(err.Error(), "vaapi device init probe failed") {
+		t.Fatalf("error = %v", err)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "-init_hw_device vaapi=probe:"+devicePath) {
+		t.Fatalf("ffmpeg calls should initialize the configured VAAPI device, calls=%s", calls)
 	}
 }
 
