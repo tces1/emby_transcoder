@@ -103,14 +103,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.observePlaybackCheckIn(kind, r)
 	}
 
-	if isPlaybackInfoPath(r.URL.Path) && s.cfg.Transcode.Enabled {
+	if isPlaybackInfoPath(r.URL.Path) {
+		itemID := itemIDFromPlaybackPath(r.URL.Path)
+		if !s.cfg.Transcode.Enabled {
+			logging.Infof("playbackinfo passthrough item=%s reason=transcode_disabled", itemID)
+			s.reverseProxy.ServeHTTP(w, r)
+			return
+		}
 		result := policy.ShouldTranscode(r.Header, s.cfg.Clients)
 		if result.Enabled {
-			logging.Infof("playbackinfo rewrite item=%s profile=%s", itemIDFromPlaybackPath(r.URL.Path), result.ProfileName)
+			logging.Infof("playbackinfo rewrite item=%s profile=%s", itemID, result.ProfileName)
 			s.handlePlaybackInfo(w, r)
 			return
 		}
-		logging.Debugf("playbackinfo passthrough item=%s remote=%s user_agent=%q", itemIDFromPlaybackPath(r.URL.Path), r.RemoteAddr, r.Header.Get("User-Agent"))
+		reason := "no_matching_profile"
+		if result.ProfileName != "" {
+			reason = "profile_transcode_disabled"
+		}
+		logging.Infof("playbackinfo passthrough item=%s profile=%s reason=%s", itemID, result.ProfileName, reason)
+		logging.Debugf("playbackinfo passthrough detail item=%s remote=%s user_agent=%q", itemID, r.RemoteAddr, r.Header.Get("User-Agent"))
 	}
 
 	s.reverseProxy.ServeHTTP(w, r)
@@ -170,7 +181,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	logging.Debugf("playbackinfo upstream item=%s status=%d content_type=%q bytes=%d", itemIDFromPlaybackPath(r.URL.Path), resp.StatusCode, resp.Header.Get("Content-Type"), len(respBody))
+	logging.Infof("playbackinfo upstream item=%s status=%d content_type=%q bytes=%d", itemIDFromPlaybackPath(r.URL.Path), resp.StatusCode, resp.Header.Get("Content-Type"), len(respBody))
 
 	copyHeaders(w.Header(), resp.Header)
 	itemID := itemIDFromPlaybackPath(r.URL.Path)
@@ -226,6 +237,11 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 		}
+		if err == nil && !changed {
+			logging.Infof("playbackinfo unchanged item=%s reason=no_media_sources", itemID)
+		}
+	} else {
+		logging.Infof("playbackinfo unchanged item=%s reason=non_json_or_missing_item", itemID)
 	}
 
 	w.WriteHeader(resp.StatusCode)
