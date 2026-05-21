@@ -904,24 +904,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 }
 
 func audioMapArg(session *Session, request Request) string {
-	ordinal := audioOrdinalForRequest(session, request)
-	return fmt.Sprintf("0:a:%d?", ordinal)
-}
-
-func audioOrdinalForRequest(session *Session, request Request) int {
-	if request.AudioStreamIndex < 0 {
-		return 0
-	}
-	media := request.Media
-	if media.IsZero() && session != nil {
-		media = session.Media
-	}
-	for _, stream := range media.AudioStreams {
-		if stream.Index == request.AudioStreamIndex && stream.Ordinal >= 0 {
-			return stream.Ordinal
-		}
-	}
-	return 0
+	return "0:a:0?"
 }
 
 func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {

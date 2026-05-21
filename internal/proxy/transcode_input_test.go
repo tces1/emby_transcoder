@@ -27,7 +27,7 @@ func TestTranscodeInputURLPreservesStartTimeTicks(t *testing.T) {
 	}
 }
 
-func TestTranscodeInputURLStripsAudioStreamIndexForLocalMapping(t *testing.T) {
+func TestTranscodeInputURLPreservesAudioStreamIndexForEmbySelection(t *testing.T) {
 	upstream, err := url.Parse("http://upstream.local")
 	if err != nil {
 		t.Fatal(err)
@@ -36,8 +36,8 @@ func TestTranscodeInputURLStripsAudioStreamIndexForLocalMapping(t *testing.T) {
 
 	got := transcodeInputURL(upstream, "item123", req)
 
-	if strings.Contains(got, "AudioStreamIndex=") {
-		t.Fatalf("input url should not forward AudioStreamIndex to upstream when local ffmpeg maps audio: %s", got)
+	if !strings.Contains(got, "AudioStreamIndex=2") {
+		t.Fatalf("input url should forward AudioStreamIndex so Emby returns the selected audio track: %s", got)
 	}
 	if !strings.Contains(got, "MediaSourceId=source1") || !strings.Contains(got, "X-Emby-Token=abc") {
 		t.Fatalf("input url should preserve non-audio query params: %s", got)

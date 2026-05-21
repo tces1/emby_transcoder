@@ -103,7 +103,7 @@ func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	}
 }
 
-func TestBuildFFmpegArgsMapsRequestedEmbyAudioStreamIndex(t *testing.T) {
+func TestBuildFFmpegArgsMapsFirstAudioStreamReturnedByEmby(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
 		Dir: t.TempDir(),
@@ -125,7 +125,7 @@ func TestBuildFFmpegArgsMapsRequestedEmbyAudioStreamIndex(t *testing.T) {
 	if len(mapIndexes) < 2 {
 		t.Fatalf("missing map args: %v", args)
 	}
-	if got := args[mapIndexes[1]+1]; got != "0:a:1?" {
+	if got := args[mapIndexes[1]+1]; got != "0:a:0?" {
 		t.Fatalf("audio map = %q, args=%v", got, args)
 	}
 }

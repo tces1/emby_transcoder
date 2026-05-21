@@ -242,9 +242,7 @@ func (s *Server) upstreamURL(in *url.URL) string {
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {
 	u := *upstream
 	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
-	query := r.URL.Query()
-	query.Del("AudioStreamIndex")
-	u.RawQuery = query.Encode()
+	u.RawQuery = r.URL.RawQuery
 	return u.String()
 }
 
