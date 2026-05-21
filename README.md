@@ -11,6 +11,7 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 - Client profile matching by `User-Agent` and `X-Emby-Authorization`.
 - PlaybackInfo rewriting for matched profiles.
 - Local FFmpeg HLS sessions under `/streambridge/transcode/`.
+- Audio track selection through Emby `AudioStreamIndex`, mapped to the matching FFmpeg audio stream.
 - Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
 - Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
 

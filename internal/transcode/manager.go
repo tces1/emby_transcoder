@@ -46,6 +46,7 @@ type Request struct {
 	ItemID                  string
 	MediaSourceID           string
 	PlaySessionID           string
+	AudioStreamIndex        int
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
@@ -65,6 +66,7 @@ type Session struct {
 	ItemID                  string
 	MediaSourceID           string
 	PlaySessionID           string
+	AudioStreamIndex        int
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
@@ -153,8 +155,17 @@ type MediaInfo struct {
 	AudioCodec    string
 	AudioChannels int
 	AudioTitle    string
+	AudioStreams  []AudioStreamInfo
 	Bitrate       int64
 	RunTimeTicks  int64
+}
+
+type AudioStreamInfo struct {
+	Index    int
+	Ordinal  int
+	Codec    string
+	Channels int
+	Title    string
 }
 
 func (info MediaInfo) Summary() string {
@@ -191,6 +202,9 @@ func (info MediaInfo) Summary() string {
 		}
 		parts = append(parts, "audio="+audio)
 	}
+	if len(info.AudioStreams) > 0 {
+		parts = append(parts, fmt.Sprintf("audio_streams=%d", len(info.AudioStreams)))
+	}
 	if info.Bitrate > 0 {
 		parts = append(parts, fmt.Sprintf("bitrate=%d", info.Bitrate))
 	}
@@ -204,7 +218,20 @@ func (info MediaInfo) Summary() string {
 }
 
 func (info MediaInfo) IsZero() bool {
-	return info == MediaInfo{}
+	return info.ItemID == "" &&
+		info.SourceID == "" &&
+		info.Name == "" &&
+		info.Path == "" &&
+		info.Container == "" &&
+		info.VideoCodec == "" &&
+		info.Width == 0 &&
+		info.Height == 0 &&
+		info.AudioCodec == "" &&
+		info.AudioChannels == 0 &&
+		info.AudioTitle == "" &&
+		len(info.AudioStreams) == 0 &&
+		info.Bitrate == 0 &&
+		info.RunTimeTicks == 0
 }
 
 func (m *Manager) RememberMedia(id string, info MediaInfo) {
@@ -488,6 +515,9 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.SegmentStartIndex != session.SegmentStartIndex {
 		return true
 	}
+	if request.AudioStreamIndex != session.AudioStreamIndex {
+		return true
+	}
 	return request.InputURL != "" && session.InputURL != "" && request.InputURL != session.InputURL
 }
 
@@ -508,6 +538,7 @@ func touchSession(session *Session, request Request, now time.Time, mediaAccess 
 	if request.PlaySessionID != "" {
 		session.PlaySessionID = request.PlaySessionID
 	}
+	session.AudioStreamIndex = request.AudioStreamIndex
 	session.StartTimeTicks = request.StartTimeTicks
 	session.RequestedStartTimeTicks = request.RequestedStartTimeTicks
 	session.SegmentStartIndex = request.SegmentStartIndex
@@ -764,7 +795,7 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	args := buildFFmpegArgs(session, request, r.Options)
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	logPath := filepath.Join(session.Dir, "ffmpeg.log")
-	logging.Infof("transcode start id=%s segment=%d decode=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(r.Options), logPath)
+	logging.Infof("transcode start id=%s segment=%d decode=%s audio_stream_index=%d audio_map=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(r.Options), request.AudioStreamIndex, audioMapArg(session, request), logPath)
 	logging.Debugf("ffmpeg start id=%s item=%s media_source=%s start_ticks=%d segment_start=%d path=%s input=%s playlist=%s media=%s args=%s", session.ID, session.ItemID, session.MediaSourceID, session.StartTimeTicks, session.SegmentStartIndex, r.Path, redactURLString(request.InputURL), playlist, session.Media.Summary(), redactFFmpegArgs(args))
 	cmd := exec.CommandContext(ctx, r.Path, args...)
 	stdin, err := cmd.StdinPipe()
@@ -845,7 +876,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	args = append(args,
 		"-i", request.InputURL,
 		"-map", "0:v:0",
-		"-map", "0:a:0?",
+		"-map", audioMapArg(session, request),
 		"-c:v", "libx264",
 		"-preset", "veryfast",
 		"-profile:v", "high",
@@ -870,6 +901,27 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		playlist,
 	)
 	return args
+}
+
+func audioMapArg(session *Session, request Request) string {
+	ordinal := audioOrdinalForRequest(session, request)
+	return fmt.Sprintf("0:a:%d?", ordinal)
+}
+
+func audioOrdinalForRequest(session *Session, request Request) int {
+	if request.AudioStreamIndex < 0 {
+		return 0
+	}
+	media := request.Media
+	if media.IsZero() && session != nil {
+		media = session.Media
+	}
+	for _, stream := range media.AudioStreams {
+		if stream.Index == request.AudioStreamIndex && stream.Ordinal >= 0 {
+			return stream.Ordinal
+		}
+	}
+	return 0
 }
 
 func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {

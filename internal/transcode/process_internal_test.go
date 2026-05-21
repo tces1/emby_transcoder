@@ -18,6 +18,16 @@ func TestRequestFromHTTPUsesCurrentPlaySessionIDFallback(t *testing.T) {
 	}
 }
 
+func TestRequestFromHTTPParsesAudioStreamIndex(t *testing.T) {
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?AudioStreamIndex=2", nil)
+
+	request := requestFromHTTP("item123", "http://upstream/stream", req)
+
+	if request.AudioStreamIndex != 2 {
+		t.Fatalf("audio stream index = %d", request.AudioStreamIndex)
+	}
+}
+
 func TestRequestWithSegmentStartUsesRuntimeTicksWhenPresent(t *testing.T) {
 	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00067.ts?actualSegmentLengthTicks=40000000&runtimeTicks=2680123456&X-Emby-Token=abc", nil)
 

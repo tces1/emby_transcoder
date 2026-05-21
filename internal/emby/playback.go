@@ -32,6 +32,7 @@ type SourceReport struct {
 	AudioCodec               string
 	AudioChannels            int
 	AudioTitle               string
+	AudioStreams             []AudioStreamReport
 	Bitrate                  int64
 	RunTimeTicks             int64
 	BeforeSupportsDirectPlay bool
@@ -39,6 +40,14 @@ type SourceReport struct {
 	BeforeDirectStreamURL    string
 	BeforeTranscodingURL     string
 	AfterTranscodingURL      string
+}
+
+type AudioStreamReport struct {
+	Index    int
+	Ordinal  int
+	Codec    string
+	Channels int
+	Title    string
 }
 
 func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string, rawQuery ...string) ([]byte, bool, RewriteReport, error) {
@@ -92,6 +101,7 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 			AudioCodec:               sourceReport.AudioCodec,
 			AudioChannels:            sourceReport.AudioChannels,
 			AudioTitle:               sourceReport.AudioTitle,
+			AudioStreams:             sourceReport.AudioStreams,
 			Bitrate:                  sourceReport.Bitrate,
 			RunTimeTicks:             sourceReport.RunTimeTicks,
 			BeforeSupportsDirectPlay: sourceReport.BeforeSupportsDirectPlay,
@@ -132,6 +142,7 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 	}
 
 	rawStreams, _ := source["MediaStreams"].([]any)
+	audioOrdinal := 0
 	for _, rawStream := range rawStreams {
 		stream, ok := rawStream.(map[string]any)
 		if !ok {
@@ -142,10 +153,21 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 			report.VideoCodec = stringValue(stream, "Codec")
 			report.Width = intValue(stream, "Width")
 			report.Height = intValue(stream, "Height")
-		case strings.EqualFold(stringValue(stream, "Type"), "Audio") && report.AudioCodec == "":
-			report.AudioCodec = stringValue(stream, "Codec")
-			report.AudioChannels = intValue(stream, "Channels")
-			report.AudioTitle = stringValue(stream, "DisplayTitle")
+		case strings.EqualFold(stringValue(stream, "Type"), "Audio"):
+			audio := AudioStreamReport{
+				Index:    intValue(stream, "Index"),
+				Ordinal:  audioOrdinal,
+				Codec:    stringValue(stream, "Codec"),
+				Channels: intValue(stream, "Channels"),
+				Title:    stringValue(stream, "DisplayTitle"),
+			}
+			report.AudioStreams = append(report.AudioStreams, audio)
+			audioOrdinal++
+			if report.AudioCodec == "" {
+				report.AudioCodec = audio.Codec
+				report.AudioChannels = audio.Channels
+				report.AudioTitle = audio.Title
+			}
 		}
 	}
 

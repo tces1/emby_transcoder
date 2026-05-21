@@ -103,6 +103,43 @@ func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsMapsRequestedEmbyAudioStreamIndex(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+		Media: MediaInfo{
+			AudioStreams: []AudioStreamInfo{
+				{Index: 1, Ordinal: 0, Codec: "dts"},
+				{Index: 2, Ordinal: 1, Codec: "aac"},
+			},
+		},
+	}
+	request := Request{
+		InputURL:         "http://upstream/stream?AudioStreamIndex=2",
+		AudioStreamIndex: 2,
+	}
+
+	args := buildFFmpegArgs(session, request)
+
+	mapIndexes := allIndexes(args, "-map")
+	if len(mapIndexes) < 2 {
+		t.Fatalf("missing map args: %v", args)
+	}
+	if got := args[mapIndexes[1]+1]; got != "0:a:1?" {
+		t.Fatalf("audio map = %q, args=%v", got, args)
+	}
+}
+
+func allIndexes(values []string, needle string) []int {
+	var indexes []int
+	for i, value := range values {
+		if value == needle {
+			indexes = append(indexes, i)
+		}
+	}
+	return indexes
+}
+
 func TestResolveHardwareDecodeKeepsVAAPIWhenProbePasses(t *testing.T) {
 	options := resolveHardwareDecodeOptions("/usr/bin/ffmpeg", FFmpegOptions{
 		HardwareDecode: "vaapi",

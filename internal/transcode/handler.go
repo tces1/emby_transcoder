@@ -160,6 +160,8 @@ func (h Handler) sessionForSegment(id string, segmentIndex int, name string, r *
 			traceSwitch("segment_decision id=%s file=%s segment=%d decision=restart reason=process_done old_segment_start=%d old_start_ticks=%d elapsed=%s", id, name, segmentIndex, session.SegmentStartIndex, session.StartTimeTicks, time.Since(requestStarted))
 		case !segmentInputCompatible(session.InputURL, inputURL):
 			traceSwitch("segment_decision id=%s file=%s segment=%d decision=restart reason=input_changed old_input=%s new_input=%s elapsed=%s", id, name, segmentIndex, redactURLString(session.InputURL), redactURLString(inputURL), time.Since(requestStarted))
+		case session.AudioStreamIndex != request.AudioStreamIndex:
+			traceSwitch("segment_decision id=%s file=%s segment=%d decision=restart reason=audio_changed old_audio=%d new_audio=%d elapsed=%s", id, name, segmentIndex, session.AudioStreamIndex, request.AudioStreamIndex, time.Since(requestStarted))
 		case segmentReusable(session, segmentIndex, name):
 			traceSwitch("segment_decision id=%s file=%s segment=%d decision=hit session_start=%d dir=%s elapsed=%s", id, name, segmentIndex, session.SegmentStartIndex, session.Dir, time.Since(requestStarted))
 			h.Manager.RecordSegmentRequest(id, segmentIndex)
@@ -284,6 +286,7 @@ func requestFromHTTP(id string, inputURL string, r *http.Request) Request {
 		ItemID:                  id,
 		MediaSourceID:           query.Get("MediaSourceId"),
 		PlaySessionID:           playSessionID,
+		AudioStreamIndex:        int(int64Query(query.Get("AudioStreamIndex"))),
 		StartTimeTicks:          int64Query(query.Get("StartTimeTicks")),
 		RequestedStartTimeTicks: int64Query(query.Get("StartTimeTicks")),
 	}

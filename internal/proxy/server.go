@@ -201,6 +201,15 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 					Bitrate:       source.Bitrate,
 					RunTimeTicks:  source.RunTimeTicks,
 				}
+				for _, audio := range source.AudioStreams {
+					mediaInfo.AudioStreams = append(mediaInfo.AudioStreams, transcode.AudioStreamInfo{
+						Index:    audio.Index,
+						Ordinal:  audio.Ordinal,
+						Codec:    audio.Codec,
+						Channels: audio.Channels,
+						Title:    audio.Title,
+					})
+				}
 				s.transcodeManager.RememberMedia(source.SessionID, mediaInfo)
 				logging.Debugf(
 					"playbackinfo source item=%s session=%s index=%d source_id=%q before_direct=%t before_transcode=%t had_direct_stream_url=%t had_transcoding_url=%t after=%s media=%s",
@@ -233,7 +242,9 @@ func (s *Server) upstreamURL(in *url.URL) string {
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {
 	u := *upstream
 	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
-	u.RawQuery = r.URL.RawQuery
+	query := r.URL.Query()
+	query.Del("AudioStreamIndex")
+	u.RawQuery = query.Encode()
 	return u.String()
 }
 

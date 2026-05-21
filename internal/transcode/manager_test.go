@@ -195,6 +195,40 @@ func TestManagerRestartsSessionWhenSegmentStartIndexChanges(t *testing.T) {
 	}
 }
 
+func TestManagerRestartsSessionWhenAudioStreamIndexChanges(t *testing.T) {
+	var stopped atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			return stopFunc(func() error {
+				stopped.Add(1)
+				return nil
+			}), nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	first, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream", AudioStreamIndex: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream", AudioStreamIndex: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first == second {
+		t.Fatal("expected a new session when audio stream index changes")
+	}
+	if second.AudioStreamIndex != 2 {
+		t.Fatalf("audio stream index = %d", second.AudioStreamIndex)
+	}
+	if stopped.Load() != 1 {
+		t.Fatalf("stopped = %d", stopped.Load())
+	}
+}
+
 func TestManagerRestartsSessionWhenRequestedStartTimeTicksChangesWithinSameSegment(t *testing.T) {
 	var stopped atomic.Int32
 	m := transcode.NewManager(transcode.Options{
@@ -354,10 +388,10 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 func TestManagerDoesNotPauseImmediatelyForSeekedSession(t *testing.T) {
 	process := &pausingProcess{}
 	m := transcode.NewManager(transcode.Options{
-		MaxSessions:            1,
-		TempDir:                t.TempDir(),
-		BufferPauseThreshold:   5 * time.Second,
-		BufferResumeThreshold:  2 * time.Second,
+		MaxSessions:           1,
+		TempDir:               t.TempDir(),
+		BufferPauseThreshold:  5 * time.Second,
+		BufferResumeThreshold: 2 * time.Second,
 		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
 			return process, nil
 		}),
