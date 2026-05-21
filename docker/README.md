@@ -23,4 +23,6 @@ Edit `config/config.json` before startup:
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set `server.debug` to `true` when you need detailed diagnostics
 
+For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
+
 The transcode cache is stored in `docker/data/transcode`.

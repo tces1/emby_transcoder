@@ -21,7 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/emby_transcoder
+  GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/emby_transcoder
+  DOCKERHUB_IMAGE_NAME: tces1/emby_transcoder
 
 jobs:
   publish:
@@ -41,11 +42,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Derive image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.GHCR_IMAGE_NAME }}
+            ${{ env.DOCKERHUB_IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
