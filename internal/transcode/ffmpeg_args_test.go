@@ -106,6 +106,27 @@ func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsCapsVideoOutputTo1080p(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+
+	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
+
+	vfIndex := slices.Index(args, "-vf")
+	if vfIndex < 0 {
+		t.Fatalf("missing video scale filter: %v", args)
+	}
+	got := args[vfIndex+1]
+	if !strings.Contains(got, "scale=") {
+		t.Fatalf("expected scale filter, got %q", got)
+	}
+	if !strings.Contains(got, "1920") || !strings.Contains(got, "1080") {
+		t.Fatalf("expected 1080p cap in scale filter, got %q", got)
+	}
+}
+
 func TestBuildFFmpegArgsMapsFirstAudioStreamReturnedByEmby(t *testing.T) {
 	session := &Session{
 		ID:  "item123",

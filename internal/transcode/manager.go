@@ -23,6 +23,8 @@ import (
 var ErrTooManySessions = errors.New("too many transcode sessions")
 
 const defaultRestartGraceTimeout = 500 * time.Millisecond
+const maxTranscodeWidth = 1920
+const maxTranscodeHeight = 1080
 
 type Options struct {
 	MaxSessions           int
@@ -933,6 +935,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-i", request.InputURL,
 		"-map", "0:v:0",
 		"-map", audioMapArg(session, request),
+		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2", maxTranscodeWidth, maxTranscodeHeight),
 		"-c:v", "libx264",
 		"-preset", "veryfast",
 		"-profile:v", "high",

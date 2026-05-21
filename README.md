@@ -14,6 +14,7 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 - Audio track selection through Emby `AudioStreamIndex`, with local transcode restart on audio changes.
 - Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
 - Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
+- Video output is capped at 1920x1080 and keeps aspect ratio.
 
 Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
 
