@@ -153,3 +153,12 @@ func TestNewManagerFallsBackToSoftwareDecodeWhenHardwareProbeFails(t *testing.T)
 		t.Fatalf("expected runner to use software decode, options = %+v", runner.Options)
 	}
 }
+
+func TestFFmpegOptionsSummaryLabelsDecodeMode(t *testing.T) {
+	if got := ffmpegOptionsSummary(FFmpegOptions{}); got != "software" {
+		t.Fatalf("software summary = %q", got)
+	}
+	if got := ffmpegOptionsSummary(FFmpegOptions{HardwareDecode: "vaapi", HardwareDevice: "/dev/dri/renderD128"}); got != "vaapi:/dev/dri/renderD128" {
+		t.Fatalf("vaapi summary = %q", got)
+	}
+}

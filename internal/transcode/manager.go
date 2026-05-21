@@ -764,8 +764,8 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	args := buildFFmpegArgs(session, request, r.Options)
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	logPath := filepath.Join(session.Dir, "ffmpeg.log")
-	logging.Infof("transcode start id=%s segment=%d", session.ID, session.SegmentStartIndex)
-	logging.Debugf("ffmpeg start id=%s item=%s media_source=%s start_ticks=%d segment_start=%d path=%s input=%s playlist=%s media=%s", session.ID, session.ItemID, session.MediaSourceID, session.StartTimeTicks, session.SegmentStartIndex, r.Path, redactURLString(request.InputURL), playlist, session.Media.Summary())
+	logging.Infof("transcode start id=%s segment=%d decode=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(r.Options), logPath)
+	logging.Debugf("ffmpeg start id=%s item=%s media_source=%s start_ticks=%d segment_start=%d path=%s input=%s playlist=%s media=%s args=%s", session.ID, session.ItemID, session.MediaSourceID, session.StartTimeTicks, session.SegmentStartIndex, r.Path, redactURLString(request.InputURL), playlist, session.Media.Summary(), redactFFmpegArgs(args))
 	cmd := exec.CommandContext(ctx, r.Path, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -781,7 +781,7 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		_ = logFile.Close()
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
-	logging.Debugf("ffmpeg started id=%s pid=%d", session.ID, cmd.Process.Pid)
+	logging.Infof("ffmpeg started id=%s pid=%d decode=%s", session.ID, cmd.Process.Pid, ffmpegOptionsSummary(r.Options))
 	process := &execProcess{cmd: cmd, logFile: logFile, stdin: stdin, doneCh: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
@@ -797,6 +797,31 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		logging.Debugf("ffmpeg exited id=%s err=nil log=%s", session.ID, logPath)
 	}()
 	return process, nil
+}
+
+func ffmpegOptionsSummary(options FFmpegOptions) string {
+	mode := strings.ToLower(strings.TrimSpace(options.HardwareDecode))
+	if mode == "" || mode == "none" || mode == "off" || mode == "false" {
+		return "software"
+	}
+	device := strings.TrimSpace(options.HardwareDevice)
+	if device == "" {
+		return mode
+	}
+	return mode + ":" + device
+}
+
+func redactFFmpegArgs(args []string) string {
+	redacted := append([]string(nil), args...)
+	for i := 0; i < len(redacted)-1; i++ {
+		switch redacted[i] {
+		case "-i":
+			redacted[i+1] = redactURLString(redacted[i+1])
+		case "-headers":
+			redacted[i+1] = "REDACTED"
+		}
+	}
+	return strings.Join(redacted, " ")
 }
 
 func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions) []string {

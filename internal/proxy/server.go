@@ -135,7 +135,8 @@ func (s *Server) observePlaybackCheckIn(kind string, r *http.Request) {
 	switch kind {
 	case "stopped":
 		stopped := s.transcodeManager.StopPlayback(event)
-		logging.Debugf("playback stopped item=%s play_session=%s stopped_sessions=%d", event.ItemID, event.PlaySessionID, stopped)
+		logging.Infof("playback stopped item=%s stopped_sessions=%d", event.ItemID, stopped)
+		logging.Debugf("playback stopped detail item=%s play_session=%s stopped_sessions=%d", event.ItemID, event.PlaySessionID, stopped)
 	case "playing", "progress":
 		updated := s.transcodeManager.RecordProgress(event)
 		logging.Debugf("playback %s item=%s play_session=%s position_ticks=%d paused=%t updated_sessions=%d", kind, event.ItemID, event.PlaySessionID, event.PositionTicks, event.IsPaused, updated)

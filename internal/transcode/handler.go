@@ -46,9 +46,11 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var session *Session
 	var ok bool
 	if name == "master.m3u8" {
+		logging.Infof("playlist request id=%s start_ticks=%d", id, startTimeTicksFromRawQuery(r.URL.RawQuery))
 		traceSwitch("playlist_request id=%s start_ticks=%d query=%s elapsed=%s", id, startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), time.Since(requestStarted))
 		if info, known := h.Manager.MediaInfo(id); known {
 			if playlist, ready := VirtualVODPlaylist(info, defaultSegmentTicks, r.URL.RawQuery); ready {
+				logging.Infof("playlist virtual id=%s duration=%s", id, formatTicks(info.RunTimeTicks))
 				traceSwitch("playlist_virtual id=%s duration=%s start_ticks=%d query=%s media=%s elapsed=%s", id, formatTicks(info.RunTimeTicks), startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), info.Summary(), time.Since(requestStarted))
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 				w.Header().Set("Cache-Control", "no-store")
@@ -71,6 +73,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		logging.Infof("playlist session id=%s elapsed=%s", id, time.Since(requestStarted))
 		traceSwitch("playlist_session_ready id=%s dir=%s input=%s elapsed=%s", id, session.Dir, redactURLString(inputURL), time.Since(requestStarted))
 	} else if segmentIndex, isSegment := segmentIndexFromName(name); isSegment {
 		var err error
