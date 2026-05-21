@@ -15,6 +15,8 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 - Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
 - Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
 - Video output is capped at 1920x1080 and keeps aspect ratio.
+- PlaybackInfo rewrite prewarms the transcode session before the first playlist request.
+- FFmpeg uses low-latency startup and GOP settings to cut first-segment delay.
 
 Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
 

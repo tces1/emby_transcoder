@@ -27,6 +27,8 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - startup probes VAAPI support, including device initialization, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
 - video output is capped at 1920x1080 while preserving aspect ratio
+- playbackinfo rewrites prewarm the transcode session before the first playlist request
+- ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 
 For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
 

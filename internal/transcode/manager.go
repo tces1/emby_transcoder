@@ -25,6 +25,7 @@ var ErrTooManySessions = errors.New("too many transcode sessions")
 const defaultRestartGraceTimeout = 500 * time.Millisecond
 const maxTranscodeWidth = 1920
 const maxTranscodeHeight = 1080
+const lowLatencyGOP = 25
 
 type Options struct {
 	MaxSessions           int
@@ -956,6 +957,10 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "info",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-analyzeduration", "0",
+		"-probesize", "32k",
 	}
 	if headerText := ffmpegHeaders(request.Headers); headerText != "" {
 		args = append(args, "-headers", headerText)
@@ -971,8 +976,13 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2", maxTranscodeWidth, maxTranscodeHeight),
 		"-c:v", "libx264",
 		"-preset", "veryfast",
+		"-tune", "zerolatency",
 		"-profile:v", "high",
 		"-level", "4.1",
+		"-g", strconv.Itoa(lowLatencyGOP),
+		"-keyint_min", strconv.Itoa(lowLatencyGOP),
+		"-sc_threshold", "0",
+		"-bf", "0",
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "160k",

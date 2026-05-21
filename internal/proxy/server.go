@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"emby-transcoder/internal/config"
 	"emby-transcoder/internal/emby"
@@ -239,6 +240,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 					mediaInfo.Summary(),
 				)
 			}
+			s.prewarmPlaybackInfoTranscode(r, report)
 		}
 		if err == nil && !changed {
 			logging.Infof("playbackinfo unchanged item=%s reason=no_media_sources", itemID)
@@ -256,6 +258,42 @@ func (s *Server) upstreamURL(in *url.URL) string {
 	u.Path = singleJoiningSlash(s.upstream.Path, in.Path)
 	u.RawQuery = in.RawQuery
 	return u.String()
+}
+
+func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.RewriteReport) {
+	if s.transcodeManager == nil || len(report.Sources) == 0 {
+		return
+	}
+	itemID := report.ItemID
+	source := report.Sources[0]
+	inputURL := transcodeInputURL(s.upstream, itemID, r)
+	request := transcode.Request{
+		InputURL:                inputURL,
+		ItemID:                  itemID,
+		MediaSourceID:           source.ID,
+		PlaySessionID:           source.SessionID,
+		StartTimeTicks:          int64Query(r.URL.Query().Get("StartTimeTicks")),
+		RequestedStartTimeTicks: int64Query(r.URL.Query().Get("StartTimeTicks")),
+	}
+	if info, ok := s.transcodeManager.MediaInfo(source.SessionID); ok {
+		request.Media = info
+	}
+	logging.Debugf("playbackinfo prewarm request item=%s source=%s", itemID, source.ID)
+	started := time.Now()
+	go func() {
+		session, err := s.transcodeManager.Ensure(source.SessionID, request)
+		if err != nil {
+			logging.Debugf("playbackinfo prewarm skipped item=%s source=%s err=%v", itemID, source.ID, err)
+			return
+		}
+		logging.Infof("playbackinfo prewarm item=%s source=%s elapsed=%s", itemID, source.ID, time.Since(started))
+		logging.Debugf("playbackinfo prewarm detail item=%s source=%s input=%s session_dir=%s", itemID, source.ID, redactURLString(inputURL), session.Dir)
+	}()
+}
+
+func int64Query(raw string) int64 {
+	value, _ := strconv.ParseInt(raw, 10, 64)
+	return value
 }
 
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {

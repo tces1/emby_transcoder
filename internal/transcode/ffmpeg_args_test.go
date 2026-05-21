@@ -77,6 +77,21 @@ func TestBuildFFmpegArgsDoesNotThrottleInputWithRealtimeFlag(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+
+	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
+
+	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32k", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0"} {
+		if !slices.Contains(args, want) {
+			t.Fatalf("missing low-latency arg %q in %v", want, args)
+		}
+	}
+}
+
 func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
