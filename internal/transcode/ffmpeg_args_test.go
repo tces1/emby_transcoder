@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -99,5 +100,56 @@ func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	}
 	if hwaccelIndex > inputIndex || deviceIndex > inputIndex {
 		t.Fatalf("hardware decode args should be input options before -i: %v", args)
+	}
+}
+
+func TestResolveHardwareDecodeKeepsVAAPIWhenProbePasses(t *testing.T) {
+	options := resolveHardwareDecodeOptions("/usr/bin/ffmpeg", FFmpegOptions{
+		HardwareDecode: "vaapi",
+		HardwareDevice: "/dev/dri/renderD128",
+	}, func(path string, options FFmpegOptions) error {
+		if path != "/usr/bin/ffmpeg" {
+			t.Fatalf("ffmpeg path = %q", path)
+		}
+		if options.HardwareDecode != "vaapi" {
+			t.Fatalf("hardware decode = %q", options.HardwareDecode)
+		}
+		return nil
+	})
+
+	if options.HardwareDecode != "vaapi" || options.HardwareDevice != "/dev/dri/renderD128" {
+		t.Fatalf("options = %+v", options)
+	}
+}
+
+func TestResolveHardwareDecodeFallsBackToSoftwareWhenProbeFails(t *testing.T) {
+	options := resolveHardwareDecodeOptions("/usr/bin/ffmpeg", FFmpegOptions{
+		HardwareDecode: "vaapi",
+		HardwareDevice: "/dev/dri/renderD128",
+	}, func(string, FFmpegOptions) error {
+		return errors.New("device not accessible")
+	})
+
+	if options.HardwareDecode != "" || options.HardwareDevice != "" {
+		t.Fatalf("expected software fallback, options = %+v", options)
+	}
+}
+
+func TestNewManagerFallsBackToSoftwareDecodeWhenHardwareProbeFails(t *testing.T) {
+	manager := NewManager(Options{
+		FFmpegPath:     "/usr/bin/ffmpeg",
+		HardwareDecode: "vaapi",
+		HardwareDevice: "/dev/dri/renderD128",
+		HardwareProbe: func(string, FFmpegOptions) error {
+			return errors.New("device not accessible")
+		},
+	})
+
+	runner, ok := manager.options.Runner.(FFmpegRunner)
+	if !ok {
+		t.Fatalf("runner = %T", manager.options.Runner)
+	}
+	if runner.Options.HardwareDecode != "" || runner.Options.HardwareDevice != "" {
+		t.Fatalf("expected runner to use software decode, options = %+v", runner.Options)
 	}
 }

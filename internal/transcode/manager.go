@@ -37,6 +37,7 @@ type Options struct {
 	ReapInterval          time.Duration
 	RestartGraceTimeout   time.Duration
 	Runner                Runner
+	HardwareProbe         HardwareProbe
 }
 
 type Request struct {
@@ -128,12 +129,13 @@ func NewManager(options Options) *Manager {
 	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
 	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
 	if options.Runner == nil && options.FFmpegPath != "" {
+		ffmpegOptions := resolveHardwareDecodeOptions(options.FFmpegPath, FFmpegOptions{
+			HardwareDecode: options.HardwareDecode,
+			HardwareDevice: options.HardwareDevice,
+		}, options.HardwareProbe)
 		options.Runner = FFmpegRunner{
-			Path: options.FFmpegPath,
-			Options: FFmpegOptions{
-				HardwareDecode: options.HardwareDecode,
-				HardwareDevice: options.HardwareDevice,
-			},
+			Path:    options.FFmpegPath,
+			Options: ffmpegOptions,
 		}
 	}
 	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}
@@ -679,6 +681,79 @@ type FFmpegRunner struct {
 type FFmpegOptions struct {
 	HardwareDecode string
 	HardwareDevice string
+}
+
+type HardwareProbe func(ffmpegPath string, options FFmpegOptions) error
+
+func resolveHardwareDecodeOptions(ffmpegPath string, options FFmpegOptions, probe HardwareProbe) FFmpegOptions {
+	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
+	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
+	switch options.HardwareDecode {
+	case "", "none", "off", "false":
+		return FFmpegOptions{}
+	case "vaapi":
+		if options.HardwareDevice == "" {
+			options.HardwareDevice = "/dev/dri/renderD128"
+		}
+	default:
+		logging.Infof("hardware decode unavailable mode=%s reason=unsupported fallback=software", options.HardwareDecode)
+		return FFmpegOptions{}
+	}
+
+	if probe == nil {
+		probe = defaultHardwareProbe
+	}
+	if err := probe(ffmpegPath, options); err != nil {
+		logging.Infof("hardware decode unavailable mode=%s device=%s reason=%v fallback=software", options.HardwareDecode, options.HardwareDevice, err)
+		return FFmpegOptions{}
+	}
+	logging.Infof("hardware decode enabled mode=%s device=%s", options.HardwareDecode, options.HardwareDevice)
+	return options
+}
+
+func defaultHardwareProbe(ffmpegPath string, options FFmpegOptions) error {
+	if strings.TrimSpace(ffmpegPath) == "" {
+		return errors.New("ffmpeg path is required")
+	}
+	switch options.HardwareDecode {
+	case "vaapi":
+		if err := probeFFmpegHWAccel(ffmpegPath, "vaapi"); err != nil {
+			return err
+		}
+		return probeDevice(options.HardwareDevice)
+	default:
+		return fmt.Errorf("unsupported hardware decode mode %q", options.HardwareDecode)
+	}
+}
+
+func probeFFmpegHWAccel(ffmpegPath, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, ffmpegPath, "-hide_banner", "-hwaccels").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("ffmpeg hwaccel probe timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("ffmpeg hwaccel probe failed: %w", err)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), name) {
+			return nil
+		}
+	}
+	return fmt.Errorf("ffmpeg does not list %s hwaccel", name)
+}
+
+func probeDevice(device string) error {
+	if strings.TrimSpace(device) == "" {
+		return errors.New("hardware device is required")
+	}
+	file, err := os.OpenFile(device, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open hardware device: %w", err)
+	}
+	return file.Close()
 }
 
 func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Request) (Process, error) {

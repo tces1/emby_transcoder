@@ -24,6 +24,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set `server.debug` to `true` when you need detailed diagnostics
 - set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI hardware decode through `/dev/dri`
+- startup probes VAAPI support and falls back to software decode when the device is unavailable or ffmpeg lacks VAAPI
 
 For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
 
