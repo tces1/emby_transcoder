@@ -76,3 +76,26 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 		t.Fatalf("clients = %+v", cfg.Clients)
 	}
 }
+
+func TestLoadSupportsVAAPIHardwareDecode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	err := os.WriteFile(path, []byte(`{
+		"upstream": {"url": "http://emby.local:8096"},
+		"transcode": {"hardware_decode": "vaapi"}
+	}`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Transcode.HardwareDecode != "vaapi" {
+		t.Fatalf("hardware decode = %q", cfg.Transcode.HardwareDecode)
+	}
+	if cfg.Transcode.HardwareDevice != "/dev/dri/renderD128" {
+		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
+	}
+}

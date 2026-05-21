@@ -72,3 +72,32 @@ func TestBuildFFmpegArgsDoesNotThrottleInputWithRealtimeFlag(t *testing.T) {
 		t.Fatalf("ffmpeg args should not include realtime throttling: %v", args)
 	}
 }
+
+func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	args := buildFFmpegArgs(session, request, FFmpegOptions{
+		HardwareDecode: "vaapi",
+		HardwareDevice: "/dev/dri/renderD128",
+	})
+
+	hwaccelIndex := slices.Index(args, "-hwaccel")
+	if hwaccelIndex < 0 || args[hwaccelIndex+1] != "vaapi" {
+		t.Fatalf("missing VAAPI hwaccel args: %v", args)
+	}
+	deviceIndex := slices.Index(args, "-hwaccel_device")
+	if deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
+		t.Fatalf("missing VAAPI device args: %v", args)
+	}
+	inputIndex := slices.Index(args, "-i")
+	if inputIndex < 0 {
+		t.Fatalf("missing -i in args: %v", args)
+	}
+	if hwaccelIndex > inputIndex || deviceIndex > inputIndex {
+		t.Fatalf("hardware decode args should be input options before -i: %v", args)
+	}
+}

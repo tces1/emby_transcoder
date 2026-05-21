@@ -29,6 +29,8 @@ type Transcode struct {
 	Enabled             bool          `json:"enabled"`
 	FFmpegPath          string        `json:"ffmpeg_path"`
 	TempDir             string        `json:"temp_dir"`
+	HardwareDecode      string        `json:"hardware_decode"`
+	HardwareDevice      string        `json:"hardware_device"`
 	MaxSessions         int           `json:"max_sessions"`
 	BufferPauseSeconds  int           `json:"buffer_pause_seconds"`
 	BufferResumeSeconds int           `json:"buffer_resume_seconds"`
@@ -102,6 +104,11 @@ func normalize(cfg *Config) {
 	}
 	if cfg.Transcode.TempDir == "" {
 		cfg.Transcode.TempDir = "/var/lib/emby-transcoder/transcode"
+	}
+	cfg.Transcode.HardwareDecode = strings.ToLower(strings.TrimSpace(cfg.Transcode.HardwareDecode))
+	cfg.Transcode.HardwareDevice = strings.TrimSpace(cfg.Transcode.HardwareDevice)
+	if cfg.Transcode.HardwareDecode == "vaapi" && cfg.Transcode.HardwareDevice == "" {
+		cfg.Transcode.HardwareDevice = "/dev/dri/renderD128"
 	}
 	if cfg.Transcode.MaxSessions <= 0 {
 		cfg.Transcode.MaxSessions = 2

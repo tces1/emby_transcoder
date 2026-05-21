@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     ports:
       - "8097:8097"
+    devices:
+      - /dev/dri:/dev/dri
     volumes:
       - ./config/config.json:/app/config/config.json:ro
       - ./data/transcode:/var/lib/emby-transcoder/transcode

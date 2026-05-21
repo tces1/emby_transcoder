@@ -11,6 +11,8 @@
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
+    "hardware_decode": "",
+    "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,

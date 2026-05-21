@@ -28,6 +28,8 @@ type Options struct {
 	MaxSessions           int
 	TempDir               string
 	FFmpegPath            string
+	HardwareDecode        string
+	HardwareDevice        string
 	BufferPauseThreshold  time.Duration
 	BufferResumeThreshold time.Duration
 	BufferCheckInterval   time.Duration
@@ -123,8 +125,16 @@ func NewManager(options Options) *Manager {
 	if options.RestartGraceTimeout <= 0 {
 		options.RestartGraceTimeout = defaultRestartGraceTimeout
 	}
+	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
+	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
 	if options.Runner == nil && options.FFmpegPath != "" {
-		options.Runner = FFmpegRunner{Path: options.FFmpegPath}
+		options.Runner = FFmpegRunner{
+			Path: options.FFmpegPath,
+			Options: FFmpegOptions{
+				HardwareDecode: options.HardwareDecode,
+				HardwareDevice: options.HardwareDevice,
+			},
+		}
 	}
 	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}
 }
@@ -662,7 +672,13 @@ func durationToTicks(d time.Duration) int64 {
 }
 
 type FFmpegRunner struct {
-	Path string
+	Path    string
+	Options FFmpegOptions
+}
+
+type FFmpegOptions struct {
+	HardwareDecode string
+	HardwareDevice string
 }
 
 func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Request) (Process, error) {
@@ -670,7 +686,7 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		return nil, errors.New("ffmpeg path is required")
 	}
 
-	args := buildFFmpegArgs(session, request)
+	args := buildFFmpegArgs(session, request, r.Options)
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	logPath := filepath.Join(session.Dir, "ffmpeg.log")
 	logging.Infof("transcode start id=%s segment=%d", session.ID, session.SegmentStartIndex)
@@ -708,9 +724,13 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	return process, nil
 }
 
-func buildFFmpegArgs(session *Session, request Request) []string {
+func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions) []string {
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	segmentPattern := filepath.Join(session.Dir, "segment_%05d.ts")
+	ffmpegOptions := FFmpegOptions{}
+	if len(options) > 0 {
+		ffmpegOptions = options[0]
+	}
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "info",
@@ -718,6 +738,7 @@ func buildFFmpegArgs(session *Session, request Request) []string {
 	if headerText := ffmpegHeaders(request.Headers); headerText != "" {
 		args = append(args, "-headers", headerText)
 	}
+	args = appendHardwareDecodeArgs(args, ffmpegOptions)
 	if session.StartTimeTicks > 0 {
 		args = append(args, "-ss", ticksSeconds(session.StartTimeTicks))
 	}
@@ -749,6 +770,21 @@ func buildFFmpegArgs(session *Session, request Request) []string {
 		playlist,
 	)
 	return args
+}
+
+func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {
+	switch strings.ToLower(strings.TrimSpace(options.HardwareDecode)) {
+	case "", "none", "off", "false":
+		return args
+	case "vaapi":
+		args = append(args, "-hwaccel", "vaapi")
+		if device := strings.TrimSpace(options.HardwareDevice); device != "" {
+			args = append(args, "-hwaccel_device", device)
+		}
+		return args
+	default:
+		return args
+	}
 }
 
 func ticksSeconds(ticks int64) string {

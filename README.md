@@ -39,6 +39,7 @@ Edit `docker/config/config.local.json` before starting:
 - set `upstream.url` to your Emby or Jellyfin server
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
+- set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` hardware decode support
 
 Update `docker/docker-compose.yml` to mount the local config file if you use `config.local.json`:
 
@@ -86,6 +87,8 @@ Copy `config.example.json` and change the upstream URL:
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
+    "hardware_decode": "",
+    "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
@@ -96,6 +99,7 @@ Copy `config.example.json` and change the upstream URL:
 
 Leave `public_url` empty when clients connect directly to EmbyTranscoder. Set it when EmbyTranscoder sits behind another reverse proxy.
 Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
+Set `hardware_decode` to `vaapi` to enable VAAPI hardware decode. The default `hardware_device` is `/dev/dri/renderD128`.
 
 ## Transcode Lifecycle
 
