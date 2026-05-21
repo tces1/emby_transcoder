@@ -31,6 +31,24 @@ func TestManagerRejectsWhenSessionLimitReached(t *testing.T) {
 	}
 }
 
+func TestNewManagerStrictFailsWhenHardwareProbeFails(t *testing.T) {
+	_, err := transcode.NewManagerStrict(transcode.Options{
+		FFmpegPath:     "/usr/bin/ffmpeg",
+		HardwareDecode: "vaapi",
+		HardwareDevice: "/dev/dri/renderD128",
+		HardwareProbe: func(string, transcode.FFmpegOptions) error {
+			return errors.New("device not accessible")
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected hardware probe failure to stop startup")
+	}
+	if !strings.Contains(err.Error(), "hardware decode unavailable") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestManagerReusesExistingSession(t *testing.T) {
 	m := transcode.NewManager(transcode.Options{MaxSessions: 1, TempDir: t.TempDir()})
 	t.Cleanup(m.Close)

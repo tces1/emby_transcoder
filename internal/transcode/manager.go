@@ -103,6 +103,39 @@ type Manager struct {
 }
 
 func NewManager(options Options) *Manager {
+	options = normalizeManagerOptions(options)
+	if options.Runner == nil && options.FFmpegPath != "" {
+		ffmpegOptions := resolveHardwareDecodeOptions(options.FFmpegPath, FFmpegOptions{
+			HardwareDecode: options.HardwareDecode,
+			HardwareDevice: options.HardwareDevice,
+		}, options.HardwareProbe)
+		options.Runner = FFmpegRunner{
+			Path:    options.FFmpegPath,
+			Options: ffmpegOptions,
+		}
+	}
+	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}
+}
+
+func NewManagerStrict(options Options) (*Manager, error) {
+	options = normalizeManagerOptions(options)
+	if options.Runner == nil && options.FFmpegPath != "" {
+		ffmpegOptions, err := resolveHardwareDecodeOptionsStrict(options.FFmpegPath, FFmpegOptions{
+			HardwareDecode: options.HardwareDecode,
+			HardwareDevice: options.HardwareDevice,
+		}, options.HardwareProbe)
+		if err != nil {
+			return nil, err
+		}
+		options.Runner = FFmpegRunner{
+			Path:    options.FFmpegPath,
+			Options: ffmpegOptions,
+		}
+	}
+	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}, nil
+}
+
+func normalizeManagerOptions(options Options) Options {
 	if options.MaxSessions <= 0 {
 		options.MaxSessions = 2
 	}
@@ -132,17 +165,7 @@ func NewManager(options Options) *Manager {
 	}
 	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
 	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
-	if options.Runner == nil && options.FFmpegPath != "" {
-		ffmpegOptions := resolveHardwareDecodeOptions(options.FFmpegPath, FFmpegOptions{
-			HardwareDecode: options.HardwareDecode,
-			HardwareDevice: options.HardwareDevice,
-		}, options.HardwareProbe)
-		options.Runner = FFmpegRunner{
-			Path:    options.FFmpegPath,
-			Options: ffmpegOptions,
-		}
-	}
-	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}
+	return options
 }
 
 type MediaInfo struct {
@@ -719,29 +742,39 @@ type FFmpegOptions struct {
 type HardwareProbe func(ffmpegPath string, options FFmpegOptions) error
 
 func resolveHardwareDecodeOptions(ffmpegPath string, options FFmpegOptions, probe HardwareProbe) FFmpegOptions {
+	resolved, err := resolveHardwareDecodeOptionsStrict(ffmpegPath, options, probe)
+	if err != nil {
+		logging.Infof("hardware decode unavailable mode=%s device=%s reason=%v fallback=software", options.HardwareDecode, options.HardwareDevice, err)
+		return FFmpegOptions{}
+	}
+	logging.Infof("hardware decode enabled mode=%s device=%s", resolved.HardwareDecode, resolved.HardwareDevice)
+	return resolved
+}
+
+func resolveHardwareDecodeOptionsStrict(ffmpegPath string, options FFmpegOptions, probe HardwareProbe) (FFmpegOptions, error) {
 	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
 	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
 	switch options.HardwareDecode {
 	case "", "none", "off", "false":
-		return FFmpegOptions{}
+		return FFmpegOptions{}, nil
 	case "vaapi":
+		if strings.TrimSpace(ffmpegPath) == "" {
+			return FFmpegOptions{}, errors.New("ffmpeg path is required for hardware decode")
+		}
 		if options.HardwareDevice == "" {
 			options.HardwareDevice = "/dev/dri/renderD128"
 		}
 	default:
-		logging.Infof("hardware decode unavailable mode=%s reason=unsupported fallback=software", options.HardwareDecode)
-		return FFmpegOptions{}
+		return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s reason=unsupported", options.HardwareDecode)
 	}
 
 	if probe == nil {
 		probe = defaultHardwareProbe
 	}
 	if err := probe(ffmpegPath, options); err != nil {
-		logging.Infof("hardware decode unavailable mode=%s device=%s reason=%v fallback=software", options.HardwareDecode, options.HardwareDevice, err)
-		return FFmpegOptions{}
+		return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s device=%s: %w", options.HardwareDecode, options.HardwareDevice, err)
 	}
-	logging.Infof("hardware decode enabled mode=%s device=%s", options.HardwareDecode, options.HardwareDevice)
-	return options
+	return options, nil
 }
 
 func defaultHardwareProbe(ffmpegPath string, options FFmpegOptions) error {

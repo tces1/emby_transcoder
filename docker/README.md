@@ -24,7 +24,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set `server.debug` to `true` when you need detailed diagnostics
 - set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI hardware decode through `/dev/dri`
-- startup probes VAAPI support, including device initialization, and falls back to software decode when the device, driver, or ffmpeg support is unavailable
+- startup probes VAAPI support, including device initialization, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
 - video output is capped at 1920x1080 while preserving aspect ratio
 

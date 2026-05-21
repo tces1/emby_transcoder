@@ -43,7 +43,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		return nil, fmt.Errorf("invalid upstream url: %s", cfg.Upstream.URL)
 	}
 
-	manager := transcode.NewManager(transcode.Options{
+	manager, err := transcode.NewManagerStrict(transcode.Options{
 		MaxSessions:           cfg.Transcode.MaxSessions,
 		TempDir:               cfg.Transcode.TempDir,
 		FFmpegPath:            cfg.Transcode.FFmpegPath,
@@ -53,6 +53,9 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		BufferResumeThreshold: cfg.Transcode.BufferResume,
 		IdleTimeout:           cfg.Transcode.IdleTimeout,
 	})
+	if err != nil {
+		return nil, err
+	}
 	logging.SetDebug(cfg.Server.Debug)
 	handler := transcode.Handler{
 		Manager: manager,

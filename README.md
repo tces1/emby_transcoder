@@ -42,7 +42,7 @@ Edit `docker/config/config.local.json` before starting:
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
 - set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` hardware decode support
-- startup will probe VAAPI availability, including device initialization, and fall back to software decode if the device, driver, or ffmpeg support is missing
+- startup will probe VAAPI availability, including device initialization, and fail startup if the device, driver, or ffmpeg support is missing
 
 Update `docker/docker-compose.yml` to mount the local config file if you use `config.local.json`:
 
@@ -103,7 +103,7 @@ Copy `config.example.json` and change the upstream URL:
 Leave `public_url` empty when clients connect directly to EmbyTranscoder. Set it when EmbyTranscoder sits behind another reverse proxy.
 Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
 Set `hardware_decode` to `vaapi` to enable VAAPI hardware decode. The default `hardware_device` is `/dev/dri/renderD128`.
-If the device, driver, or ffmpeg probe fails, startup falls back to software decode and logs the reason.
+If the device, driver, or ffmpeg probe fails, startup stops with an error.
 
 ## Transcode Lifecycle
 
