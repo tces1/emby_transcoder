@@ -1,8 +1,6 @@
 services:
   emby-transcoder:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+    image: tces1/emby_transcoder:latest
     container_name: emby-transcoder
     restart: unless-stopped
     ports:

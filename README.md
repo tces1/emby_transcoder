@@ -24,6 +24,44 @@ go run ./cmd/emby-transcoder -config config.example.json
 
 Point a client at the proxy listen address, for example `http://linux-host:8097`.
 
+## Docker Compose
+
+The published linux/amd64 image is available as `tces1/emby_transcoder:latest`.
+
+```bash
+cd docker
+mkdir -p data/transcode
+cp config/config.json config/config.local.json
+```
+
+Edit `docker/config/config.local.json` before starting:
+
+- set `upstream.url` to your Emby or Jellyfin server
+- set `server.public_url` if clients reach the proxy through another reverse proxy
+- leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
+
+Update `docker/docker-compose.yml` to mount the local config file if you use `config.local.json`:
+
+```yaml
+volumes:
+  - ./config/config.local.json:/app/config/config.json:ro
+  - ./data/transcode:/var/lib/emby-transcoder/transcode
+```
+
+Start or update the service:
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose logs -f
+```
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
 ## Build
 
 ```bash
