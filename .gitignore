@@ -1,5 +1,5 @@
 .cache/
-emby-transcoder
+/emby-transcoder
 config.local.json
 dist/
 tmp/
