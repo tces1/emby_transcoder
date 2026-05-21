@@ -43,3 +43,20 @@ func TestTranscodeInputURLPreservesAudioStreamIndexForEmbySelection(t *testing.T
 		t.Fatalf("input url should preserve non-audio query params: %s", got)
 	}
 }
+
+func TestTranscodeInputURLStripsReqFormatFromStreamRequest(t *testing.T) {
+	upstream, err := url.Parse("http://upstream.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?reqformat=json&StartTimeTicks=900000000&MediaSourceId=source1&AudioStreamIndex=2", nil)
+
+	got := transcodeInputURL(upstream, "item123", req)
+
+	if strings.Contains(got, "reqformat=") {
+		t.Fatalf("input url should not forward reqformat to the stream endpoint: %s", got)
+	}
+	if !strings.Contains(got, "StartTimeTicks=900000000") || !strings.Contains(got, "MediaSourceId=source1") {
+		t.Fatalf("input url should keep stream parameters: %s", got)
+	}
+}

@@ -821,6 +821,11 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		_ = logFile.Close()
 		if err != nil {
 			logging.Infof("transcode exit id=%s err=%v", session.ID, err)
+			if archivedPath, archiveErr := archiveFailedTranscodeLog(session, logPath); archiveErr != nil {
+				logging.Errorf("transcode log archive failed id=%s err=%v", session.ID, archiveErr)
+			} else {
+				logging.Infof("transcode log archived id=%s path=%s", session.ID, archivedPath)
+			}
 			logging.Debugf("ffmpeg exited id=%s err=%v log=%s", session.ID, err, logPath)
 			return
 		}
@@ -828,6 +833,28 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		logging.Debugf("ffmpeg exited id=%s err=nil log=%s", session.ID, logPath)
 	}()
 	return process, nil
+}
+
+func archiveFailedTranscodeLog(session *Session, logPath string) (string, error) {
+	if session == nil {
+		return "", errors.New("session is required")
+	}
+	if strings.TrimSpace(logPath) == "" {
+		return "", errors.New("log path is required")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return "", err
+	}
+	logsDir := filepath.Join(filepath.Dir(session.Dir), "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		return "", err
+	}
+	archivedPath := filepath.Join(logsDir, fmt.Sprintf("%s-%s.log", session.ID, time.Now().UTC().Format("20060102T150405.000Z")))
+	if err := os.WriteFile(archivedPath, data, 0o644); err != nil {
+		return "", err
+	}
+	return archivedPath, nil
 }
 
 func ffmpegOptionsSummary(options FFmpegOptions) string {
