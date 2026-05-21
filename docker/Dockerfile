@@ -11,7 +11,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/emby-transcoder ./cmd
 FROM public.ecr.aws/docker/library/debian:bookworm-slim
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+	&& apt-get install -y --no-install-recommends \
+		ca-certificates \
+		ffmpeg \
+		intel-media-va-driver \
+		mesa-va-drivers \
+		vainfo \
 	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
