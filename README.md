@@ -98,6 +98,7 @@ Copy `config.example.json` and change the upstream URL:
     "max_sessions": 2,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
+    "segment_retention_seconds": 300,
     "idle_timeout_seconds": 60
   }
 }
@@ -117,5 +118,6 @@ EmbyTranscoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 - HLS playlist and segment requests refresh media activity.
 - When transcoded media gets more than `buffer_pause_seconds` ahead of playback, FFmpeg is paused.
 - When buffered media falls back under `buffer_resume_seconds`, FFmpeg resumes.
+- Segments older than `segment_retention_seconds` behind the current playback position are deleted from the local cache.
 - If neither playback activity nor HLS access arrives before `idle_timeout_seconds`, the idle reaper stops the session.
 - A new `master.m3u8` request with a different upstream stream URL, such as a seek with a different `StartTimeTicks`, restarts the local session.

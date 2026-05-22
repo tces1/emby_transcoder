@@ -35,6 +35,7 @@ type Options struct {
 	HardwareDevice        string
 	BufferPauseThreshold  time.Duration
 	BufferResumeThreshold time.Duration
+	SegmentRetention      time.Duration
 	BufferCheckInterval   time.Duration
 	IdleTimeout           time.Duration
 	ReapInterval          time.Duration
@@ -53,6 +54,7 @@ type Request struct {
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
+	SegmentRequest          bool
 	Media                   MediaInfo
 }
 
@@ -73,6 +75,7 @@ type Session struct {
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
+	OldestSegmentKept       int
 	HighestSegmentSeen      int
 	Media                   MediaInfo
 	Dir                     string
@@ -154,6 +157,9 @@ func normalizeManagerOptions(options Options) Options {
 	}
 	if options.BufferResumeThreshold <= 0 {
 		options.BufferResumeThreshold = 2 * time.Minute
+	}
+	if options.SegmentRetention <= 0 {
+		options.SegmentRetention = 5 * time.Minute
 	}
 	if options.BufferCheckInterval <= 0 {
 		options.BufferCheckInterval = time.Second
@@ -410,6 +416,7 @@ func (m *Manager) RecordProgress(event PlaybackEvent) int {
 	now := time.Now()
 	count := 0
 	var actions []bufferAction
+	var cleanups []segmentCleanupTask
 	for _, session := range m.sessions {
 		if !matchesPlayback(session, event) {
 			continue
@@ -430,9 +437,15 @@ func (m *Manager) RecordProgress(event PlaybackEvent) int {
 		if action, ok := m.bufferActionLocked(session); ok {
 			actions = append(actions, action)
 		}
+		if cleanup, ok := m.segmentCleanupTaskLocked(session); ok {
+			cleanups = append(cleanups, cleanup)
+		}
 		count++
 	}
 	m.mu.Unlock()
+	for _, cleanup := range cleanups {
+		cleanupOldSegments(cleanup)
+	}
 	for _, action := range actions {
 		m.applyBufferAction(action)
 	}
@@ -535,6 +548,9 @@ func (m *Manager) ReconcileBuffers() {
 }
 
 func shouldRestart(session *Session, request Request) bool {
+	if request.SegmentRequest && session.OldestSegmentKept > session.SegmentStartIndex && request.SegmentStartIndex < session.OldestSegmentKept {
+		return true
+	}
 	if request.StartTimeTicks != session.StartTimeTicks {
 		return true
 	}
@@ -571,6 +587,9 @@ func touchSession(session *Session, request Request, now time.Time, mediaAccess 
 	session.StartTimeTicks = request.StartTimeTicks
 	session.RequestedStartTimeTicks = request.RequestedStartTimeTicks
 	session.SegmentStartIndex = request.SegmentStartIndex
+	if session.OldestSegmentKept < request.SegmentStartIndex {
+		session.OldestSegmentKept = request.SegmentStartIndex
+	}
 	if session.HighestSegmentSeen < request.SegmentStartIndex {
 		session.HighestSegmentSeen = request.SegmentStartIndex
 	}
@@ -589,6 +608,61 @@ type bufferAction struct {
 	process     pausableProcess
 	pause       bool
 	bufferTicks int64
+}
+
+type segmentCleanupTask struct {
+	sessionID     string
+	dir           string
+	beforeSegment int
+}
+
+func (m *Manager) segmentCleanupTaskLocked(session *Session) (segmentCleanupTask, bool) {
+	if session == nil || session.Dir == "" || m.options.SegmentRetention <= 0 {
+		return segmentCleanupTask{}, false
+	}
+	retentionTicks := durationToTicks(m.options.SegmentRetention)
+	if retentionTicks <= 0 || session.PositionTicks <= retentionTicks {
+		return segmentCleanupTask{}, false
+	}
+	cutoffTicks := session.PositionTicks - retentionTicks
+	beforeSegment := int(cutoffTicks / defaultSegmentTicks)
+	if beforeSegment <= session.OldestSegmentKept {
+		return segmentCleanupTask{}, false
+	}
+	session.OldestSegmentKept = beforeSegment
+	return segmentCleanupTask{sessionID: session.ID, dir: session.Dir, beforeSegment: beforeSegment}, true
+}
+
+func cleanupOldSegments(task segmentCleanupTask) {
+	entries, err := os.ReadDir(task.dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logging.Errorf("transcode cleanup error id=%s err=%v", task.sessionID, err)
+		}
+		return
+	}
+
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		segmentIndex, ok := segmentIndexFromName(entry.Name())
+		if !ok || segmentIndex >= task.beforeSegment {
+			continue
+		}
+		path := filepath.Join(task.dir, entry.Name())
+		if err := os.Remove(path); err != nil {
+			if !os.IsNotExist(err) {
+				logging.Errorf("transcode cleanup error id=%s file=%s err=%v", task.sessionID, entry.Name(), err)
+			}
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		logging.Infof("transcode cleanup id=%s deleted_segments=%d before_segment=%d", task.sessionID, deleted, task.beforeSegment)
+	}
 }
 
 func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {

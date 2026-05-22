@@ -26,18 +26,20 @@ type Upstream struct {
 }
 
 type Transcode struct {
-	Enabled             bool          `json:"enabled"`
-	FFmpegPath          string        `json:"ffmpeg_path"`
-	TempDir             string        `json:"temp_dir"`
-	HardwareDecode      string        `json:"hardware_decode"`
-	HardwareDevice      string        `json:"hardware_device"`
-	MaxSessions         int           `json:"max_sessions"`
-	BufferPauseSeconds  int           `json:"buffer_pause_seconds"`
-	BufferResumeSeconds int           `json:"buffer_resume_seconds"`
-	IdleTimeoutSeconds  int           `json:"idle_timeout_seconds"`
-	BufferPause         time.Duration `json:"-"`
-	BufferResume        time.Duration `json:"-"`
-	IdleTimeout         time.Duration `json:"-"`
+	Enabled                 bool          `json:"enabled"`
+	FFmpegPath              string        `json:"ffmpeg_path"`
+	TempDir                 string        `json:"temp_dir"`
+	HardwareDecode          string        `json:"hardware_decode"`
+	HardwareDevice          string        `json:"hardware_device"`
+	MaxSessions             int           `json:"max_sessions"`
+	BufferPauseSeconds      int           `json:"buffer_pause_seconds"`
+	BufferResumeSeconds     int           `json:"buffer_resume_seconds"`
+	SegmentRetentionSeconds int           `json:"segment_retention_seconds"`
+	IdleTimeoutSeconds      int           `json:"idle_timeout_seconds"`
+	BufferPause             time.Duration `json:"-"`
+	BufferResume            time.Duration `json:"-"`
+	SegmentRetention        time.Duration `json:"-"`
+	IdleTimeout             time.Duration `json:"-"`
 }
 
 func (t *Transcode) UnmarshalJSON(data []byte) error {
@@ -85,13 +87,14 @@ func Default() Config {
 			URL: "http://127.0.0.1:8096",
 		},
 		Transcode: Transcode{
-			Enabled:             true,
-			FFmpegPath:          "/usr/bin/ffmpeg",
-			TempDir:             "/var/lib/emby-transcoder/transcode",
-			MaxSessions:         2,
-			BufferPauseSeconds:  300,
-			BufferResumeSeconds: 120,
-			IdleTimeoutSeconds:  60,
+			Enabled:                 true,
+			FFmpegPath:              "/usr/bin/ffmpeg",
+			TempDir:                 "/var/lib/emby-transcoder/transcode",
+			MaxSessions:             2,
+			BufferPauseSeconds:      300,
+			BufferResumeSeconds:     120,
+			SegmentRetentionSeconds: 300,
+			IdleTimeoutSeconds:      60,
 		},
 		Clients: []ClientProfile{
 			{Name: "emby_android_tv", Match: []string{"Emby for Android TV", "Android TV"}, Transcode: true},
@@ -149,10 +152,14 @@ func normalize(cfg *Config) {
 	if cfg.Transcode.BufferResumeSeconds <= 0 {
 		cfg.Transcode.BufferResumeSeconds = 120
 	}
+	if cfg.Transcode.SegmentRetentionSeconds <= 0 {
+		cfg.Transcode.SegmentRetentionSeconds = 300
+	}
 	if cfg.Transcode.IdleTimeoutSeconds <= 0 {
 		cfg.Transcode.IdleTimeoutSeconds = 60
 	}
 	cfg.Transcode.BufferPause = time.Duration(cfg.Transcode.BufferPauseSeconds) * time.Second
 	cfg.Transcode.BufferResume = time.Duration(cfg.Transcode.BufferResumeSeconds) * time.Second
+	cfg.Transcode.SegmentRetention = time.Duration(cfg.Transcode.SegmentRetentionSeconds) * time.Second
 	cfg.Transcode.IdleTimeout = time.Duration(cfg.Transcode.IdleTimeoutSeconds) * time.Second
 }

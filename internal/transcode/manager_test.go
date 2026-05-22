@@ -352,6 +352,102 @@ func TestManagerRecordsPlaybackProgress(t *testing.T) {
 	}
 }
 
+func TestManagerDeletesOldSegmentsBehindPlaybackPosition(t *testing.T) {
+	tempDir := t.TempDir()
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions:      1,
+		TempDir:          tempDir,
+		SegmentRetention: 3 * time.Second,
+	})
+	t.Cleanup(m.Close)
+
+	session, err := m.Ensure("item123", transcode.Request{
+		InputURL:      "http://upstream/stream",
+		PlaySessionID: "play-session-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for segment := 0; segment <= 8; segment++ {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(session.Dir, "master.m3u8"), []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(session.Dir, "ffmpeg.log"), []byte("log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.RecordProgress(transcode.PlaybackEvent{
+		ItemID:        "item123",
+		PlaySessionID: "play-session-1",
+		PositionTicks: 7 * 10_000_000,
+	})
+
+	for _, segment := range []int{0, 1, 2, 3} {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected segment %d to be deleted, err=%v", segment, err)
+		}
+	}
+	for _, segment := range []int{4, 5, 6, 7, 8} {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected segment %d to be kept: %v", segment, err)
+		}
+	}
+	for _, name := range []string{"master.m3u8", "ffmpeg.log"} {
+		if _, err := os.Stat(filepath.Join(session.Dir, name)); err != nil {
+			t.Fatalf("expected %s to be kept: %v", name, err)
+		}
+	}
+}
+
+func TestManagerDoesNotRestartPlaylistRequestAfterSegmentsWerePruned(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions:      1,
+		TempDir:          t.TempDir(),
+		SegmentRetention: 3 * time.Second,
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			return noopProcess{}, nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	first, err := m.Ensure("item123", transcode.Request{
+		InputURL:      "http://upstream/stream",
+		PlaySessionID: "play-session-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m.RecordProgress(transcode.PlaybackEvent{
+		ItemID:        "item123",
+		PlaySessionID: "play-session-1",
+		PositionTicks: 7 * 10_000_000,
+	})
+
+	second, err := m.Ensure("item123", transcode.Request{
+		InputURL: "http://upstream/stream",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if second != first {
+		t.Fatal("expected playlist-style request to reuse the active session")
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("starts = %d", starts.Load())
+	}
+}
+
 func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 	process := &pausingProcess{}
 	m := transcode.NewManager(transcode.Options{
@@ -717,6 +813,59 @@ func TestHandlerKeepsSequentialSegmentSessionPastInitialWindow(t *testing.T) {
 		if starts.Load() != 1 {
 			t.Fatalf("segment %d unexpectedly restarted session; starts = %d", segment, starts.Load())
 		}
+	}
+}
+
+func TestHandlerRestartsWhenRequestedSegmentWasPruned(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions:      1,
+		TempDir:          t.TempDir(),
+		SegmentRetention: 3 * time.Second,
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			return noopProcess{}, os.WriteFile(filepath.Join(session.Dir, "segment_00000.ts"), []byte("ts"), 0o644)
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	session, err := m.Ensure("item123", transcode.Request{
+		InputURL:      "http://upstream.local/emby/Videos/item123/stream",
+		PlaySessionID: "play-session-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for segment := 1; segment <= 8; segment++ {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m.RecordProgress(transcode.PlaybackEvent{
+		ItemID:        "item123",
+		PlaySessionID: "play-session-1",
+		PositionTicks: 7 * 10_000_000,
+	})
+
+	handler := transcode.Handler{
+		Manager: m,
+		InputURLForID: func(id string, r *http.Request) string {
+			return "http://upstream.local/emby/Videos/" + id + "/stream?" + r.URL.RawQuery
+		},
+		StartupWait: 50 * time.Millisecond,
+	}
+
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00000.ts?runtimeTicks=0", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if starts.Load() != 2 {
+		t.Fatalf("starts = %d", starts.Load())
 	}
 }
 

@@ -30,10 +30,11 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - video output is capped at 1920x1080 while preserving aspect ratio
 - playbackinfo rewrites prewarm the transcode session before the first playlist request
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
+- old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback
 
 For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
 
-The transcode cache is stored in `docker/data/transcode`.
+The transcode cache is stored in `docker/data/transcode`; active sessions keep only the retained back-buffer plus the forward buffer.
 
 ## Operations
 

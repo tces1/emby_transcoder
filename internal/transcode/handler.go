@@ -145,6 +145,7 @@ func (h Handler) sessionForSegment(id string, segmentIndex int, name string, r *
 	}
 	request := requestFromHTTP(id, inputURL, segmentReq)
 	request.SegmentStartIndex = segmentIndex
+	request.SegmentRequest = true
 	request.RequestedStartTimeTicks = int64Query(r.URL.Query().Get("StartTimeTicks"))
 	if request.RequestedStartTimeTicks == 0 {
 		request.RequestedStartTimeTicks = request.StartTimeTicks
@@ -188,11 +189,14 @@ func (h Handler) startupWait() time.Duration {
 }
 
 func segmentReusable(session *Session, segmentIndex int, name string) bool {
-	if fileExists(filepath.Join(session.Dir, name)) {
-		return true
+	if segmentIndex < session.OldestSegmentKept {
+		return false
 	}
 	if segmentIndex < session.SegmentStartIndex {
 		return false
+	}
+	if fileExists(filepath.Join(session.Dir, name)) {
+		return true
 	}
 	highest := session.HighestSegmentSeen
 	if highest < session.SegmentStartIndex {

@@ -52,6 +52,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		HardwareDevice:        cfg.Transcode.HardwareDevice,
 		BufferPauseThreshold:  cfg.Transcode.BufferPause,
 		BufferResumeThreshold: cfg.Transcode.BufferResume,
+		SegmentRetention:      cfg.Transcode.SegmentRetention,
 		IdleTimeout:           cfg.Transcode.IdleTimeout,
 	})
 	if err != nil {
