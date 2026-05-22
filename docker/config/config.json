@@ -16,6 +16,7 @@
     "max_sessions": 2,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
+    "segment_seconds": 2,
     "segment_retention_seconds": 300,
     "idle_timeout_seconds": 60
   },

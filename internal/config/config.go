@@ -34,10 +34,12 @@ type Transcode struct {
 	MaxSessions             int           `json:"max_sessions"`
 	BufferPauseSeconds      int           `json:"buffer_pause_seconds"`
 	BufferResumeSeconds     int           `json:"buffer_resume_seconds"`
+	SegmentSeconds          int           `json:"segment_seconds"`
 	SegmentRetentionSeconds int           `json:"segment_retention_seconds"`
 	IdleTimeoutSeconds      int           `json:"idle_timeout_seconds"`
 	BufferPause             time.Duration `json:"-"`
 	BufferResume            time.Duration `json:"-"`
+	SegmentDuration         time.Duration `json:"-"`
 	SegmentRetention        time.Duration `json:"-"`
 	IdleTimeout             time.Duration `json:"-"`
 }
@@ -93,6 +95,7 @@ func Default() Config {
 			MaxSessions:             2,
 			BufferPauseSeconds:      300,
 			BufferResumeSeconds:     120,
+			SegmentSeconds:          2,
 			SegmentRetentionSeconds: 300,
 			IdleTimeoutSeconds:      60,
 		},
@@ -152,6 +155,9 @@ func normalize(cfg *Config) {
 	if cfg.Transcode.BufferResumeSeconds <= 0 {
 		cfg.Transcode.BufferResumeSeconds = 120
 	}
+	if cfg.Transcode.SegmentSeconds <= 0 {
+		cfg.Transcode.SegmentSeconds = 2
+	}
 	if cfg.Transcode.SegmentRetentionSeconds <= 0 {
 		cfg.Transcode.SegmentRetentionSeconds = 300
 	}
@@ -160,6 +166,7 @@ func normalize(cfg *Config) {
 	}
 	cfg.Transcode.BufferPause = time.Duration(cfg.Transcode.BufferPauseSeconds) * time.Second
 	cfg.Transcode.BufferResume = time.Duration(cfg.Transcode.BufferResumeSeconds) * time.Second
+	cfg.Transcode.SegmentDuration = time.Duration(cfg.Transcode.SegmentSeconds) * time.Second
 	cfg.Transcode.SegmentRetention = time.Duration(cfg.Transcode.SegmentRetentionSeconds) * time.Second
 	cfg.Transcode.IdleTimeout = time.Duration(cfg.Transcode.IdleTimeoutSeconds) * time.Second
 }

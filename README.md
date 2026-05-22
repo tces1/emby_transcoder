@@ -98,6 +98,7 @@ Copy `config.example.json` and change the upstream URL:
     "max_sessions": 2,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
+    "segment_seconds": 2,
     "segment_retention_seconds": 300,
     "idle_timeout_seconds": 60
   }
@@ -116,6 +117,7 @@ EmbyTranscoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 - `POST /Sessions/Playing` and `/Sessions/Playing/Progress` update local playback state.
 - `POST /Sessions/Playing/Stopped` immediately stops the matching local FFmpeg session.
 - HLS playlist and segment requests refresh media activity.
+- `segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count, while `1` is fastest and higher values reduce disk churn.
 - When transcoded media gets more than `buffer_pause_seconds` ahead of playback, FFmpeg is paused.
 - When buffered media falls back under `buffer_resume_seconds`, FFmpeg resumes.
 - Segments older than `segment_retention_seconds` behind the current playback position are deleted from the local cache.

@@ -35,6 +35,7 @@ type Options struct {
 	HardwareDevice        string
 	BufferPauseThreshold  time.Duration
 	BufferResumeThreshold time.Duration
+	SegmentDuration       time.Duration
 	SegmentRetention      time.Duration
 	BufferCheckInterval   time.Duration
 	IdleTimeout           time.Duration
@@ -55,6 +56,7 @@ type Request struct {
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
 	SegmentRequest          bool
+	SegmentTicks            int64
 	Media                   MediaInfo
 }
 
@@ -77,6 +79,7 @@ type Session struct {
 	SegmentStartIndex       int
 	OldestSegmentKept       int
 	HighestSegmentSeen      int
+	SegmentTicks            int64
 	Media                   MediaInfo
 	Dir                     string
 	InputURL                string
@@ -158,6 +161,9 @@ func normalizeManagerOptions(options Options) Options {
 	if options.BufferResumeThreshold <= 0 {
 		options.BufferResumeThreshold = 2 * time.Minute
 	}
+	if options.SegmentDuration <= 0 {
+		options.SegmentDuration = 2 * time.Second
+	}
 	if options.SegmentRetention <= 0 {
 		options.SegmentRetention = 5 * time.Minute
 	}
@@ -176,6 +182,38 @@ func normalizeManagerOptions(options Options) Options {
 	options.HardwareDecode = strings.ToLower(strings.TrimSpace(options.HardwareDecode))
 	options.HardwareDevice = strings.TrimSpace(options.HardwareDevice)
 	return options
+}
+
+func (m *Manager) segmentTicks() int64 {
+	if m == nil {
+		return defaultSegmentTicks
+	}
+	return segmentTicksFromDuration(m.options.SegmentDuration)
+}
+
+func segmentTicksFromDuration(duration time.Duration) int64 {
+	ticks := durationToTicks(duration)
+	if ticks <= 0 {
+		return defaultSegmentTicks
+	}
+	return ticks
+}
+
+func sessionSegmentTicks(session *Session) int64 {
+	if session == nil || session.SegmentTicks <= 0 {
+		return defaultSegmentTicks
+	}
+	return session.SegmentTicks
+}
+
+func hlsTimeValue(segmentTicks int64) string {
+	if segmentTicks <= 0 {
+		segmentTicks = defaultSegmentTicks
+	}
+	if segmentTicks%timeSecondTicks == 0 {
+		return strconv.FormatInt(segmentTicks/timeSecondTicks, 10)
+	}
+	return strconv.FormatFloat(ticksFloatSeconds(segmentTicks), 'f', 3, 64)
 }
 
 type MediaInfo struct {
@@ -349,6 +387,7 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		session := &Session{ID: id, Dir: dir, InputURL: request.InputURL, LastAccess: now, LastMediaAccess: now, cancel: cancel}
+		session.SegmentTicks = m.segmentTicks()
 		touchSession(session, request, now, true)
 		if session.Media.IsZero() {
 			session.Media = m.media[id]
@@ -587,6 +626,12 @@ func touchSession(session *Session, request Request, now time.Time, mediaAccess 
 	session.StartTimeTicks = request.StartTimeTicks
 	session.RequestedStartTimeTicks = request.RequestedStartTimeTicks
 	session.SegmentStartIndex = request.SegmentStartIndex
+	if request.SegmentTicks > 0 {
+		session.SegmentTicks = request.SegmentTicks
+	}
+	if session.SegmentTicks <= 0 {
+		session.SegmentTicks = defaultSegmentTicks
+	}
 	if session.OldestSegmentKept < request.SegmentStartIndex {
 		session.OldestSegmentKept = request.SegmentStartIndex
 	}
@@ -625,7 +670,7 @@ func (m *Manager) segmentCleanupTaskLocked(session *Session) (segmentCleanupTask
 		return segmentCleanupTask{}, false
 	}
 	cutoffTicks := session.PositionTicks - retentionTicks
-	beforeSegment := int(cutoffTicks / defaultSegmentTicks)
+	beforeSegment := int(cutoffTicks / sessionSegmentTicks(session))
 	if beforeSegment <= session.OldestSegmentKept {
 		return segmentCleanupTask{}, false
 	}
@@ -679,7 +724,7 @@ func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {
 	}
 	generatedTicks := baseTicks
 	if session.HighestSegmentSeen >= session.SegmentStartIndex {
-		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * defaultSegmentTicks
+		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * sessionSegmentTicks(session)
 	}
 	playedTicks := session.PositionTicks
 	if playedTicks < baseTicks {
@@ -1211,7 +1256,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	}
 	args = append(args,
 		"-f", "hls",
-		"-hls_time", "1",
+		"-hls_time", hlsTimeValue(sessionSegmentTicks(session)),
 		"-hls_list_size", "0",
 		"-hls_flags", "independent_segments",
 		"-start_number", strconv.Itoa(session.SegmentStartIndex),

@@ -32,6 +32,9 @@ func TestDefaultConfigIsUsable(t *testing.T) {
 	if cfg.Transcode.BufferResumeSeconds != 120 {
 		t.Fatalf("buffer resume seconds = %d", cfg.Transcode.BufferResumeSeconds)
 	}
+	if cfg.Transcode.SegmentSeconds != 2 {
+		t.Fatalf("segment seconds = %d", cfg.Transcode.SegmentSeconds)
+	}
 	if cfg.Transcode.SegmentRetentionSeconds != 300 {
 		t.Fatalf("segment retention seconds = %d", cfg.Transcode.SegmentRetentionSeconds)
 	}
@@ -45,7 +48,7 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	err := os.WriteFile(path, []byte(`{
 		"server": {"listen": ":9000", "debug": true},
 		"upstream": {"url": "http://emby.local:8096"},
-		"transcode": {"max_sessions": 4, "buffer_pause_seconds": 600, "buffer_resume_seconds": 90, "segment_retention_seconds": 180},
+		"transcode": {"max_sessions": 4, "buffer_pause_seconds": 600, "buffer_resume_seconds": 90, "segment_seconds": 2, "segment_retention_seconds": 180},
 		"clients": [{"name": "yamby", "match": ["Yamby"], "transcode": true}]
 	}`), 0o600)
 	if err != nil {
@@ -71,6 +74,9 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	}
 	if cfg.Transcode.BufferPauseSeconds != 600 || cfg.Transcode.BufferResumeSeconds != 90 {
 		t.Fatalf("buffer thresholds = %d/%d", cfg.Transcode.BufferPauseSeconds, cfg.Transcode.BufferResumeSeconds)
+	}
+	if cfg.Transcode.SegmentSeconds != 2 {
+		t.Fatalf("segment seconds = %d", cfg.Transcode.SegmentSeconds)
 	}
 	if cfg.Transcode.SegmentRetentionSeconds != 180 {
 		t.Fatalf("segment retention seconds = %d", cfg.Transcode.SegmentRetentionSeconds)

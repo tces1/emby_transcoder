@@ -10,7 +10,7 @@ import (
 
 const (
 	timeSecondTicks     int64 = 10_000_000
-	defaultSegmentTicks       = 1 * timeSecondTicks
+	defaultSegmentTicks       = 2 * timeSecondTicks
 )
 
 func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (string, bool) {

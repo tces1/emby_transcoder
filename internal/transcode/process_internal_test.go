@@ -31,7 +31,7 @@ func TestRequestFromHTTPParsesAudioStreamIndex(t *testing.T) {
 func TestRequestWithSegmentStartUsesRuntimeTicksWhenPresent(t *testing.T) {
 	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00067.ts?actualSegmentLengthTicks=40000000&runtimeTicks=2680123456&X-Emby-Token=abc", nil)
 
-	segmentReq := requestWithSegmentStart(req, 67)
+	segmentReq := requestWithSegmentStart(req, 67, 2*timeSecondTicks)
 	query := segmentReq.URL.Query()
 
 	if got := query.Get("StartTimeTicks"); got != "2680123456" {
@@ -45,6 +45,16 @@ func TestRequestWithSegmentStartUsesRuntimeTicksWhenPresent(t *testing.T) {
 	}
 	if got := query.Get("X-Emby-Token"); got != "abc" {
 		t.Fatalf("X-Emby-Token = %q", got)
+	}
+}
+
+func TestRequestWithSegmentStartUsesConfiguredSegmentDuration(t *testing.T) {
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00067.ts?X-Emby-Token=abc", nil)
+
+	segmentReq := requestWithSegmentStart(req, 67, 2*timeSecondTicks)
+
+	if got := segmentReq.URL.Query().Get("StartTimeTicks"); got != "1340000000" {
+		t.Fatalf("StartTimeTicks = %q", got)
 	}
 }
 

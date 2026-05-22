@@ -387,13 +387,13 @@ func TestManagerDeletesOldSegmentsBehindPlaybackPosition(t *testing.T) {
 		PositionTicks: 7 * 10_000_000,
 	})
 
-	for _, segment := range []int{0, 1, 2, 3} {
+	for _, segment := range []int{0, 1} {
 		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("expected segment %d to be deleted, err=%v", segment, err)
 		}
 	}
-	for _, segment := range []int{4, 5, 6, 7, 8} {
+	for _, segment := range []int{2, 3, 4, 5, 6, 7, 8} {
 		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected segment %d to be kept: %v", segment, err)
@@ -488,7 +488,7 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 	m.RecordProgress(transcode.PlaybackEvent{
 		ItemID:        "item123",
 		PlaySessionID: "play-session-1",
-		PositionTicks: 5 * 10_000_000,
+		PositionTicks: 11 * 10_000_000,
 	})
 
 	if process.resumeCount.Load() != 1 {
@@ -710,13 +710,13 @@ func TestHandlerStartsSegmentSessionFromRequestedSegmentIndex(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if captured.StartTimeTicks != 30_000_000 {
+	if captured.StartTimeTicks != 60_000_000 {
 		t.Fatalf("start ticks = %d", captured.StartTimeTicks)
 	}
 	if captured.SegmentStartIndex != 3 {
 		t.Fatalf("segment start index = %d", captured.SegmentStartIndex)
 	}
-	if !strings.Contains(captured.InputURL, "StartTimeTicks=30000000") {
+	if !strings.Contains(captured.InputURL, "StartTimeTicks=60000000") {
 		t.Fatalf("input url = %s", captured.InputURL)
 	}
 }

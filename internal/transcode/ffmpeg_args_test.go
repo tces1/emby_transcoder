@@ -55,11 +55,26 @@ func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testi
 		t.Fatalf("expected unbounded HLS list size, args=%v", args)
 	}
 	hlsTimeIndex := slices.Index(args, "-hls_time")
-	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "1" {
-		t.Fatalf("expected 1 second HLS segments, args=%v", args)
+	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
+		t.Fatalf("expected default HLS segment duration, args=%v", args)
 	}
 	if args[len(args)-1] != filepath.Join(session.Dir, "master.m3u8") {
 		t.Fatalf("playlist output = %q", args[len(args)-1])
+	}
+}
+
+func TestBuildFFmpegArgsUsesConfiguredSegmentDuration(t *testing.T) {
+	session := &Session{
+		ID:           "item123",
+		Dir:          t.TempDir(),
+		SegmentTicks: 2 * timeSecondTicks,
+	}
+
+	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
+
+	hlsTimeIndex := slices.Index(args, "-hls_time")
+	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
+		t.Fatalf("expected configured HLS segment duration, args=%v", args)
 	}
 }
 

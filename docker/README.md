@@ -28,6 +28,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - startup probes VAAPI support, including device initialization and `h264_vaapi`, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
 - video output is capped at 1920x1080 while preserving aspect ratio
+- `transcode.segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count
 - playbackinfo rewrites prewarm the transcode session before the first playlist request
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 - old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback

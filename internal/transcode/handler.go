@@ -49,7 +49,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logging.Infof("playlist request id=%s start_ticks=%d", id, startTimeTicksFromRawQuery(r.URL.RawQuery))
 		traceSwitch("playlist_request id=%s start_ticks=%d query=%s elapsed=%s", id, startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), time.Since(requestStarted))
 		if info, known := h.Manager.MediaInfo(id); known {
-			if playlist, ready := VirtualVODPlaylist(info, defaultSegmentTicks, r.URL.RawQuery); ready {
+			if playlist, ready := VirtualVODPlaylist(info, h.Manager.segmentTicks(), r.URL.RawQuery); ready {
 				logging.Infof("playlist virtual id=%s duration=%s", id, formatTicks(info.RunTimeTicks))
 				traceSwitch("playlist_virtual id=%s duration=%s start_ticks=%d query=%s media=%s elapsed=%s", id, formatTicks(info.RunTimeTicks), startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), info.Summary(), time.Since(requestStarted))
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -138,7 +138,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) sessionForSegment(id string, segmentIndex int, name string, r *http.Request, requestStarted time.Time) (*Session, error) {
-	segmentReq := requestWithSegmentStart(r, segmentIndex)
+	segmentReq := requestWithSegmentStart(r, segmentIndex, h.Manager.segmentTicks())
 	inputURL := ""
 	if h.InputURLForID != nil {
 		inputURL = h.InputURLForID(id, segmentReq)
@@ -146,6 +146,7 @@ func (h Handler) sessionForSegment(id string, segmentIndex int, name string, r *
 	request := requestFromHTTP(id, inputURL, segmentReq)
 	request.SegmentStartIndex = segmentIndex
 	request.SegmentRequest = true
+	request.SegmentTicks = h.Manager.segmentTicks()
 	request.RequestedStartTimeTicks = int64Query(r.URL.Query().Get("StartTimeTicks"))
 	if request.RequestedStartTimeTicks == 0 {
 		request.RequestedStartTimeTicks = request.StartTimeTicks
@@ -223,11 +224,11 @@ func segmentInputFingerprint(raw string) string {
 	return parsed.String()
 }
 
-func requestWithSegmentStart(r *http.Request, segmentIndex int) *http.Request {
+func requestWithSegmentStart(r *http.Request, segmentIndex int, segmentTicks int64) *http.Request {
 	req := r.Clone(r.Context())
 	u := *r.URL
 	query := u.Query()
-	query.Set("StartTimeTicks", strconv.FormatInt(segmentStartTicksFromRequest(r, segmentIndex), 10))
+	query.Set("StartTimeTicks", strconv.FormatInt(segmentStartTicksFromRequest(r, segmentIndex, segmentTicks), 10))
 	query.Del("runtimeTicks")
 	query.Del("actualSegmentLengthTicks")
 	u.RawQuery = query.Encode()
@@ -235,15 +236,18 @@ func requestWithSegmentStart(r *http.Request, segmentIndex int) *http.Request {
 	return req
 }
 
-func segmentStartTicksFromRequest(r *http.Request, segmentIndex int) int64 {
+func segmentStartTicksFromRequest(r *http.Request, segmentIndex int, segmentTicks int64) int64 {
 	if raw := r.URL.Query().Get("runtimeTicks"); raw != "" {
 		return int64Query(raw)
 	}
-	return segmentStartTicks(segmentIndex)
+	return segmentStartTicks(segmentIndex, segmentTicks)
 }
 
-func segmentStartTicks(segmentIndex int) int64 {
-	return int64(segmentIndex) * defaultSegmentTicks
+func segmentStartTicks(segmentIndex int, segmentTicks int64) int64 {
+	if segmentTicks <= 0 {
+		segmentTicks = defaultSegmentTicks
+	}
+	return int64(segmentIndex) * segmentTicks
 }
 
 func removeLocalAndPlaybackOnlyQuery(query url.Values) {
