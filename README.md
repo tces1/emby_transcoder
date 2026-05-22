@@ -43,8 +43,9 @@ Edit `docker/config/config.local.json` before starting:
 - set `upstream.url` to your Emby or Jellyfin server
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
-- set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` hardware decode support
-- startup will probe VAAPI availability, including device initialization, and fail startup if the device, driver, or ffmpeg support is missing
+- set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` VAAPI support
+- VAAPI mode uses hardware decode, `scale_vaapi` GPU scaling, and `h264_vaapi` hardware H.264 encoding
+- startup will probe VAAPI availability, including device initialization, `scale_vaapi`, and `h264_vaapi`, and fail startup if the device, driver, or ffmpeg support is missing
 
 Update `docker/docker-compose.yml` to mount the local config file if you use `config.local.json`:
 
@@ -104,8 +105,8 @@ Copy `config.example.json` and change the upstream URL:
 
 Leave `public_url` empty when clients connect directly to EmbyTranscoder. Set it when EmbyTranscoder sits behind another reverse proxy.
 Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
-Set `hardware_decode` to `vaapi` to enable VAAPI hardware decode. The default `hardware_device` is `/dev/dri/renderD128`.
-If the device, driver, or ffmpeg probe fails, startup stops with an error.
+Set `hardware_decode` to `vaapi` to enable the full VAAPI transcode pipeline: hardware decode, GPU scaling, and H.264 hardware encoding. The default `hardware_device` is `/dev/dri/renderD128`.
+If the device, driver, `scale_vaapi`, or `h264_vaapi` probe fails, startup stops with an error.
 
 ## Transcode Lifecycle
 

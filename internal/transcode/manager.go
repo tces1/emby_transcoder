@@ -128,6 +128,9 @@ func NewManagerStrict(options Options) (*Manager, error) {
 		if err != nil {
 			return nil, err
 		}
+		if ffmpegOptions.HardwareDecode != "" {
+			logging.Infof("hardware transcode enabled pipeline=%s", ffmpegOptionsSummary(ffmpegOptions))
+		}
 		options.Runner = FFmpegRunner{
 			Path:    options.FFmpegPath,
 			Options: ffmpegOptions,
@@ -745,10 +748,10 @@ type HardwareProbe func(ffmpegPath string, options FFmpegOptions) error
 func resolveHardwareDecodeOptions(ffmpegPath string, options FFmpegOptions, probe HardwareProbe) FFmpegOptions {
 	resolved, err := resolveHardwareDecodeOptionsStrict(ffmpegPath, options, probe)
 	if err != nil {
-		logging.Infof("hardware decode unavailable mode=%s device=%s reason=%v fallback=software", options.HardwareDecode, options.HardwareDevice, err)
+		logging.Infof("hardware transcode unavailable mode=%s device=%s reason=%v fallback=software", options.HardwareDecode, options.HardwareDevice, err)
 		return FFmpegOptions{}
 	}
-	logging.Infof("hardware decode enabled mode=%s device=%s", resolved.HardwareDecode, resolved.HardwareDevice)
+	logging.Infof("hardware transcode enabled pipeline=%s", ffmpegOptionsSummary(resolved))
 	return resolved
 }
 
@@ -787,10 +790,19 @@ func defaultHardwareProbe(ffmpegPath string, options FFmpegOptions) error {
 		if err := probeFFmpegHWAccel(ffmpegPath, "vaapi"); err != nil {
 			return err
 		}
+		if err := probeFFmpegEncoder(ffmpegPath, "h264_vaapi"); err != nil {
+			return err
+		}
+		if err := probeFFmpegFilter(ffmpegPath, "scale_vaapi"); err != nil {
+			return err
+		}
 		if err := probeDevice(options.HardwareDevice); err != nil {
 			return err
 		}
-		return probeFFmpegVAAPIDeviceInit(ffmpegPath, options.HardwareDevice)
+		if err := probeFFmpegVAAPIDeviceInit(ffmpegPath, options.HardwareDevice); err != nil {
+			return err
+		}
+		return probeFFmpegVAAPIFullPipeline(ffmpegPath, options.HardwareDevice)
 	default:
 		return fmt.Errorf("unsupported hardware decode mode %q", options.HardwareDecode)
 	}
@@ -815,6 +827,49 @@ func probeFFmpegHWAccel(ffmpegPath, name string) error {
 	return fmt.Errorf("ffmpeg does not list %s hwaccel", name)
 }
 
+func probeFFmpegEncoder(ffmpegPath, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, ffmpegPath, "-hide_banner", "-encoders").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("ffmpeg encoder probe timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("ffmpeg encoder probe failed: %w", err)
+	}
+	if ffmpegListContains(output, name) {
+		return nil
+	}
+	return fmt.Errorf("ffmpeg does not list %s encoder", name)
+}
+
+func probeFFmpegFilter(ffmpegPath, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, ffmpegPath, "-hide_banner", "-filters").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("ffmpeg filter probe timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("ffmpeg filter probe failed: %w", err)
+	}
+	if ffmpegListContains(output, name) {
+		return nil
+	}
+	return fmt.Errorf("ffmpeg does not list %s filter", name)
+}
+
+func ffmpegListContains(output []byte, name string) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(strings.ToLower(line), strings.ToLower(name)) {
+			return true
+		}
+	}
+	return false
+}
+
 func probeFFmpegVAAPIDeviceInit(ffmpegPath, device string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -837,6 +892,35 @@ func probeFFmpegVAAPIDeviceInit(ffmpegPath, device string) error {
 			return fmt.Errorf("vaapi device init probe failed: %w: %s", err, message)
 		}
 		return fmt.Errorf("vaapi device init probe failed: %w", err)
+	}
+	return nil
+}
+
+func probeFFmpegVAAPIFullPipeline(ffmpegPath, device string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-init_hw_device", "vaapi=probe:"+device,
+		"-filter_hw_device", "probe",
+		"-f", "lavfi",
+		"-i", "nullsrc=s=64x64:d=0.1",
+		"-vf", "format=nv12,hwupload,"+vaapiScaleFilter(64, 64),
+		"-frames:v", "1",
+		"-c:v", "h264_vaapi",
+		"-f", "null",
+		"-",
+	).CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("vaapi full pipeline probe timed out")
+	}
+	if err != nil {
+		if message := strings.TrimSpace(string(output)); message != "" {
+			return fmt.Errorf("vaapi full pipeline probe failed: %w: %s", err, message)
+		}
+		return fmt.Errorf("vaapi full pipeline probe failed: %w", err)
 	}
 	return nil
 }
@@ -927,6 +1011,9 @@ func ffmpegOptionsSummary(options FFmpegOptions) string {
 	if mode == "" || mode == "none" || mode == "off" || mode == "false" {
 		return "software"
 	}
+	if mode == "vaapi" {
+		mode = "vaapi-full"
+	}
 	device := strings.TrimSpace(options.HardwareDevice)
 	if device == "" {
 		return mode
@@ -971,17 +1058,9 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-i", request.InputURL,
 		"-map", "0:v:0",
 		"-map", audioMapArg(session, request),
-		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2", maxTranscodeWidth, maxTranscodeHeight),
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-tune", "zerolatency",
-		"-profile:v", "high",
-		"-level", "4.1",
-		"-g", strconv.Itoa(lowLatencyGOP),
-		"-keyint_min", strconv.Itoa(lowLatencyGOP),
-		"-sc_threshold", "0",
-		"-bf", "0",
-		"-pix_fmt", "yuv420p",
+	)
+	args = appendVideoTranscodeArgs(args, ffmpegOptions)
+	args = append(args,
 		"-c:a", "aac",
 		"-b:a", "160k",
 		"-ac", "2",
@@ -1003,6 +1082,38 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	return args
 }
 
+func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
+	if isVAAPITranscode(options) {
+		return append(args,
+			"-vf", vaapiScaleFilter(maxTranscodeWidth, maxTranscodeHeight),
+			"-c:v", "h264_vaapi",
+			"-profile:v", "high",
+			"-level", "4.1",
+			"-g", strconv.Itoa(lowLatencyGOP),
+			"-keyint_min", strconv.Itoa(lowLatencyGOP),
+			"-bf", "0",
+			"-qp", "23",
+		)
+	}
+	return append(args,
+		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2", maxTranscodeWidth, maxTranscodeHeight),
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-tune", "zerolatency",
+		"-profile:v", "high",
+		"-level", "4.1",
+		"-g", strconv.Itoa(lowLatencyGOP),
+		"-keyint_min", strconv.Itoa(lowLatencyGOP),
+		"-sc_threshold", "0",
+		"-bf", "0",
+		"-pix_fmt", "yuv420p",
+	)
+}
+
+func vaapiScaleFilter(width, height int) string {
+	return fmt.Sprintf("scale_vaapi=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12", width, height)
+}
+
 func audioMapArg(session *Session, request Request) string {
 	return "0:a:0?"
 }
@@ -1016,10 +1127,15 @@ func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {
 		if device := strings.TrimSpace(options.HardwareDevice); device != "" {
 			args = append(args, "-hwaccel_device", device)
 		}
+		args = append(args, "-hwaccel_output_format", "vaapi")
 		return args
 	default:
 		return args
 	}
+}
+
+func isVAAPITranscode(options FFmpegOptions) bool {
+	return strings.EqualFold(strings.TrimSpace(options.HardwareDecode), "vaapi")
 }
 
 func ticksSeconds(ticks int64) string {
