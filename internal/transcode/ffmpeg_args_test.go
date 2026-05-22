@@ -247,6 +247,26 @@ func TestResolveHardwareDecodeFallsBackToSoftwareWhenProbeFails(t *testing.T) {
 	}
 }
 
+func TestResolveHardwareDecodeFalseSkipsHardwareProbe(t *testing.T) {
+	called := false
+	options, err := resolveHardwareDecodeOptionsStrict("/definitely/missing/ffmpeg", FFmpegOptions{
+		HardwareDecode: "false",
+		HardwareDevice: "/dev/dri/renderD128",
+	}, func(string, FFmpegOptions) error {
+		called = true
+		return errors.New("probe should not run")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("hardware probe should not run when hardware decode is false")
+	}
+	if options.HardwareDecode != "" || options.HardwareDevice != "" {
+		t.Fatalf("expected software options, got %+v", options)
+	}
+}
+
 func TestDefaultHardwareProbeRejectsVAAPIWhenDeviceInitializationFails(t *testing.T) {
 	tempDir := t.TempDir()
 	ffmpegPath := filepath.Join(tempDir, "ffmpeg")

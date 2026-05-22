@@ -99,3 +99,23 @@ func TestLoadSupportsVAAPIHardwareDecode(t *testing.T) {
 		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
 	}
 }
+
+func TestLoadSupportsBooleanFalseHardwareDecode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	err := os.WriteFile(path, []byte(`{
+		"upstream": {"url": "http://upstream.local"},
+		"transcode": {"hardware_decode": false}
+	}`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Transcode.HardwareDecode != "false" {
+		t.Fatalf("hardware decode = %q", cfg.Transcode.HardwareDecode)
+	}
+}

@@ -40,6 +40,36 @@ type Transcode struct {
 	IdleTimeout         time.Duration `json:"-"`
 }
 
+func (t *Transcode) UnmarshalJSON(data []byte) error {
+	type transcodeAlias Transcode
+	aux := struct {
+		HardwareDecode json.RawMessage `json:"hardware_decode"`
+		*transcodeAlias
+	}{
+		transcodeAlias: (*transcodeAlias)(t),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(aux.HardwareDecode) == 0 || string(aux.HardwareDecode) == "null" {
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(aux.HardwareDecode, &text); err == nil {
+		t.HardwareDecode = text
+		return nil
+	}
+	var enabled bool
+	if err := json.Unmarshal(aux.HardwareDecode, &enabled); err == nil {
+		if !enabled {
+			t.HardwareDecode = "false"
+			return nil
+		}
+		return errors.New(`transcode.hardware_decode boolean true is not supported; use "vaapi"`)
+	}
+	return errors.New(`transcode.hardware_decode must be a string or false`)
+}
+
 type ClientProfile struct {
 	Name      string   `json:"name"`
 	Match     []string `json:"match"`
