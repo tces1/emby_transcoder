@@ -85,9 +85,14 @@ func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 
 	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
 
-	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32k", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0"} {
+	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0"} {
 		if !slices.Contains(args, want) {
 			t.Fatalf("missing low-latency arg %q in %v", want, args)
+		}
+	}
+	for _, risky := range []string{"-analyzeduration", "-probesize"} {
+		if slices.Contains(args, risky) {
+			t.Fatalf("should not force risky probing arg %q for mkv/dts inputs: %v", risky, args)
 		}
 	}
 }

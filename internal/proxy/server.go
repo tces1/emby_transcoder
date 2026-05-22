@@ -266,12 +266,17 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 	}
 	itemID := report.ItemID
 	source := report.Sources[0]
-	inputURL := transcodeInputURL(s.upstream, itemID, r)
+	audioStreamIndex := preferredAudioStreamIndex(source.AudioStreams)
+	if raw := r.URL.Query().Get("AudioStreamIndex"); raw != "" {
+		audioStreamIndex = int(int64Query(raw))
+	}
+	inputURL := prewarmTranscodeInputURL(s.upstream, itemID, source.ID, audioStreamIndex, r)
 	request := transcode.Request{
 		InputURL:                inputURL,
 		ItemID:                  itemID,
 		MediaSourceID:           source.ID,
 		PlaySessionID:           source.SessionID,
+		AudioStreamIndex:        audioStreamIndex,
 		StartTimeTicks:          int64Query(r.URL.Query().Get("StartTimeTicks")),
 		RequestedStartTimeTicks: int64Query(r.URL.Query().Get("StartTimeTicks")),
 	}
@@ -281,6 +286,10 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 	logging.Debugf("playbackinfo prewarm request item=%s source=%s", itemID, source.ID)
 	started := time.Now()
 	go func() {
+		if _, ok := s.transcodeManager.Get(source.SessionID); ok {
+			logging.Debugf("playbackinfo prewarm skipped item=%s source=%s reason=session_exists", itemID, source.ID)
+			return
+		}
 		session, err := s.transcodeManager.Ensure(source.SessionID, request)
 		if err != nil {
 			logging.Debugf("playbackinfo prewarm skipped item=%s source=%s err=%v", itemID, source.ID, err)
@@ -294,6 +303,30 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 func int64Query(raw string) int64 {
 	value, _ := strconv.ParseInt(raw, 10, 64)
 	return value
+}
+
+func preferredAudioStreamIndex(streams []emby.AudioStreamReport) int {
+	if len(streams) == 0 {
+		return 0
+	}
+	return streams[0].Index
+}
+
+func prewarmTranscodeInputURL(upstream *url.URL, id string, mediaSourceID string, audioStreamIndex int, r *http.Request) string {
+	u := *upstream
+	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
+	query := r.URL.Query()
+	query.Del("reqformat")
+	query.Set("AutoOpenLiveStream", "true")
+	query.Set("IsPlayback", "true")
+	if mediaSourceID != "" {
+		query.Set("MediaSourceId", mediaSourceID)
+	}
+	if audioStreamIndex > 0 {
+		query.Set("AudioStreamIndex", strconv.Itoa(audioStreamIndex))
+	}
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {

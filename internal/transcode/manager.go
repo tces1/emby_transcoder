@@ -959,8 +959,6 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-loglevel", "info",
 		"-fflags", "nobuffer",
 		"-flags", "low_delay",
-		"-analyzeduration", "0",
-		"-probesize", "32k",
 	}
 	if headerText := ffmpegHeaders(request.Headers); headerText != "" {
 		args = append(args, "-headers", headerText)
