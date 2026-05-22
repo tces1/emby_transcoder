@@ -105,8 +105,9 @@ func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {
 	request := Request{InputURL: "http://upstream/stream"}
 
 	args := buildFFmpegArgs(session, request, FFmpegOptions{
-		HardwareDecode: "vaapi",
-		HardwareDevice: "/dev/dri/renderD128",
+		HardwareDecode:   "vaapi",
+		HardwareDevice:   "/dev/dri/renderD128",
+		HardwarePipeline: "vaapi-full",
 	})
 
 	hwaccelIndex := slices.Index(args, "-hwaccel")
@@ -154,6 +155,39 @@ func TestBuildFFmpegArgsUsesFullVAAPITranscodePipeline(t *testing.T) {
 		if slices.Contains(args, softwareOnly) {
 			t.Fatalf("VAAPI pipeline should not include software encoder arg %q: %v", softwareOnly, args)
 		}
+	}
+}
+
+func TestBuildFFmpegArgsUsesVAAPIEncodeFallbackPipeline(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	args := buildFFmpegArgs(session, request, FFmpegOptions{
+		HardwareDecode:   "vaapi",
+		HardwareDevice:   "/dev/dri/renderD128",
+		HardwarePipeline: "vaapi-encode",
+	})
+
+	if slices.Contains(args, "-hwaccel_output_format") {
+		t.Fatalf("VAAPI encode fallback should not require VAAPI decoded frames: %v", args)
+	}
+	deviceIndex := slices.Index(args, "-vaapi_device")
+	if deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
+		t.Fatalf("missing VAAPI encode device: %v", args)
+	}
+	vfIndex := slices.Index(args, "-vf")
+	if vfIndex < 0 || !strings.Contains(args[vfIndex+1], "scale=") || !strings.Contains(args[vfIndex+1], "hwupload") {
+		t.Fatalf("expected software scale plus VAAPI upload filter, args=%v", args)
+	}
+	codecIndex := slices.Index(args, "-c:v")
+	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
+		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
+	}
+	if slices.Contains(args, "libx264") {
+		t.Fatalf("VAAPI encode fallback should not use libx264: %v", args)
 	}
 }
 
@@ -264,6 +298,68 @@ func TestResolveHardwareDecodeFalseSkipsHardwareProbe(t *testing.T) {
 	}
 	if options.HardwareDecode != "" || options.HardwareDevice != "" {
 		t.Fatalf("expected software options, got %+v", options)
+	}
+}
+
+func TestResolveHardwareDecodeFallsBackToVAAPIEncodeWhenFullPipelineUnsupported(t *testing.T) {
+	tempDir := t.TempDir()
+	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
+	callsPath := filepath.Join(tempDir, "calls")
+	script := fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %q
+case " $* " in
+  *" -hwaccels "*)
+    printf 'Hardware acceleration methods:\nvaapi\n'
+    exit 0
+    ;;
+  *" -encoders "*)
+    printf ' V....D h264_vaapi           H.264/AVC (VAAPI)\n'
+    exit 0
+    ;;
+  *" -filters "*)
+    printf ' ... scale_vaapi       V->V       Scale to/from VAAPI surfaces.\n'
+    exit 0
+    ;;
+  *" -init_hw_device "*"scale_vaapi="*)
+    echo 'Failed to create processing pipeline config: 12 (the requested VAProfile is not supported).' >&2
+    exit 1
+    ;;
+  *" -vaapi_device "*"hwupload"*)
+    exit 0
+    ;;
+  *" -init_hw_device "*)
+    exit 0
+    ;;
+esac
+exit 0
+`, callsPath)
+	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	devicePath := filepath.Join(tempDir, "renderD128")
+	if err := os.WriteFile(devicePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	options, err := resolveHardwareDecodeOptionsStrict(ffmpegPath, FFmpegOptions{
+		HardwareDecode: "vaapi",
+		HardwareDevice: devicePath,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if options.HardwarePipeline != "vaapi-encode" {
+		t.Fatalf("hardware pipeline = %q", options.HardwarePipeline)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"scale_vaapi=", "-vaapi_device " + devicePath, "hwupload", "-c:v h264_vaapi"} {
+		if !strings.Contains(string(calls), want) {
+			t.Fatalf("expected probe call containing %q, calls=%s", want, calls)
+		}
 	}
 }
 
@@ -395,7 +491,10 @@ func TestFFmpegOptionsSummaryLabelsDecodeMode(t *testing.T) {
 	if got := ffmpegOptionsSummary(FFmpegOptions{}); got != "software" {
 		t.Fatalf("software summary = %q", got)
 	}
-	if got := ffmpegOptionsSummary(FFmpegOptions{HardwareDecode: "vaapi", HardwareDevice: "/dev/dri/renderD128"}); got != "vaapi-full:/dev/dri/renderD128" {
+	if got := ffmpegOptionsSummary(FFmpegOptions{HardwareDecode: "vaapi", HardwareDevice: "/dev/dri/renderD128", HardwarePipeline: "vaapi-full"}); got != "vaapi-full:/dev/dri/renderD128" {
 		t.Fatalf("vaapi summary = %q", got)
+	}
+	if got := ffmpegOptionsSummary(FFmpegOptions{HardwareDecode: "vaapi", HardwareDevice: "/dev/dri/renderD128", HardwarePipeline: "vaapi-encode"}); got != "vaapi-encode:/dev/dri/renderD128" {
+		t.Fatalf("vaapi encode summary = %q", got)
 	}
 }
