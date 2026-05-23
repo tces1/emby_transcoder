@@ -60,3 +60,18 @@ func TestTranscodeInputURLStripsReqFormatFromStreamRequest(t *testing.T) {
 		t.Fatalf("input url should keep stream parameters: %s", got)
 	}
 }
+
+func TestTranscodeInputURLUsesHeaderTokenWhenQueryIsMissing(t *testing.T) {
+	upstream, err := url.Parse("http://upstream.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?MediaSourceId=source1", nil)
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Emby for Android TV", Token="abc"`)
+
+	got := transcodeInputURL(upstream, "item123", req)
+
+	if !strings.Contains(got, "X-Emby-Token=abc") {
+		t.Fatalf("input url should carry token from auth header: %s", got)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,8 @@ type Server struct {
 	cancelReaper     context.CancelFunc
 	transcodeManager *transcode.Manager
 }
+
+var embyTokenPattern = regexp.MustCompile(`(?i)\btoken\s*=\s*"?([^",\s]+)"?`)
 
 func New(cfg config.Config) (*Server, error) {
 	return NewWithTransport(cfg, http.DefaultTransport)
@@ -193,7 +196,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	itemID := itemIDFromPlaybackPath(r.URL.Path)
 	publicURL := s.publicURL(r)
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") && itemID != "" {
-		rewritten, changed, report, err := emby.RewritePlaybackInfoWithReport(respBody, itemID, publicURL, r.URL.RawQuery)
+		rewritten, changed, report, err := emby.RewritePlaybackInfoWithReport(respBody, itemID, publicURL, authAwareRawQuery(r))
 		if err != nil {
 			logging.Errorf("playbackinfo rewrite error item=%s err=%v", itemID, err)
 		}
@@ -275,6 +278,7 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 	inputURL := prewarmTranscodeInputURL(s.upstream, itemID, source.ID, audioStreamIndex, r)
 	request := transcode.Request{
 		InputURL:                inputURL,
+		Headers:                 r.Header.Clone(),
 		ItemID:                  itemID,
 		MediaSourceID:           source.ID,
 		PlaySessionID:           source.SessionID,
@@ -317,7 +321,7 @@ func preferredAudioStreamIndex(streams []emby.AudioStreamReport) int {
 func prewarmTranscodeInputURL(upstream *url.URL, id string, mediaSourceID string, audioStreamIndex int, r *http.Request) string {
 	u := *upstream
 	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
-	query := r.URL.Query()
+	query := authAwareQuery(r)
 	query.Del("reqformat")
 	query.Set("AutoOpenLiveStream", "true")
 	query.Set("IsPlayback", "true")
@@ -334,10 +338,48 @@ func prewarmTranscodeInputURL(upstream *url.URL, id string, mediaSourceID string
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {
 	u := *upstream
 	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
-	query := r.URL.Query()
+	query := authAwareQuery(r)
 	query.Del("reqformat")
 	u.RawQuery = query.Encode()
 	return u.String()
+}
+
+func authAwareRawQuery(r *http.Request) string {
+	return authAwareQuery(r).Encode()
+}
+
+func authAwareQuery(r *http.Request) url.Values {
+	query := r.URL.Query()
+	if query.Get("X-Emby-Token") == "" {
+		if token := embyTokenFromHeaders(r.Header); token != "" {
+			query.Set("X-Emby-Token", token)
+		}
+	}
+	return query
+}
+
+func embyTokenFromHeaders(headers http.Header) string {
+	for _, key := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"X-Emby-Authorization", "Authorization"} {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			if token := extractEmbyToken(value); token != "" {
+				return token
+			}
+		}
+	}
+	return ""
+}
+
+func extractEmbyToken(value string) string {
+	match := embyTokenPattern.FindStringSubmatch(value)
+	if len(match) == 2 {
+		return match[1]
+	}
+	return ""
 }
 
 func (s *Server) publicURL(r *http.Request) string {

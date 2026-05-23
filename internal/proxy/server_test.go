@@ -110,6 +110,35 @@ func TestNormalRequestsAreProxied(t *testing.T) {
 	}
 }
 
+func TestPlaybackInfoCarriesHeaderTokenIntoRewrittenTranscodeURL(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResponse(`{"MediaSources":[{"Id":"source1","SupportsDirectPlay":true,"MediaStreams":[{"Type":"Video","Codec":"hevc","Width":3840,"Height":2160},{"Type":"Audio","Codec":"dts","Channels":6}]}]}`), nil
+	})
+
+	cfg := config.Default()
+	cfg.Upstream.URL = "http://upstream.local"
+	cfg.Server.PublicURL = "http://proxy.local"
+	cfg.Clients = []config.ClientProfile{{Name: "yamby", Match: []string{"Yamby"}, Transcode: true}}
+
+	srv, err := proxy.NewWithTransport(cfg, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/emby/Items/item123/PlaybackInfo?AutoOpenLiveStream=false&IsPlayback=false", nil)
+	req.Header.Set("User-Agent", "Yamby TV")
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Emby for Android TV", Token="abc"`)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "X-Emby-Token=abc") {
+		t.Fatalf("rewritten body should carry header token: %s", rec.Body.String())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
