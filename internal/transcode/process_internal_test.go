@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -77,6 +78,9 @@ func TestSegmentInputCompatibleRejectsMediaSourceChange(t *testing.T) {
 }
 
 func TestExecProcessStopWaitsForProcessExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("linux-only process control test")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

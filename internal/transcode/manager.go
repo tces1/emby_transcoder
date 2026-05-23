@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"emby-transcoder/internal/logging"
@@ -893,14 +892,13 @@ func resolveHardwareDecodeOptionsStrict(ffmpegPath string, options FFmpegOptions
 	}
 
 	if probe == nil {
-		return resolveDefaultHardwareDecodeOptions(ffmpegPath, options)
-	}
-	if err := probe(ffmpegPath, options); err != nil {
+		if err := probeVAAPIBase(ffmpegPath, options); err != nil {
+			return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s device=%s: %w", options.HardwareDecode, options.HardwareDevice, err)
+		}
+	} else if err := probe(ffmpegPath, options); err != nil {
 		return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s device=%s: %w", options.HardwareDecode, options.HardwareDevice, err)
 	}
-	if options.HardwarePipeline == "" {
-		options.HardwarePipeline = "vaapi-full"
-	}
+	options.HardwarePipeline = "vaapi-full"
 	return options, nil
 }
 
@@ -910,16 +908,7 @@ func resolveDefaultHardwareDecodeOptions(ffmpegPath string, options FFmpegOption
 		if err := probeVAAPIBase(ffmpegPath, options); err != nil {
 			return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s device=%s: %w", options.HardwareDecode, options.HardwareDevice, err)
 		}
-		if err := probeFFmpegVAAPIFullPipeline(ffmpegPath, options.HardwareDevice); err == nil {
-			options.HardwarePipeline = "vaapi-full"
-			return options, nil
-		} else {
-			logging.Infof("hardware transcode full vaapi unavailable device=%s reason=%v fallback=vaapi-encode", options.HardwareDevice, err)
-		}
-		if err := probeFFmpegVAAPIEncodePipeline(ffmpegPath, options.HardwareDevice); err != nil {
-			return FFmpegOptions{}, fmt.Errorf("hardware decode unavailable mode=%s device=%s: %w", options.HardwareDecode, options.HardwareDevice, err)
-		}
-		options.HardwarePipeline = "vaapi-encode"
+		options.HardwarePipeline = "vaapi-full"
 		return options, nil
 	default:
 		return FFmpegOptions{}, fmt.Errorf("unsupported hardware decode mode %q", options.HardwareDecode)
@@ -932,15 +921,7 @@ func defaultHardwareProbe(ffmpegPath string, options FFmpegOptions) error {
 	}
 	switch options.HardwareDecode {
 	case "vaapi":
-		if err := probeVAAPIBase(ffmpegPath, options); err != nil {
-			return err
-		}
-		if err := probeFFmpegVAAPIFullPipeline(ffmpegPath, options.HardwareDevice); err == nil {
-			return nil
-		} else {
-			logging.Infof("hardware transcode full vaapi unavailable device=%s reason=%v fallback=vaapi-encode", options.HardwareDevice, err)
-		}
-		return probeFFmpegVAAPIEncodePipeline(ffmpegPath, options.HardwareDevice)
+		return probeVAAPIBase(ffmpegPath, options)
 	default:
 		return fmt.Errorf("unsupported hardware decode mode %q", options.HardwareDecode)
 	}
@@ -951,9 +932,6 @@ func probeVAAPIBase(ffmpegPath string, options FFmpegOptions) error {
 		return err
 	}
 	if err := probeFFmpegEncoder(ffmpegPath, "h264_vaapi"); err != nil {
-		return err
-	}
-	if err := probeFFmpegFilter(ffmpegPath, "scale_vaapi"); err != nil {
 		return err
 	}
 	if err := probeDevice(options.HardwareDevice); err != nil {
@@ -1270,10 +1248,8 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 	switch hardwarePipeline(options) {
 	case "vaapi-full":
 		return append(args,
-			"-vf", vaapiScaleFilter(maxTranscodeWidth, maxTranscodeHeight),
 			"-c:v", "h264_vaapi",
 			"-profile:v", "high",
-			"-level", "4.1",
 			"-g", strconv.Itoa(lowLatencyGOP),
 			"-keyint_min", strconv.Itoa(lowLatencyGOP),
 			"-bf", "0",
@@ -1368,31 +1344,6 @@ func (p *execProcess) Stop() error {
 	return p.StopWithGrace(5 * time.Second)
 }
 
-func (p *execProcess) StopWithGrace(grace time.Duration) error {
-	if p.cmd == nil || p.cmd.Process == nil {
-		return nil
-	}
-	if p.Done() {
-		return nil
-	}
-	if p.paused.Load() && p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Signal(syscall.SIGCONT)
-		p.paused.Store(false)
-	}
-	if p.stdin != nil {
-		_, _ = io.WriteString(p.stdin, "q\n")
-		_ = p.stdin.Close()
-	}
-	if p.waitForExit(grace) {
-		return nil
-	}
-	err := p.cmd.Process.Kill()
-	if p.waitForExit(2 * time.Second) {
-		return nil
-	}
-	return err
-}
-
 func (p *execProcess) Done() bool {
 	return p.done.Load()
 }
@@ -1412,28 +1363,6 @@ func (p *execProcess) waitForExit(timeout time.Duration) bool {
 	case <-timer.C:
 		return p.Done()
 	}
-}
-
-func (p *execProcess) Pause() error {
-	if p.cmd == nil || p.cmd.Process == nil || p.Done() || p.paused.Load() {
-		return nil
-	}
-	if err := p.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
-		return err
-	}
-	p.paused.Store(true)
-	return nil
-}
-
-func (p *execProcess) Resume() error {
-	if p.cmd == nil || p.cmd.Process == nil || p.Done() || !p.paused.Load() {
-		return nil
-	}
-	if err := p.cmd.Process.Signal(syscall.SIGCONT); err != nil {
-		return err
-	}
-	p.paused.Store(false)
-	return nil
 }
 
 func ffmpegHeaders(headers http.Header) string {

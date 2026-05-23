@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -158,15 +159,14 @@ func TestBuildFFmpegArgsUsesFullVAAPITranscodePipeline(t *testing.T) {
 	if outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
 		t.Fatalf("missing VAAPI hardware frame output: %v", args)
 	}
-	vfIndex := slices.Index(args, "-vf")
-	if vfIndex < 0 || !strings.Contains(args[vfIndex+1], "scale_vaapi=") || !strings.Contains(args[vfIndex+1], "format=nv12") {
-		t.Fatalf("expected VAAPI scale filter, args=%v", args)
-	}
 	codecIndex := slices.Index(args, "-c:v")
 	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
 		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
 	}
-	for _, softwareOnly := range []string{"libx264", "-preset", "-tune"} {
+	if slices.Contains(args, "-vf") {
+		t.Fatalf("full VAAPI pipeline should not scale, args=%v", args)
+	}
+	for _, softwareOnly := range []string{"libx264", "-preset", "-tune", "-level"} {
 		if slices.Contains(args, softwareOnly) {
 			t.Fatalf("VAAPI pipeline should not include software encoder arg %q: %v", softwareOnly, args)
 		}
@@ -278,7 +278,7 @@ func TestResolveHardwareDecodeKeepsVAAPIWhenProbePasses(t *testing.T) {
 		return nil
 	})
 
-	if options.HardwareDecode != "vaapi" || options.HardwareDevice != "/dev/dri/renderD128" {
+	if options.HardwareDecode != "vaapi" || options.HardwareDevice != "/dev/dri/renderD128" || options.HardwarePipeline != "vaapi-full" {
 		t.Fatalf("options = %+v", options)
 	}
 }
@@ -316,69 +316,10 @@ func TestResolveHardwareDecodeFalseSkipsHardwareProbe(t *testing.T) {
 	}
 }
 
-func TestResolveHardwareDecodeFallsBackToVAAPIEncodeWhenFullPipelineUnsupported(t *testing.T) {
-	tempDir := t.TempDir()
-	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
-	callsPath := filepath.Join(tempDir, "calls")
-	script := fmt.Sprintf(`#!/bin/sh
-echo "$@" >> %q
-case " $* " in
-  *" -hwaccels "*)
-    printf 'Hardware acceleration methods:\nvaapi\n'
-    exit 0
-    ;;
-  *" -encoders "*)
-    printf ' V....D h264_vaapi           H.264/AVC (VAAPI)\n'
-    exit 0
-    ;;
-  *" -filters "*)
-    printf ' ... scale_vaapi       V->V       Scale to/from VAAPI surfaces.\n'
-    exit 0
-    ;;
-  *" -init_hw_device "*"scale_vaapi="*)
-    echo 'Failed to create processing pipeline config: 12 (the requested VAProfile is not supported).' >&2
-    exit 1
-    ;;
-  *" -vaapi_device "*"hwupload"*)
-    exit 0
-    ;;
-  *" -init_hw_device "*)
-    exit 0
-    ;;
-esac
-exit 0
-`, callsPath)
-	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	devicePath := filepath.Join(tempDir, "renderD128")
-	if err := os.WriteFile(devicePath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	options, err := resolveHardwareDecodeOptionsStrict(ffmpegPath, FFmpegOptions{
-		HardwareDecode: "vaapi",
-		HardwareDevice: devicePath,
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if options.HardwarePipeline != "vaapi-encode" {
-		t.Fatalf("hardware pipeline = %q", options.HardwarePipeline)
-	}
-	calls, err := os.ReadFile(callsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"scale_vaapi=", "-vaapi_device " + devicePath, "hwupload", "-c:v h264_vaapi"} {
-		if !strings.Contains(string(calls), want) {
-			t.Fatalf("expected probe call containing %q, calls=%s", want, calls)
-		}
-	}
-}
-
 func TestDefaultHardwareProbeRejectsVAAPIWhenDeviceInitializationFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("linux-only ffmpeg probe test")
+	}
 	tempDir := t.TempDir()
 	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
 	callsPath := filepath.Join(tempDir, "calls")
@@ -391,10 +332,6 @@ case " $* " in
     ;;
   *" -encoders "*)
     printf ' V....D h264_vaapi           H.264/AVC (VAAPI)\n'
-    exit 0
-    ;;
-  *" -filters "*)
-    printf ' ... scale_vaapi       V->V       Scale to/from VAAPI surfaces.\n'
     exit 0
     ;;
   *" -init_hw_device "*)
@@ -432,7 +369,10 @@ exit 0
 	}
 }
 
-func TestDefaultHardwareProbeRequiresFullVAAPIPipeline(t *testing.T) {
+func TestDefaultHardwareProbeUsesVAAPIBaseOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("linux-only ffmpeg probe test")
+	}
 	tempDir := t.TempDir()
 	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
 	callsPath := filepath.Join(tempDir, "calls")
@@ -445,10 +385,6 @@ case " $* " in
     ;;
   *" -encoders "*)
     printf ' V....D h264_vaapi           H.264/AVC (VAAPI)\n'
-    exit 0
-    ;;
-  *" -filters "*)
-    printf ' ... scale_vaapi       V->V       Scale to/from VAAPI surfaces.\n'
     exit 0
     ;;
   *" -init_hw_device "*)
@@ -476,7 +412,7 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"-hwaccels", "-encoders", "-filters", "-init_hw_device vaapi=probe:" + devicePath, "-filter_hw_device probe", "scale_vaapi=", "-c:v h264_vaapi"} {
+	for _, want := range []string{"-hwaccels", "-encoders", "-init_hw_device vaapi=probe:" + devicePath} {
 		if !strings.Contains(string(calls), want) {
 			t.Fatalf("expected hardware probe call containing %q, calls=%s", want, calls)
 		}
