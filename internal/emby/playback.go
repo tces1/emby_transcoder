@@ -3,7 +3,9 @@ package emby
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -70,16 +72,15 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 		}
 		sourceID, _ := source["Id"].(string)
 		sessionID := SessionID(itemID, sourceID, index)
-		transcodeURL := fmt.Sprintf("/streambridge/transcode/%s/master.m3u8", sessionID)
-		if len(rawQuery) > 0 && rawQuery[0] != "" {
-			transcodeURL += "?" + rawQuery[0]
-		}
-
 		beforeDirectPlay, _ := source["SupportsDirectPlay"].(bool)
 		beforeTranscode, _ := source["SupportsTranscoding"].(bool)
 		beforeDirectStreamURL, _ := source["DirectStreamUrl"].(string)
 		beforeTranscodingURL, _ := source["TranscodingUrl"].(string)
 		sourceReport := sourceReportFromMap(source)
+		transcodeURL := fmt.Sprintf("/streambridge/transcode/%s/master.m3u8", sessionID)
+		if enrichedQuery := transcodeQueryForSource(firstRawQuery(rawQuery), sourceID, sourceReport.AudioStreams); enrichedQuery != "" {
+			transcodeURL += "?" + enrichedQuery
+		}
 		sourceReport.Index = index
 		sourceReport.ID = sourceID
 		sourceReport.SessionID = sessionID
@@ -130,6 +131,27 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 		return nil, false, report, err
 	}
 	return out, true, report, nil
+}
+
+func firstRawQuery(rawQuery []string) string {
+	if len(rawQuery) == 0 {
+		return ""
+	}
+	return rawQuery[0]
+}
+
+func transcodeQueryForSource(rawQuery string, sourceID string, audioStreams []AudioStreamReport) string {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	if sourceID != "" && query.Get("MediaSourceId") == "" {
+		query.Set("MediaSourceId", sourceID)
+	}
+	if query.Get("AudioStreamIndex") == "" && len(audioStreams) > 0 {
+		query.Set("AudioStreamIndex", strconv.Itoa(audioStreams[0].Index))
+	}
+	return query.Encode()
 }
 
 func sourceReportFromMap(source map[string]any) SourceReport {

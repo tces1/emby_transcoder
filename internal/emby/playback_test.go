@@ -57,8 +57,29 @@ func TestRewritePlaybackInfoPreservesQueryString(t *testing.T) {
 	if !changed {
 		t.Fatal("expected rewrite to change response")
 	}
-	if !bytes.Contains(out, []byte(`master.m3u8?X-Emby-Token=abc`)) {
+	if !bytes.Contains(out, []byte(`X-Emby-Token=abc`)) {
 		t.Fatalf("missing query string: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`MediaSourceId=source1`)) {
+		t.Fatalf("missing media source id: %s", out)
+	}
+}
+
+func TestRewritePlaybackInfoAddsSourceParametersWhenClientOmitsThem(t *testing.T) {
+	input := []byte(`{"MediaSources":[{"Id":"source1","SupportsDirectPlay":true,"MediaStreams":[{"Type":"Audio","Index":1,"Codec":"dts"}]}]}`)
+
+	out, changed, err := emby.RewritePlaybackInfo(input, "item123", "http://proxy.local", "AutoOpenLiveStream=false&IsPlayback=false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected rewrite to change response")
+	}
+	if !bytes.Contains(out, []byte(`MediaSourceId=source1`)) {
+		t.Fatalf("missing media source id: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`AudioStreamIndex=1`)) {
+		t.Fatalf("missing audio stream index: %s", out)
 	}
 }
 
@@ -85,7 +106,7 @@ func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
 	if source.BeforeDirectStreamURL != "/Videos/1/stream" {
 		t.Fatalf("direct stream url = %q", source.BeforeDirectStreamURL)
 	}
-	if source.AfterTranscodingURL != "/streambridge/transcode/item123/master.m3u8" {
+	if source.AfterTranscodingURL != "/streambridge/transcode/item123/master.m3u8?AudioStreamIndex=1&MediaSourceId=source1" {
 		t.Fatalf("after url = %q", source.AfterTranscodingURL)
 	}
 	if source.SessionID != "item123" {
