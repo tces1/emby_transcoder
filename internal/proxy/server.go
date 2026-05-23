@@ -121,6 +121,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		result := policy.ShouldTranscode(r.Header, s.cfg.Clients)
 		if result.Enabled {
+			logging.Infof(
+				"playbackinfo request item=%s profile=%s ua=%q query=%s token=%t",
+				itemID,
+				result.ProfileName,
+				r.Header.Get("User-Agent"),
+				redactURLString("?"+r.URL.RawQuery),
+				embyTokenFromHeaders(r.Header) != "",
+			)
 			logging.Infof("playbackinfo rewrite item=%s profile=%s", itemID, result.ProfileName)
 			s.handlePlaybackInfo(w, r)
 			return
@@ -231,6 +239,16 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 				s.transcodeManager.RememberMedia(source.SessionID, mediaInfo)
+				logging.Infof(
+					"playbackinfo source item=%s session=%s index=%d source_id=%q direct=%t transcode=%t after=%s",
+					itemID,
+					source.SessionID,
+					source.Index,
+					source.ID,
+					source.BeforeSupportsDirectPlay,
+					source.BeforeSupportsTranscode,
+					redactURLString(source.AfterTranscodingURL),
+				)
 				logging.Debugf(
 					"playbackinfo source item=%s session=%s index=%d source_id=%q before_direct=%t before_transcode=%t had_direct_stream_url=%t had_transcoding_url=%t after=%s media=%s",
 					itemID,
@@ -289,7 +307,13 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 	if info, ok := s.transcodeManager.MediaInfo(source.SessionID); ok {
 		request.Media = info
 	}
-	logging.Debugf("playbackinfo prewarm request item=%s source=%s", itemID, source.ID)
+	logging.Infof(
+		"playbackinfo prewarm request item=%s source=%s query=%s input=%s",
+		itemID,
+		source.ID,
+		redactURLString("?"+r.URL.RawQuery),
+		redactURLString(inputURL),
+	)
 	started := time.Now()
 	go func() {
 		if _, ok := s.transcodeManager.Get(source.SessionID); ok {
