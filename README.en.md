@@ -2,6 +2,15 @@
 
 [中文](README.md)
 
+[![Docker Image](https://github.com/tces1/emby_transcoder/actions/workflows/docker-image.yml/badge.svg)](https://github.com/tces1/emby_transcoder/actions/workflows/docker-image.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tces1/emby_transcoder?logo=docker&label=Docker%20Pulls)](https://hub.docker.com/r/tces1/emby_transcoder)
+[![Image](https://img.shields.io/badge/image-tces1%2Femby__transcoder-blue?logo=docker)](https://hub.docker.com/r/tces1/emby_transcoder)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey)](docker/Dockerfile)
+[![HLS](https://img.shields.io/badge/streaming-HLS%20%2B%20MPEG--TS-orange)](#transcode-lifecycle)
+[![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#configuration)
+[![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#license)
+
 EmbyTranscoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
 
 It is intentionally narrow: normal API traffic is forwarded to the upstream server, while selected clients can receive a proxy-provided HLS `TranscodingUrl` when they request `PlaybackInfo`.
@@ -143,3 +152,7 @@ EmbyTranscoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 - Segments older than `segment_retention_seconds` behind the current playback position are deleted from the local cache.
 - If neither playback activity nor HLS access arrives before `idle_timeout_seconds`, the idle reaper stops the session.
 - A new `master.m3u8` request with a different upstream stream URL, such as a seek with a different `StartTimeTicks`, restarts the local session.
+
+## License
+
+This repository does not declare an open-source license yet. After choosing MIT, Apache-2.0, or another license, add a `LICENSE` file and update the badge above.

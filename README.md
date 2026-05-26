@@ -2,6 +2,15 @@
 
 [English](README.en.md)
 
+[![Docker Image](https://github.com/tces1/emby_transcoder/actions/workflows/docker-image.yml/badge.svg)](https://github.com/tces1/emby_transcoder/actions/workflows/docker-image.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/tces1/emby_transcoder?logo=docker&label=Docker%20Pulls)](https://hub.docker.com/r/tces1/emby_transcoder)
+[![Image](https://img.shields.io/badge/image-tces1%2Femby__transcoder-blue?logo=docker)](https://hub.docker.com/r/tces1/emby_transcoder)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey)](docker/Dockerfile)
+[![HLS](https://img.shields.io/badge/streaming-HLS%20%2B%20MPEG--TS-orange)](#转码生命周期)
+[![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#配置)
+[![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#协议)
+
 EmbyTranscoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
 
 它的目标很窄：普通 API 请求继续透明转发到上游服务；命中配置规则的客户端请求 `PlaybackInfo` 时，会收到由代理提供的 HLS `TranscodingUrl`。
@@ -148,3 +157,7 @@ EmbyTranscoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 - 落后当前播放位置超过 `segment_retention_seconds` 的旧分片会从本地缓存删除。
 - 如果超过 `idle_timeout_seconds` 没有播放活动或 HLS 访问，idle reaper 会停止会话。
 - 新的 `master.m3u8` 请求如果带来不同的上游 stream URL，例如 seek 后 `StartTimeTicks` 变化，会重启本地会话。
+
+## 协议
+
+当前仓库还没有声明开源协议。确认使用 MIT、Apache-2.0 或其他协议后，可以补充 `LICENSE` 文件并把顶部 badge 改成正式协议。
