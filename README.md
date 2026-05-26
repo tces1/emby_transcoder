@@ -1,36 +1,58 @@
 # EmbyTranscoder
 
-EmbyTranscoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
+[English](README.en.md)
 
-It is intentionally narrow: normal API traffic is forwarded to the upstream server, while selected clients can receive a proxy-provided HLS `TranscodingUrl` when they request `PlaybackInfo`.
+EmbyTranscoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
 
-## Current Scope
+它的目标很窄：普通 API 请求继续透明转发到上游服务；命中配置规则的客户端请求 `PlaybackInfo` 时，会收到由代理提供的 HLS `TranscodingUrl`。
 
-- Native Linux-friendly Go binary.
-- Transparent reverse proxy for ordinary Emby/Jellyfin requests.
-- Client profile matching by `User-Agent` and `X-Emby-Authorization`.
-- PlaybackInfo rewriting for matched profiles.
-- Local FFmpeg HLS sessions under `/streambridge/transcode/`.
-- Audio track selection through Emby `AudioStreamIndex`, with local transcode restart on audio changes.
-- Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
-- Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
-- Video output is capped at 1920x1080 and keeps aspect ratio.
-- PlaybackInfo rewrite prewarms the transcode session before the first playlist request.
-- FFmpeg uses low-latency startup and GOP settings to cut first-segment delay.
+## 当前功能
 
-Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
+- 原生 Go 二进制，适合 Linux 部署。
+- 普通 Emby/Jellyfin 请求透明反向代理。
+- 按 `User-Agent` 和 `X-Emby-Authorization` 匹配客户端配置。
+- 对命中的客户端重写 PlaybackInfo。
+- 本地 FFmpeg HLS 会话路径为 `/streambridge/transcode/`。
+- 支持通过 Emby `AudioStreamIndex` 选择音轨，切换音轨时会重启本地转码。
+- 通过 Emby `/Sessions/Playing*` check-in 和 HLS 访问跟踪播放生命周期。
+- 输出目标保守固定为 H.264 视频、AAC 音频、HLS MPEG-TS 分片。
+- 视频输出限制到 1920x1080，并保持原始宽高比。
+- PlaybackInfo 重写时会预热转码会话，减少首次 playlist 请求等待。
+- FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
 
-## Run
+不包含：虚拟媒体库、RSS、封面生成、刮削、数据库存储或管理 UI。
+
+## 直接运行
 
 ```bash
 go run ./cmd/emby-transcoder -config config.example.json
 ```
 
-Point a client at the proxy listen address, for example `http://linux-host:8097`.
+然后让客户端连接代理地址，例如 `http://linux-host:8097`。
 
 ## Docker Compose
 
-The published linux/amd64 image is available as `tces1/emby_transcoder:latest`.
+使用 Docker Hub 公共镜像 `tces1/emby_transcoder:latest`。`docker/` 目录里的 compose 文件已经指向这个发布好的 linux/amd64 镜像，不会在本地 build。
+
+最小 compose 服务示例：
+
+```yaml
+services:
+  emby-transcoder:
+    image: tces1/emby_transcoder:latest
+    container_name: emby-transcoder
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8097:8097"
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./config/config.json:/app/config/config.json:ro
+      - ./data/transcode:/var/lib/emby-transcoder/transcode
+```
+
+使用仓库内的 compose 模板：
 
 ```bash
 cd docker
@@ -38,16 +60,16 @@ mkdir -p data/transcode
 cp config/config.json config/config.local.json
 ```
 
-Edit `docker/config/config.local.json` before starting:
+启动前修改 `docker/config/config.local.json`：
 
-- set `upstream.url` to your Emby or Jellyfin server
-- set `server.public_url` if clients reach the proxy through another reverse proxy
-- leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
-- set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` VAAPI support
-- VAAPI mode first tries `vaapi-full` (`scale_vaapi` GPU scaling plus `h264_vaapi` encoding), then falls back to `vaapi-encode` (CPU scaling plus `h264_vaapi`) when GPU scaling is unsupported
-- startup will probe VAAPI availability, including device initialization and `h264_vaapi`, and fail startup if the device, driver, or ffmpeg support is missing
+- 将 `upstream.url` 改成你的 Emby 或 Jellyfin 地址。
+- 如果客户端通过另一层反向代理访问本服务，设置 `server.public_url`。
+- `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
+- Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_decode` 设置为 `vaapi`。
+- VAAPI 会先尝试 `vaapi-full`（`scale_vaapi` GPU 缩放加 `h264_vaapi` 编码），不支持 GPU 缩放时回退到 `vaapi-encode`（CPU 缩放加 `h264_vaapi` 编码）。
+- 启动时会探测 VAAPI 可用性，包括设备初始化和 `h264_vaapi`；设备、驱动或 ffmpeg 支持缺失时会启动失败。
 
-Update `docker/docker-compose.yml` to mount the local config file if you use `config.local.json`:
+如果使用 `config.local.json`，需要把 `docker/docker-compose.yml` 的挂载改成本地配置文件：
 
 ```yaml
 volumes:
@@ -55,7 +77,7 @@ volumes:
   - ./data/transcode:/var/lib/emby-transcoder/transcode
 ```
 
-Start or update the service:
+启动或更新服务：
 
 ```bash
 docker compose pull
@@ -63,21 +85,21 @@ docker compose up -d
 docker compose logs -f
 ```
 
-Stop the service:
+停止服务：
 
 ```bash
 docker compose down
 ```
 
-## Build
+## 编译
 
 ```bash
 go build ./cmd/emby-transcoder
 ```
 
-## Configuration
+## 配置
 
-Copy `config.example.json` and change the upstream URL:
+复制 `config.example.json`，然后修改上游地址：
 
 ```json
 {
@@ -105,21 +127,24 @@ Copy `config.example.json` and change the upstream URL:
 }
 ```
 
-Leave `public_url` empty when clients connect directly to EmbyTranscoder. Set it when EmbyTranscoder sits behind another reverse proxy.
-Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
-Set `hardware_decode` to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
-Startup prefers `vaapi-full`; if `scale_vaapi` fails, it falls back to `vaapi-encode` so H.264 encoding still stays on the GPU. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
+客户端直接连接 EmbyTranscoder 时，`public_url` 留空。服务在另一层反向代理后面时，再设置它。
 
-## Transcode Lifecycle
+`debug` 保持 `false` 时只输出动作级日志；需要 `TRACE_SWITCH` 和请求级诊断时设置为 `true`。
 
-EmbyTranscoder keeps local FFmpeg sessions tied to Emby playback check-ins:
+设置 `hardware_decode` 为 `vaapi` 可启用 VAAPI 硬件转码，默认设备是 `/dev/dri/renderD128`。
 
-- `POST /Sessions/Playing` and `/Sessions/Playing/Progress` update local playback state.
-- `POST /Sessions/Playing/Stopped` immediately stops the matching local FFmpeg session.
-- HLS playlist and segment requests refresh media activity.
-- `segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count, while `1` is fastest and higher values reduce disk churn.
-- When transcoded media gets more than `buffer_pause_seconds` ahead of playback, FFmpeg is paused.
-- When buffered media falls back under `buffer_resume_seconds`, FFmpeg resumes.
-- Segments older than `segment_retention_seconds` behind the current playback position are deleted from the local cache.
-- If neither playback activity nor HLS access arrives before `idle_timeout_seconds`, the idle reaper stops the session.
-- A new `master.m3u8` request with a different upstream stream URL, such as a seek with a different `StartTimeTicks`, restarts the local session.
+启动时优先使用 `vaapi-full`；如果 `scale_vaapi` 失败，会回退到 `vaapi-encode`，仍然使用 GPU 做 H.264 编码。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
+
+## 转码生命周期
+
+EmbyTranscoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
+
+- `POST /Sessions/Playing` 和 `/Sessions/Playing/Progress` 更新本地播放状态。
+- `POST /Sessions/Playing/Stopped` 会立即停止匹配的本地 FFmpeg 会话。
+- HLS playlist 和 segment 请求会刷新媒体访问时间。
+- `segment_seconds` 控制 HLS 分片时长；默认 `2` 秒，兼顾启动延迟和分片数量。设为 `1` 启动最快，更高值会减少文件数量和磁盘抖动。
+- 已转码内容超过播放位置 `buffer_pause_seconds` 时，暂停 FFmpeg。
+- 缓冲回落到 `buffer_resume_seconds` 以下时，恢复 FFmpeg。
+- 落后当前播放位置超过 `segment_retention_seconds` 的旧分片会从本地缓存删除。
+- 如果超过 `idle_timeout_seconds` 没有播放活动或 HLS 访问，idle reaper 会停止会话。
+- 新的 `master.m3u8` 请求如果带来不同的上游 stream URL，例如 seek 后 `StartTimeTicks` 变化，会重启本地会话。
