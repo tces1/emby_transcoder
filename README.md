@@ -1,4 +1,4 @@
-# EmbyTranscoder
+# Emby-Transcoder
 
 [English](README.en.md)
 
@@ -11,7 +11,7 @@
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#配置)
 [![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#协议)
 
-EmbyTranscoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
+Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
 
 它的目标很窄：普通 API 请求继续透明转发到上游服务；命中配置规则的客户端请求 `PlaybackInfo` 时，会收到由代理提供的 HLS `TranscodingUrl`。
 
@@ -136,7 +136,7 @@ go build ./cmd/emby-transcoder
 }
 ```
 
-客户端直接连接 EmbyTranscoder 时，`public_url` 留空。服务在另一层反向代理后面时，再设置它。
+客户端直接连接 Emby-Transcoder 时，`public_url` 留空。服务在另一层反向代理后面时，再设置它。
 
 `debug` 保持 `false` 时只输出动作级日志；需要 `TRACE_SWITCH` 和请求级诊断时设置为 `true`。
 
@@ -146,7 +146,7 @@ go build ./cmd/emby-transcoder
 
 ## 转码生命周期
 
-EmbyTranscoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
+Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 
 - `POST /Sessions/Playing` 和 `/Sessions/Playing/Progress` 更新本地播放状态。
 - `POST /Sessions/Playing/Stopped` 会立即停止匹配的本地 FFmpeg 会话。

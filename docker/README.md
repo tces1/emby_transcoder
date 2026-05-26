@@ -2,7 +2,7 @@
 
 ## Files
 
-- `Dockerfile`: multi-stage image build for EmbyTranscoder plus runtime `ffmpeg`
+- `Dockerfile`: multi-stage image build for Emby-Transcoder plus runtime `ffmpeg`
 - `docker-compose.yml`: container run setup using `tces1/emby_transcoder:latest`
 - `config/config.json`: container config template
 

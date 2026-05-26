@@ -1,4 +1,4 @@
-# EmbyTranscoder
+# Emby-Transcoder
 
 [中文](README.md)
 
@@ -11,7 +11,7 @@
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#configuration)
 [![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#license)
 
-EmbyTranscoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
+Emby-Transcoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
 
 It is intentionally narrow: normal API traffic is forwarded to the upstream server, while selected clients can receive a proxy-provided HLS `TranscodingUrl` when they request `PlaybackInfo`.
 
@@ -134,14 +134,14 @@ Copy `config.example.json` and change the upstream URL:
 }
 ```
 
-Leave `public_url` empty when clients connect directly to EmbyTranscoder. Set it when EmbyTranscoder sits behind another reverse proxy.
+Leave `public_url` empty when clients connect directly to Emby-Transcoder. Set it when Emby-Transcoder sits behind another reverse proxy.
 Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
 Set `hardware_decode` to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
 Startup prefers `vaapi-full`; if `scale_vaapi` fails, it falls back to `vaapi-encode` so H.264 encoding still stays on the GPU. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
 
 ## Transcode Lifecycle
 
-EmbyTranscoder keeps local FFmpeg sessions tied to Emby playback check-ins:
+Emby-Transcoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 
 - `POST /Sessions/Playing` and `/Sessions/Playing/Progress` update local playback state.
 - `POST /Sessions/Playing/Stopped` immediately stops the matching local FFmpeg session.
