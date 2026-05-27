@@ -15,6 +15,22 @@ Emby-Transcoder is a lightweight Go reverse proxy that adds local FFmpeg HLS tra
 
 It is intentionally narrow: normal API traffic is forwarded to the upstream server, while selected clients can receive a proxy-provided HLS `TranscodingUrl` when they request `PlaybackInfo`.
 
+## How It Works
+
+```text
+Emby / Jellyfin client
+        |
+        v
+  Emby-Transcoder
+  - transparent proxy for ordinary requests
+  - PlaybackInfo matching by client profile
+  - PlaybackInfo rewrite to local HLS
+  - local FFmpeg transcode sessions
+        |
+        v
+  upstream Emby / Jellyfin
+```
+
 ## Current Scope
 
 - Native Linux-friendly Go binary.

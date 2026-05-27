@@ -15,6 +15,22 @@ Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客�
 
 它的目标很窄：普通 API 请求继续透明转发到上游服务；命中配置规则的客户端请求 `PlaybackInfo` 时，会收到由代理提供的 HLS `TranscodingUrl`。
 
+## 工作方式
+
+```text
+Emby / Jellyfin 客户端
+        |
+        v
+  Emby-Transcoder
+  - 普通请求透明转发
+  - 按客户端配置匹配 PlaybackInfo
+  - 将命中的 PlaybackInfo 改写到本地 HLS
+  - 在本机维护 FFmpeg 转码会话
+        |
+        v
+  上游 Emby / Jellyfin
+```
+
 ## 当前功能
 
 - 原生 Go 二进制，适合 Linux 部署。
