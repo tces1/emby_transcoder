@@ -19,13 +19,13 @@ Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客�
 
 - 原生 Go 二进制，适合 Linux 部署。
 - 普通 Emby/Jellyfin 请求透明反向代理。
-- 按 `User-Agent` 和 `X-Emby-Authorization` 匹配客户端配置。
+- 按 `User-Agent`、`X-Emby-Authorization` 和 `X-MediaBrowser-Token` 匹配客户端配置。
 - 对命中的客户端重写 PlaybackInfo。
 - 本地 FFmpeg HLS 会话路径为 `/streambridge/transcode/`。
 - 支持通过 Emby `AudioStreamIndex` 选择音轨，切换音轨时会重启本地转码。
 - 通过 Emby `/Sessions/Playing*` check-in 和 HLS 访问跟踪播放生命周期。
 - 输出目标保守固定为 H.264 视频、AAC 音频、HLS MPEG-TS 分片。
-- 视频输出限制到 1920x1080，并保持原始宽高比。
+- 软件转码会把视频输出限制到 1920x1080，并保持原始宽高比；VAAPI 模式不做缩放。
 - PlaybackInfo 重写时会预热转码会话，减少首次 playlist 请求等待。
 - FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
 
@@ -74,8 +74,9 @@ cp config/config.json config/config.local.json
 - 将 `upstream.url` 改成你的 Emby 或 Jellyfin 地址。
 - 如果客户端通过另一层反向代理访问本服务，设置 `server.public_url`。
 - `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
+- `transcode.hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。
 - Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_decode` 设置为 `vaapi`。
-- VAAPI 会先尝试 `vaapi-full`（`scale_vaapi` GPU 缩放加 `h264_vaapi` 编码），不支持 GPU 缩放时回退到 `vaapi-encode`（CPU 缩放加 `h264_vaapi` 编码）。
+- 当前 VAAPI 模式使用硬件解码加 `h264_vaapi` 硬件编码，不再插入缩放过滤器。
 - 启动时会探测 VAAPI 可用性，包括设备初始化和 `h264_vaapi`；设备、驱动或 ffmpeg 支持缺失时会启动失败。
 
 如果使用 `config.local.json`，需要把 `docker/docker-compose.yml` 的挂载改成本地配置文件：
@@ -140,9 +141,9 @@ go build ./cmd/emby-transcoder
 
 `debug` 保持 `false` 时只输出动作级日志；需要 `TRACE_SWITCH` 和请求级诊断时设置为 `true`。
 
-设置 `hardware_decode` 为 `vaapi` 可启用 VAAPI 硬件转码，默认设备是 `/dev/dri/renderD128`。
+`hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。设置为 `vaapi` 可启用 VAAPI 硬件转码，默认设备是 `/dev/dri/renderD128`。
 
-启动时优先使用 `vaapi-full`；如果 `scale_vaapi` 失败，会回退到 `vaapi-encode`，仍然使用 GPU 做 H.264 编码。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
+当前 VAAPI 模式使用硬件解码加 `h264_vaapi` 硬件编码，不再插入缩放过滤器。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
 
 ## 转码生命周期
 

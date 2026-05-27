@@ -23,11 +23,12 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `upstream.url` to your Emby or Jellyfin server
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set `server.debug` to `true` when you need detailed diagnostics
+- leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
 - set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI through `/dev/dri`
-- VAAPI mode first tries `vaapi-full` (`scale_vaapi` GPU scaling plus `h264_vaapi` encoding), then falls back to `vaapi-encode` (CPU scaling plus `h264_vaapi`) when GPU scaling is unsupported
+- VAAPI mode uses hardware decode plus `h264_vaapi` hardware encoding and does not add a scale filter
 - startup probes VAAPI support, including device initialization and `h264_vaapi`, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
-- video output is capped at 1920x1080 while preserving aspect ratio
+- software transcoding caps video output at 1920x1080 while preserving aspect ratio; VAAPI mode does not scale
 - `transcode.segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count
 - playbackinfo rewrites prewarm the transcode session before the first playlist request
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
