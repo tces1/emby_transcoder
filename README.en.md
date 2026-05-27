@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey)](docker/Dockerfile)
 [![HLS](https://img.shields.io/badge/streaming-HLS%20%2B%20MPEG--TS-orange)](#transcode-lifecycle)
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#configuration)
-[![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#license)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 Emby-Transcoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
 
@@ -172,4 +172,6 @@ Emby-Transcoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 
 ## License
 
-This repository does not declare an open-source license yet. After choosing MIT, Apache-2.0, or another license, add a `LICENSE` file and update the badge above.
+This repository's code is licensed under the [Apache License 2.0](LICENSE), Copyright 2026 tces1.
+
+Debian, FFmpeg, and VAAPI userspace components included in the Docker image remain under their respective upstream licenses.

@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey)](docker/Dockerfile)
 [![HLS](https://img.shields.io/badge/streaming-HLS%20%2B%20MPEG--TS-orange)](#转码生命周期)
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#配置)
-[![License](https://img.shields.io/badge/license-not%20specified-lightgrey)](#协议)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
 
@@ -177,4 +177,6 @@ Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 
 ## 协议
 
-当前仓库还没有声明开源协议。确认使用 MIT、Apache-2.0 或其他协议后，可以补充 `LICENSE` 文件并把顶部 badge 改成正式协议。
+本仓库代码以 [Apache License 2.0](LICENSE) 发布，Copyright 2026 tces1。
+
+Docker 镜像中包含的 Debian、FFmpeg 和 VAAPI 相关用户态组件遵循各自上游许可证。
