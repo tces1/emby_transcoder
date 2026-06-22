@@ -1249,7 +1249,6 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 	case "vaapi-full":
 		return append(args,
 			"-c:v", "h264_vaapi",
-			"-profile:v", "high",
 			"-g", strconv.Itoa(lowLatencyGOP),
 			"-keyint_min", strconv.Itoa(lowLatencyGOP),
 			"-bf", "0",
@@ -1259,7 +1258,6 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 		return append(args,
 			"-vf", softwareScaleFilter(maxTranscodeWidth, maxTranscodeHeight)+",format=nv12,hwupload",
 			"-c:v", "h264_vaapi",
-			"-profile:v", "high",
 			"-level", "4.1",
 			"-g", strconv.Itoa(lowLatencyGOP),
 			"-keyint_min", strconv.Itoa(lowLatencyGOP),
@@ -1291,6 +1289,13 @@ func softwareScaleFilter(width, height int) string {
 }
 
 func audioMapArg(session *Session, request Request) string {
+	if request.AudioStreamIndex != 0 && session != nil {
+		for _, audio := range session.Media.AudioStreams {
+			if audio.Index == request.AudioStreamIndex {
+				return fmt.Sprintf("0:a:%d?", audio.Ordinal)
+			}
+		}
+	}
 	return "0:a:0?"
 }
 

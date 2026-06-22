@@ -206,6 +206,28 @@ func TestBuildFFmpegArgsUsesVAAPIEncodeFallbackPipeline(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsDoesNotForceVAAPIH264Profile(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	for _, pipeline := range []string{"vaapi-full", "vaapi-encode"} {
+		t.Run(pipeline, func(t *testing.T) {
+			args := buildFFmpegArgs(session, request, FFmpegOptions{
+				HardwareDecode:   "vaapi",
+				HardwareDevice:   "/dev/dri/renderD128",
+				HardwarePipeline: pipeline,
+			})
+
+			if slices.Contains(args, "-profile:v") {
+				t.Fatalf("VAAPI pipeline should not force H.264 profile: %v", args)
+			}
+		})
+	}
+}
+
 func TestBuildFFmpegArgsCapsVideoOutputTo1080p(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
@@ -227,7 +249,7 @@ func TestBuildFFmpegArgsCapsVideoOutputTo1080p(t *testing.T) {
 	}
 }
 
-func TestBuildFFmpegArgsMapsFirstAudioStreamReturnedByEmby(t *testing.T) {
+func TestBuildFFmpegArgsMapsFirstAudioStreamWhenNoAudioStreamIndexRequested(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
 		Dir: t.TempDir(),
@@ -235,6 +257,30 @@ func TestBuildFFmpegArgsMapsFirstAudioStreamReturnedByEmby(t *testing.T) {
 			AudioStreams: []AudioStreamInfo{
 				{Index: 1, Ordinal: 0, Codec: "dts"},
 				{Index: 2, Ordinal: 1, Codec: "aac"},
+			},
+		},
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	args := buildFFmpegArgs(session, request)
+
+	mapIndexes := allIndexes(args, "-map")
+	if len(mapIndexes) < 2 {
+		t.Fatalf("missing map args: %v", args)
+	}
+	if got := args[mapIndexes[1]+1]; got != "0:a:0?" {
+		t.Fatalf("audio map = %q, args=%v", got, args)
+	}
+}
+
+func TestBuildFFmpegArgsMapsRequestedAudioStreamIndex(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+		Media: MediaInfo{
+			AudioStreams: []AudioStreamInfo{
+				{Index: 1, Ordinal: 0, Codec: "aac"},
+				{Index: 2, Ordinal: 1, Codec: "eac3"},
 			},
 		},
 	}
@@ -249,7 +295,7 @@ func TestBuildFFmpegArgsMapsFirstAudioStreamReturnedByEmby(t *testing.T) {
 	if len(mapIndexes) < 2 {
 		t.Fatalf("missing map args: %v", args)
 	}
-	if got := args[mapIndexes[1]+1]; got != "0:a:0?" {
+	if got := args[mapIndexes[1]+1]; got != "0:a:1?" {
 		t.Fatalf("audio map = %q, args=%v", got, args)
 	}
 }
