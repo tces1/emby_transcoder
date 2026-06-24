@@ -252,6 +252,30 @@ func TestBuildFFmpegArgsUsesVAAPILowPowerEncoding(t *testing.T) {
 	}
 }
 
+func TestEffectiveFFmpegOptionsUsesSessionPipelineOverride(t *testing.T) {
+	options := effectiveFFmpegOptions(&Session{HardwarePipeline: "vaapi-encode"}, FFmpegOptions{
+		HardwareDecode:   "vaapi",
+		HardwareDevice:   "/dev/dri/renderD128",
+		HardwarePipeline: "vaapi-full",
+	})
+
+	if options.HardwarePipeline != "vaapi-encode" {
+		t.Fatalf("pipeline = %q", options.HardwarePipeline)
+	}
+
+	args := buildFFmpegArgs(&Session{ID: "item123", Dir: t.TempDir()}, Request{InputURL: "http://upstream/stream"}, options)
+	if slices.Contains(args, "-hwaccel") {
+		t.Fatalf("fallback pipeline should not use VAAPI hardware decode: %v", args)
+	}
+	if deviceIndex := slices.Index(args, "-vaapi_device"); deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
+		t.Fatalf("fallback pipeline should keep VAAPI encode device: %v", args)
+	}
+	vfIndex := slices.Index(args, "-vf")
+	if vfIndex < 0 || !strings.Contains(args[vfIndex+1], "format=nv12,hwupload") {
+		t.Fatalf("fallback pipeline should upload software-decoded frames: %v", args)
+	}
+}
+
 func TestBuildFFmpegArgsCapsVideoOutputTo1080p(t *testing.T) {
 	session := &Session{
 		ID:  "item123",

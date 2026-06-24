@@ -88,6 +88,7 @@ type Session struct {
 	PositionTicks           int64
 	Paused                  bool
 	bufferPaused            bool
+	HardwarePipeline        string
 
 	cancel  context.CancelFunc
 	process Process
@@ -102,10 +103,11 @@ type Runner interface {
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	options  Options
-	sessions map[string]*Session
-	media    map[string]MediaInfo
+	mu                  sync.Mutex
+	options             Options
+	sessions            map[string]*Session
+	media               map[string]MediaInfo
+	vaapiEncodeFallback map[string]bool
 }
 
 func NewManager(options Options) *Manager {
@@ -120,7 +122,7 @@ func NewManager(options Options) *Manager {
 			Options: ffmpegOptions,
 		}
 	}
-	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}
+	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}, vaapiEncodeFallback: map[string]bool{}}
 }
 
 func NewManagerStrict(options Options) (*Manager, error) {
@@ -141,7 +143,7 @@ func NewManagerStrict(options Options) (*Manager, error) {
 			Options: ffmpegOptions,
 		}
 	}
-	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}}, nil
+	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}, vaapiEncodeFallback: map[string]bool{}}, nil
 }
 
 func normalizeManagerOptions(options Options) Options {
@@ -346,6 +348,10 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		if existing, ok := m.sessions[id]; ok {
 			if sessionProcessDone(existing) {
 				delete(m.sessions, id)
+				if shouldFallbackToVAAPIEncode(existing, m.options.Runner) {
+					m.vaapiEncodeFallback[id] = true
+					logging.Infof("hardware transcode fallback id=%s from=vaapi-full to=vaapi-encode reason=process_done", id)
+				}
 				stale = existing
 				traceSwitch("manager_restart_done id=%s input=%s", id, redactURLString(existing.InputURL))
 			} else if shouldRestart(existing, request) {
@@ -386,6 +392,12 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		session := &Session{ID: id, Dir: dir, InputURL: request.InputURL, LastAccess: now, LastMediaAccess: now, cancel: cancel}
+		if runner, ok := m.options.Runner.(FFmpegRunner); ok {
+			session.HardwarePipeline = effectiveFFmpegOptions(session, runner.Options).HardwarePipeline
+		}
+		if m.vaapiEncodeFallback[id] {
+			session.HardwarePipeline = "vaapi-encode"
+		}
 		session.SegmentTicks = m.segmentTicks()
 		touchSession(session, request, now, true)
 		if session.Media.IsZero() {
@@ -837,6 +849,20 @@ func sessionProcessDone(session *Session) bool {
 	return ok && process.Done()
 }
 
+func shouldFallbackToVAAPIEncode(session *Session, runner Runner) bool {
+	if session == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(session.HardwarePipeline), "vaapi-encode") {
+		return false
+	}
+	ffmpegRunner, ok := runner.(FFmpegRunner)
+	if !ok {
+		return false
+	}
+	return hardwarePipeline(ffmpegRunner.Options) == "vaapi-full"
+}
+
 func formatTicks(ticks int64) string {
 	if ticks <= 0 {
 		return "0s"
@@ -1101,10 +1127,11 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		return nil, errors.New("ffmpeg path is required")
 	}
 
-	args := buildFFmpegArgs(session, request, r.Options)
+	options := effectiveFFmpegOptions(session, r.Options)
+	args := buildFFmpegArgs(session, request, options)
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	logPath := filepath.Join(session.Dir, "ffmpeg.log")
-	logging.Infof("transcode start id=%s segment=%d decode=%s audio_stream_index=%d audio_map=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(r.Options), request.AudioStreamIndex, audioMapArg(session, request), logPath)
+	logging.Infof("transcode start id=%s segment=%d decode=%s audio_stream_index=%d audio_map=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(options), request.AudioStreamIndex, audioMapArg(session, request), logPath)
 	logging.Debugf("ffmpeg start id=%s item=%s media_source=%s start_ticks=%d segment_start=%d path=%s input=%s playlist=%s media=%s args=%s", session.ID, session.ItemID, session.MediaSourceID, session.StartTimeTicks, session.SegmentStartIndex, r.Path, redactURLString(request.InputURL), playlist, session.Media.Summary(), redactFFmpegArgs(args))
 	cmd := exec.CommandContext(ctx, r.Path, args...)
 	stdin, err := cmd.StdinPipe()
@@ -1121,7 +1148,7 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		_ = logFile.Close()
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
-	logging.Infof("ffmpeg started id=%s pid=%d decode=%s", session.ID, cmd.Process.Pid, ffmpegOptionsSummary(r.Options))
+	logging.Infof("ffmpeg started id=%s pid=%d decode=%s", session.ID, cmd.Process.Pid, ffmpegOptionsSummary(options))
 	process := &execProcess{cmd: cmd, logFile: logFile, stdin: stdin, doneCh: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
@@ -1142,6 +1169,16 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		logging.Debugf("ffmpeg exited id=%s err=nil log=%s", session.ID, logPath)
 	}()
 	return process, nil
+}
+
+func effectiveFFmpegOptions(session *Session, options FFmpegOptions) FFmpegOptions {
+	if session == nil {
+		return options
+	}
+	if pipeline := strings.TrimSpace(session.HardwarePipeline); pipeline != "" {
+		options.HardwarePipeline = pipeline
+	}
+	return options
 }
 
 func archiveFailedTranscodeLog(session *Session, logPath string) (string, error) {
