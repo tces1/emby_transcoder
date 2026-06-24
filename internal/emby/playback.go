@@ -29,6 +29,9 @@ type SourceReport struct {
 	Path                     string
 	Container                string
 	VideoCodec               string
+	VideoProfile             string
+	VideoPixelFormat         string
+	VideoBitDepth            int
 	Width                    int
 	Height                   int
 	AudioCodec               string
@@ -97,6 +100,9 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 			Path:                     sourceReport.Path,
 			Container:                sourceReport.Container,
 			VideoCodec:               sourceReport.VideoCodec,
+			VideoProfile:             sourceReport.VideoProfile,
+			VideoPixelFormat:         sourceReport.VideoPixelFormat,
+			VideoBitDepth:            sourceReport.VideoBitDepth,
 			Width:                    sourceReport.Width,
 			Height:                   sourceReport.Height,
 			AudioCodec:               sourceReport.AudioCodec,
@@ -173,6 +179,9 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 		switch {
 		case strings.EqualFold(stringValue(stream, "Type"), "Video") && report.VideoCodec == "":
 			report.VideoCodec = stringValue(stream, "Codec")
+			report.VideoProfile = stringValue(stream, "Profile")
+			report.VideoPixelFormat = stringValue(stream, "PixelFormat")
+			report.VideoBitDepth = intValue(stream, "BitDepth")
 			report.Width = intValue(stream, "Width")
 			report.Height = intValue(stream, "Height")
 		case strings.EqualFold(stringValue(stream, "Type"), "Audio"):

@@ -207,6 +207,61 @@ func TestBuildFFmpegArgsUsesVAAPIEncodeFallbackPipeline(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsUsesVAAPIHybridPipelineForHEVCMain10(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+		Media: MediaInfo{
+			VideoCodec:    "hevc",
+			VideoProfile:  "Main 10",
+			VideoBitDepth: 10,
+			Width:         3840,
+			Height:        1920,
+		},
+		HardwarePipeline: selectHardwarePipeline(MediaInfo{
+			VideoCodec:    "hevc",
+			VideoProfile:  "Main 10",
+			VideoBitDepth: 10,
+			Width:         3840,
+			Height:        1920,
+		}, "vaapi-full"),
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	args := buildFFmpegArgs(session, request, effectiveFFmpegOptions(session, FFmpegOptions{
+		HardwareDecode:   "vaapi",
+		HardwareDevice:   "/dev/dri/renderD128",
+		HardwarePipeline: "vaapi-full",
+	}))
+
+	if got := session.HardwarePipeline; got != "vaapi-hybrid" {
+		t.Fatalf("pipeline = %q", got)
+	}
+	if hwaccelIndex := slices.Index(args, "-hwaccel"); hwaccelIndex < 0 || args[hwaccelIndex+1] != "vaapi" {
+		t.Fatalf("missing VAAPI hardware decode: %v", args)
+	}
+	if outputFormatIndex := slices.Index(args, "-hwaccel_output_format"); outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
+		t.Fatalf("missing VAAPI surface output: %v", args)
+	}
+	if deviceIndex := slices.Index(args, "-vaapi_device"); deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
+		t.Fatalf("missing VAAPI upload/encode device: %v", args)
+	}
+	vfIndex := slices.Index(args, "-vf")
+	if vfIndex < 0 {
+		t.Fatalf("missing filter chain: %v", args)
+	}
+	filter := args[vfIndex+1]
+	for _, want := range []string{"hwdownload", "format=p010le", "scale=", "format=nv12", "hwupload"} {
+		if !strings.Contains(filter, want) {
+			t.Fatalf("hybrid filter missing %q: %q", want, filter)
+		}
+	}
+	codecIndex := slices.Index(args, "-c:v")
+	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
+		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
+	}
+}
+
 func TestBuildFFmpegArgsDoesNotForceVAAPIH264Profile(t *testing.T) {
 	session := &Session{
 		ID:  "item123",

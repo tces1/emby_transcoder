@@ -224,6 +224,9 @@ type MediaInfo struct {
 	Path          string
 	Container     string
 	VideoCodec    string
+	VideoProfile  string
+	VideoPixFmt   string
+	VideoBitDepth int
 	Width         int
 	Height        int
 	AudioCodec    string
@@ -257,6 +260,15 @@ func (info MediaInfo) Summary() string {
 		video := strings.TrimSpace(info.VideoCodec)
 		if video == "" {
 			video = "unknown"
+		}
+		if info.VideoProfile != "" {
+			video += " " + info.VideoProfile
+		}
+		if info.VideoBitDepth > 0 {
+			video += fmt.Sprintf(" %dbit", info.VideoBitDepth)
+		}
+		if info.VideoPixFmt != "" {
+			video += " " + info.VideoPixFmt
 		}
 		if info.Width > 0 || info.Height > 0 {
 			video += fmt.Sprintf(" %dx%d", info.Width, info.Height)
@@ -298,6 +310,9 @@ func (info MediaInfo) IsZero() bool {
 		info.Path == "" &&
 		info.Container == "" &&
 		info.VideoCodec == "" &&
+		info.VideoProfile == "" &&
+		info.VideoPixFmt == "" &&
+		info.VideoBitDepth == 0 &&
 		info.Width == 0 &&
 		info.Height == 0 &&
 		info.AudioCodec == "" &&
@@ -375,6 +390,14 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 			}
 			continue
 		}
+		done := m.removeDoneSessionsLocked(id)
+		if len(done) > 0 {
+			m.mu.Unlock()
+			for _, session := range done {
+				_ = stopSession(session)
+			}
+			continue
+		}
 		if len(m.sessions) >= m.options.MaxSessions {
 			logging.Errorf("transcode limit id=%s active=%d max=%d", id, len(m.sessions), m.options.MaxSessions)
 			m.mu.Unlock()
@@ -395,13 +418,14 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		if runner, ok := m.options.Runner.(FFmpegRunner); ok {
 			session.HardwarePipeline = effectiveFFmpegOptions(session, runner.Options).HardwarePipeline
 		}
-		if m.vaapiEncodeFallback[id] {
-			session.HardwarePipeline = "vaapi-encode"
-		}
 		session.SegmentTicks = m.segmentTicks()
 		touchSession(session, request, now, true)
 		if session.Media.IsZero() {
 			session.Media = m.media[id]
+		}
+		session.HardwarePipeline = selectHardwarePipeline(session.Media, session.HardwarePipeline)
+		if m.vaapiEncodeFallback[id] {
+			session.HardwarePipeline = "vaapi-encode"
 		}
 		if session.ItemID == "" {
 			session.ItemID = id
@@ -571,7 +595,7 @@ func (m *Manager) ReapIdle() {
 	now := time.Now()
 	var expired []string
 	for id, session := range m.sessions {
-		if now.Sub(sessionIdleReference(session)) > m.options.IdleTimeout {
+		if sessionProcessDone(session) || now.Sub(sessionIdleReference(session)) > m.options.IdleTimeout {
 			expired = append(expired, id)
 		}
 	}
@@ -580,6 +604,19 @@ func (m *Manager) ReapIdle() {
 	for _, id := range expired {
 		_ = m.Stop(id)
 	}
+}
+
+func (m *Manager) removeDoneSessionsLocked(exceptID string) []*Session {
+	var done []*Session
+	for id, session := range m.sessions {
+		if id == exceptID || !sessionProcessDone(session) {
+			continue
+		}
+		delete(m.sessions, id)
+		done = append(done, session)
+		logging.Infof("transcode reap done id=%s", id)
+	}
+	return done
 }
 
 func (m *Manager) ReconcileBuffers() {
@@ -886,6 +923,7 @@ type FFmpegOptions struct {
 	HardwareDecode   string
 	HardwareDevice   string
 	HardwarePipeline string
+	InputBitDepth    int
 }
 
 type HardwareProbe func(ffmpegPath string, options FFmpegOptions) error
@@ -1178,7 +1216,37 @@ func effectiveFFmpegOptions(session *Session, options FFmpegOptions) FFmpegOptio
 	if pipeline := strings.TrimSpace(session.HardwarePipeline); pipeline != "" {
 		options.HardwarePipeline = pipeline
 	}
+	if session.Media.VideoBitDepth > 0 {
+		options.InputBitDepth = session.Media.VideoBitDepth
+	}
 	return options
+}
+
+func selectHardwarePipeline(info MediaInfo, current string) string {
+	pipeline := strings.ToLower(strings.TrimSpace(current))
+	if pipeline != "vaapi-full" {
+		return current
+	}
+	if needsVAAPIHybridPipeline(info) {
+		return "vaapi-hybrid"
+	}
+	return current
+}
+
+func needsVAAPIHybridPipeline(info MediaInfo) bool {
+	codec := strings.ToLower(strings.TrimSpace(info.VideoCodec))
+	profile := strings.ToLower(strings.TrimSpace(info.VideoProfile))
+	pixFmt := strings.ToLower(strings.TrimSpace(info.VideoPixFmt))
+	if codec != "hevc" && codec != "h265" {
+		return false
+	}
+	if info.VideoBitDepth > 8 {
+		return true
+	}
+	if strings.Contains(profile, "10") || strings.Contains(pixFmt, "p10") || strings.Contains(pixFmt, "p010") {
+		return true
+	}
+	return false
 }
 
 func archiveFailedTranscodeLog(session *Session, logPath string) (string, error) {
@@ -1293,6 +1361,17 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 			"-bf", "0",
 			"-qp", "23",
 		)
+	case "vaapi-hybrid":
+		return append(args,
+			"-vf", vaapiHybridFilter(options),
+			"-c:v", "h264_vaapi",
+			"-low_power", "1",
+			"-level", "4.1",
+			"-g", strconv.Itoa(lowLatencyGOP),
+			"-keyint_min", strconv.Itoa(lowLatencyGOP),
+			"-bf", "0",
+			"-qp", "23",
+		)
 	case "vaapi-encode":
 		return append(args,
 			"-vf", softwareScaleFilter(maxTranscodeWidth, maxTranscodeHeight)+",format=nv12,hwupload",
@@ -1332,6 +1411,14 @@ func softwareScaleFilter(width, height int) string {
 	return fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2", width, height)
 }
 
+func vaapiHybridFilter(options FFmpegOptions) string {
+	downloadFormat := "nv12"
+	if options.InputBitDepth > 8 {
+		downloadFormat = "p010le"
+	}
+	return "hwdownload,format=" + downloadFormat + "," + softwareScaleFilter(maxTranscodeWidth, maxTranscodeHeight) + ",format=nv12,hwupload"
+}
+
 func audioMapArg(session *Session, request Request) string {
 	if request.AudioStreamIndex != 0 && session != nil {
 		for _, audio := range session.Media.AudioStreams {
@@ -1345,10 +1432,11 @@ func audioMapArg(session *Session, request Request) string {
 
 func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {
 	switch hardwarePipeline(options) {
-	case "vaapi-full":
+	case "vaapi-full", "vaapi-hybrid":
 		args = append(args, "-hwaccel", "vaapi")
 		if device := strings.TrimSpace(options.HardwareDevice); device != "" {
 			args = append(args, "-hwaccel_device", device)
+			args = append(args, "-vaapi_device", device)
 		}
 		args = append(args, "-hwaccel_output_format", "vaapi")
 		return args

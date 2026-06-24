@@ -618,6 +618,72 @@ func TestManagerStopsMatchingPlaybackSessions(t *testing.T) {
 	}
 }
 
+func TestManagerStopsPlaybackByItemWhenPlaySessionDiffers(t *testing.T) {
+	var stopped atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 2,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			return stopFunc(func() error {
+				stopped.Add(1)
+				return nil
+			}), nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	_, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/item123", ItemID: "item123", PlaySessionID: "prewarm-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := m.StopPlayback(transcode.PlaybackEvent{ItemID: "item123", PlaySessionID: "emby-play-session"})
+
+	if count != 1 {
+		t.Fatalf("stopped sessions = %d", count)
+	}
+	if stopped.Load() != 1 {
+		t.Fatalf("process stop count = %d", stopped.Load())
+	}
+	if _, ok := m.Get("item123"); ok {
+		t.Fatal("expected item session to be removed")
+	}
+}
+
+func TestManagerReapsDoneSessionsBeforeLimit(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 2,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			if starts.Add(1) == 1 {
+				return doneProcess{}, nil
+			}
+			return noopProcess{}, nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	if _, err := m.Ensure("done", transcode.Request{InputURL: "http://upstream/done"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Ensure("active", transcode.Request{InputURL: "http://upstream/active"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Ensure("new", transcode.Request{InputURL: "http://upstream/new"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Get("done"); ok {
+		t.Fatal("expected done session to be reaped")
+	}
+	if _, ok := m.Get("active"); !ok {
+		t.Fatal("expected active session to remain")
+	}
+	if _, ok := m.Get("new"); !ok {
+		t.Fatal("expected new session to start")
+	}
+}
+
 func TestHandlerStartsSessionAndServesPlaylist(t *testing.T) {
 	var capturedInput string
 	m := transcode.NewManager(transcode.Options{

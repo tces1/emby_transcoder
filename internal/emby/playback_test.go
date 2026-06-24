@@ -84,7 +84,7 @@ func TestRewritePlaybackInfoAddsSourceParametersWhenClientOmitsThem(t *testing.T
 }
 
 func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
-	input := []byte(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Path":"/media/Movie.mkv","Container":"mkv","Bitrate":80000000,"RunTimeTicks":72000000000,"SupportsDirectPlay":true,"DirectStreamUrl":"/Videos/1/stream","MediaStreams":[{"Type":"Video","Index":0,"Codec":"hevc","Width":3840,"Height":2160},{"Type":"Audio","Index":1,"Codec":"dts","Channels":6,"DisplayTitle":"DTS 5.1"},{"Type":"Audio","Index":2,"Codec":"aac","Channels":2,"DisplayTitle":"AAC 2.0"}]}]}`)
+	input := []byte(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Path":"/media/Movie.mkv","Container":"mkv","Bitrate":80000000,"RunTimeTicks":72000000000,"SupportsDirectPlay":true,"DirectStreamUrl":"/Videos/1/stream","MediaStreams":[{"Type":"Video","Index":0,"Codec":"hevc","Profile":"Main 10","BitDepth":10,"PixelFormat":"yuv420p10le","Width":3840,"Height":2160},{"Type":"Audio","Index":1,"Codec":"dts","Channels":6,"DisplayTitle":"DTS 5.1"},{"Type":"Audio","Index":2,"Codec":"aac","Channels":2,"DisplayTitle":"AAC 2.0"}]}]}`)
 
 	_, changed, report, err := emby.RewritePlaybackInfoWithReport(input, "item123", "http://proxy.local")
 	if err != nil {
@@ -121,8 +121,8 @@ func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
 	if source.Container != "mkv" {
 		t.Fatalf("container = %q", source.Container)
 	}
-	if source.VideoCodec != "hevc" || source.Width != 3840 || source.Height != 2160 {
-		t.Fatalf("video = %s %dx%d", source.VideoCodec, source.Width, source.Height)
+	if source.VideoCodec != "hevc" || source.VideoProfile != "Main 10" || source.VideoBitDepth != 10 || source.Width != 3840 || source.Height != 2160 {
+		t.Fatalf("video = %s %s %dbit %dx%d", source.VideoCodec, source.VideoProfile, source.VideoBitDepth, source.Width, source.Height)
 	}
 	if source.AudioCodec != "dts" || source.AudioChannels != 6 || source.AudioTitle != "DTS 5.1" {
 		t.Fatalf("audio = %s channels=%d title=%q", source.AudioCodec, source.AudioChannels, source.AudioTitle)
