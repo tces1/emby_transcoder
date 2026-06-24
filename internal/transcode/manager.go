@@ -1248,6 +1248,7 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 	switch hardwarePipeline(options) {
 	case "vaapi-full":
 		return append(args,
+			"-vf", vaapiFormatFilter(),
 			"-c:v", "h264_vaapi",
 			"-low_power", "1",
 			"-g", strconv.Itoa(lowLatencyGOP),
@@ -1284,6 +1285,10 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 
 func vaapiScaleFilter(width, height int) string {
 	return fmt.Sprintf("scale_vaapi=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12", width, height)
+}
+
+func vaapiFormatFilter() string {
+	return "scale_vaapi=format=nv12"
 }
 
 func softwareScaleFilter(width, height int) string {

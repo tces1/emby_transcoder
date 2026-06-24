@@ -163,8 +163,9 @@ func TestBuildFFmpegArgsUsesFullVAAPITranscodePipeline(t *testing.T) {
 	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
 		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
 	}
-	if slices.Contains(args, "-vf") {
-		t.Fatalf("full VAAPI pipeline should not scale, args=%v", args)
+	vfIndex := slices.Index(args, "-vf")
+	if vfIndex < 0 || args[vfIndex+1] != "scale_vaapi=format=nv12" {
+		t.Fatalf("full VAAPI pipeline should convert surfaces to NV12 with VAAPI, args=%v", args)
 	}
 	for _, softwareOnly := range []string{"libx264", "-preset", "-tune", "-level"} {
 		if slices.Contains(args, softwareOnly) {
