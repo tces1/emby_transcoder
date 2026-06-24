@@ -228,6 +228,29 @@ func TestBuildFFmpegArgsDoesNotForceVAAPIH264Profile(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsUsesVAAPILowPowerEncoding(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+	}
+	request := Request{InputURL: "http://upstream/stream"}
+
+	for _, pipeline := range []string{"vaapi-full", "vaapi-encode"} {
+		t.Run(pipeline, func(t *testing.T) {
+			args := buildFFmpegArgs(session, request, FFmpegOptions{
+				HardwareDecode:   "vaapi",
+				HardwareDevice:   "/dev/dri/renderD128",
+				HardwarePipeline: pipeline,
+			})
+
+			lowPowerIndex := slices.Index(args, "-low_power")
+			if lowPowerIndex < 0 || args[lowPowerIndex+1] != "1" {
+				t.Fatalf("VAAPI pipeline should request low-power encoding: %v", args)
+			}
+		})
+	}
+}
+
 func TestBuildFFmpegArgsCapsVideoOutputTo1080p(t *testing.T) {
 	session := &Session{
 		ID:  "item123",

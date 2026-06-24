@@ -1249,6 +1249,7 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 	case "vaapi-full":
 		return append(args,
 			"-c:v", "h264_vaapi",
+			"-low_power", "1",
 			"-g", strconv.Itoa(lowLatencyGOP),
 			"-keyint_min", strconv.Itoa(lowLatencyGOP),
 			"-bf", "0",
@@ -1258,6 +1259,7 @@ func appendVideoTranscodeArgs(args []string, options FFmpegOptions) []string {
 		return append(args,
 			"-vf", softwareScaleFilter(maxTranscodeWidth, maxTranscodeHeight)+",format=nv12,hwupload",
 			"-c:v", "h264_vaapi",
+			"-low_power", "1",
 			"-level", "4.1",
 			"-g", strconv.Itoa(lowLatencyGOP),
 			"-keyint_min", strconv.Itoa(lowLatencyGOP),
