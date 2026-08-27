@@ -2,12 +2,6 @@ name: docker-image
 
 on:
   push:
-    paths:
-      - cmd/**
-      - internal/**
-      - docker/**
-      - go.mod
-      - .github/workflows/docker-image.yml
   workflow_dispatch:
 
 permissions:
