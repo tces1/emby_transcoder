@@ -2,6 +2,7 @@
   "server": {
     "listen": ":8097",
     "public_url": "",
+    "dashboard_password": "",
     "debug": false
   },
   "upstream": {

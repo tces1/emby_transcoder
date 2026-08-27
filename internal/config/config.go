@@ -18,9 +18,10 @@ type Config struct {
 }
 
 type Server struct {
-	Listen    string `json:"listen"`
-	PublicURL string `json:"public_url"`
-	Debug     bool   `json:"debug"`
+	Listen            string `json:"listen"`
+	PublicURL         string `json:"public_url"`
+	DashboardPassword string `json:"dashboard_password"`
+	Debug             bool   `json:"debug"`
 }
 
 type Upstream struct {

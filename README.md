@@ -90,6 +90,7 @@ cp config/config.json config/config.local.json
 
 - 将 `upstream.urls` 改成你的 Emby 或 Jellyfin 入口列表；第一个是 API 主线路，失败时自动切换后续线路。
 - 如果客户端通过另一层反向代理访问本服务，设置 `server.public_url`。
+- 设置非空的 `server.dashboard_password` 后才能访问 `/emby_transcoder` 状态后台。
 - `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
 - `transcode.hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。
 - Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_decode` 设置为 `vaapi`。
@@ -133,6 +134,7 @@ go build ./cmd/emby-transcoder
   "server": {
     "listen": ":8097",
     "public_url": "",
+    "dashboard_password": "",
     "debug": false
   },
   "upstream": {
@@ -205,7 +207,7 @@ Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 
 ## 状态后台
 
-访问代理同域下的 `/emby_transcoder` 可以打开状态后台。页面使用 Emby API Key 或 Token 调用 `/emby/Users/Me` 完成校验，成功后只在 HttpOnly Cookie 中保存随机后台会话 ID，不会把 Emby Token 写入页面或状态接口。
+先在配置文件中设置非空的 `server.dashboard_password`，然后访问代理同域下的 `/emby_transcoder`。密码为空时后台保持禁用。登录成功后浏览器只在 HttpOnly Cookie 中保存随机后台会话 ID，配置密码不会写入页面或状态接口。
 
 状态页每秒刷新并显示：
 

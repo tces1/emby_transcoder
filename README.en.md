@@ -87,6 +87,7 @@ Edit `docker/config/config.local.json` before starting:
 
 - set `upstream.urls` to your Emby or Jellyfin entrance list; the first route is primary and later routes are failover targets
 - set `server.public_url` if clients reach the proxy through another reverse proxy
+- set a non-empty `server.dashboard_password` to enable the `/emby_transcoder` status dashboard
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
 - leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
 - set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` VAAPI support
@@ -130,6 +131,7 @@ Copy `config.example.json` and change the upstream URL:
   "server": {
     "listen": ":8097",
     "public_url": "",
+    "dashboard_password": "",
     "debug": false
   },
   "upstream": {
@@ -199,7 +201,7 @@ Emby-Transcoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 
 ## Status Dashboard
 
-Open `/emby_transcoder` on the same proxy origin to access the status dashboard. An Emby API Key or Token is validated through `/emby/Users/Me`. After login, only an opaque dashboard session ID is stored in an HttpOnly cookie; the Emby token is not embedded in the page or status API.
+Set a non-empty `server.dashboard_password`, then open `/emby_transcoder` on the same proxy origin. The dashboard remains disabled while the password is empty. After login, only an opaque dashboard session ID is stored in an HttpOnly cookie; the configured password is not embedded in the page or status API.
 
 The dashboard refreshes every second and shows:
 

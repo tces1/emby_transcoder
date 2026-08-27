@@ -22,6 +22,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 
 - set `upstream.urls` to your Emby or Jellyfin entrance list; the first route is primary and later routes are API failover targets
 - set `server.public_url` if clients reach the proxy through another reverse proxy
+- set `server.dashboard_password` to enable password login for `/emby_transcoder`
 - set `server.debug` to `true` when you need detailed diagnostics
 - leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
 - set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI through `/dev/dri`
@@ -37,7 +38,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - playbackinfo rewrites prewarm the transcode session before the first playlist request
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 - old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback
-- open `/emby_transcoder` on the proxy and authenticate with an Emby Token to view worker, FFmpeg, download, and HLS upload status
+- open `/emby_transcoder` on the proxy and authenticate with `server.dashboard_password` to view worker, FFmpeg, download, and HLS upload status
 
 For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
 

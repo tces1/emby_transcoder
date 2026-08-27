@@ -1,8 +1,8 @@
 package proxy
 
 import (
-	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -54,14 +54,12 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		s.dashboardStatus(w)
 	case r.URL.Path == dashboardPrefix || r.URL.Path == dashboardPrefix+"/":
-		if s.dashboardAuthorized(r) {
-			writeDashboardHTML(w, dashboardHTML)
+		if strings.TrimSpace(s.cfg.Server.DashboardPassword) == "" {
+			http.Error(w, "dashboard password is not configured", http.StatusServiceUnavailable)
 			return
 		}
-		if token := dashboardTokenFromRequest(r); token != "" && s.validateDashboardToken(r.Context(), token) {
-			if s.setDashboardSession(w, r) {
-				http.Redirect(w, r, dashboardPrefix, http.StatusSeeOther)
-			}
+		if s.dashboardAuthorized(r) {
+			writeDashboardHTML(w, dashboardHTML)
 			return
 		}
 		writeDashboardHTML(w, dashboardLoginHTML)
@@ -81,8 +79,8 @@ func (s *Server) dashboardLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid login request", http.StatusBadRequest)
 		return
 	}
-	token := strings.TrimSpace(r.Form.Get("token"))
-	if token == "" || !s.validateDashboardToken(r.Context(), token) {
+	password := r.Form.Get("password")
+	if !s.dashboardPasswordValid(password) {
 		writeDashboardHTMLStatus(w, dashboardLoginFailedHTML, http.StatusUnauthorized)
 		return
 	}
@@ -169,35 +167,12 @@ func dashboardSecureCookie(r *http.Request) bool {
 	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
-func dashboardTokenFromRequest(r *http.Request) string {
-	return embyTokenFromHeaders(r.Header)
-}
-
-func (s *Server) validateDashboardToken(parent context.Context, token string) bool {
-	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
-	defer cancel()
-	target := *s.upstream
-	target.Path = singleJoiningSlash(s.upstream.Path, "/emby/Users/Me")
-	target.RawQuery = ""
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
+func (s *Server) dashboardPasswordValid(candidate string) bool {
+	expected := s.cfg.Server.DashboardPassword
+	if expected == "" || len(candidate) != len(expected) {
 		return false
 	}
-	req.Header.Set("X-Emby-Token", token)
-	client := *s.client
-	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if len(via) > 0 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return resp.StatusCode == http.StatusOK
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
 }
 
 func (s *Server) dashboardStatus(w http.ResponseWriter) {
@@ -250,12 +225,12 @@ body{margin:0;background:#0b1220;color:#e5edf8;font:15px system-ui;display:grid;
 .card{width:min(420px,calc(100% - 40px));background:#131d2f;border:1px solid #263653;border-radius:16px;padding:28px;box-shadow:0 20px 60px #0008}
 h1{margin:0 0 8px;font-size:24px}.muted{color:#8fa3bf;margin-bottom:22px}input{box-sizing:border-box;width:100%;padding:12px;border-radius:9px;border:1px solid #344766;background:#09111f;color:white}
 button{width:100%;margin-top:14px;padding:12px;border:0;border-radius:9px;background:#2dd4bf;color:#04201d;font-weight:700;cursor:pointer}
-</style></head><body><form class="card" method="post" action="/emby_transcoder/login"><h1>Emby Transcoder</h1><div class="muted">使用 Emby API Key 或 Token 登录状态后台</div><input name="token" type="password" required autocomplete="current-password" placeholder="API Key / Token"><button>进入状态页</button></form></body></html>`
+</style></head><body><form class="card" method="post" action="/emby_transcoder/login"><h1>Emby Transcoder</h1><div class="muted">输入配置文件中的后台密码</div><input name="password" type="password" required autocomplete="current-password" placeholder="后台密码"><button>进入状态页</button></form></body></html>`
 
 const dashboardLoginFailedHTML = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>登录失败</title><style>body{background:#0b1220;color:#e5edf8;font:15px system-ui;display:grid;place-items:center;min-height:100vh}.card{background:#131d2f;padding:28px;border-radius:16px}a{color:#2dd4bf}</style></head>
-<body><div class="card"><h2>Token 校验失败</h2><p><a href="/emby_transcoder">返回重试</a></p></div></body></html>`
+<body><div class="card"><h2>密码错误</h2><p><a href="/emby_transcoder">返回重试</a></p></div></body></html>`
 
 const dashboardHTML = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
