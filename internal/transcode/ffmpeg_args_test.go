@@ -1,14 +1,17 @@
 package transcode
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testing.T) {
@@ -93,6 +96,106 @@ func TestBuildFFmpegArgsDoesNotThrottleInputWithRealtimeFlag(t *testing.T) {
 	}
 }
 
+func TestExecProcessParsesFFmpegProgressSpeed(t *testing.T) {
+	process := &execProcess{}
+	process.readProgress(strings.NewReader("frame=10\nspeed=1.375x\nprogress=continue\n"))
+	if got := process.TranscodeSpeed(); got != 1.375 {
+		t.Fatalf("transcode speed = %v", got)
+	}
+}
+
+func TestManagerStatusSnapshotReportsVideoAndUploadRate(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	session, err := manager.Ensure("item123", Request{
+		InputURL: "http://upstream/video",
+		Media:    MediaInfo{Name: "Example Movie"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordSessionUpload(session, 2<<20)
+	manager.mu.Lock()
+	session.uploadSampleTime = time.Now().Add(-time.Second)
+	manager.mu.Unlock()
+
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	if statuses[0].VideoName != "Example Movie" || statuses[0].UploadBPS <= 0 || statuses[0].UploadedBytes != 2<<20 {
+		t.Fatalf("status = %+v", statuses[0])
+	}
+	manager.Close()
+}
+
+func TestManagerIgnoresUploadFromReplacedSession(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	first, err := manager.Ensure("item123", Request{InputURL: "http://upstream/video", StartTimeTicks: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Ensure("item123", Request{InputURL: "http://upstream/video", StartTimeTicks: 10_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordSessionUpload(first, 4096)
+	manager.RecordSessionUpload(second, 2048)
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 || statuses[0].UploadedBytes != 2048 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	manager.Close()
+}
+
+func TestFFmpegRunnerUsesAcceleratedInputAndReleasesIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := &recordingInputProxy{released: make(chan struct{})}
+	runner := FFmpegRunner{Path: ffmpegPath, InputProxy: input}
+	session := &Session{ID: "item123", Dir: dir}
+	request := Request{
+		InputURL: "http://upstream.local/video?X-Emby-Token=secret",
+		Headers:  http.Header{"X-Emby-Token": []string{"secret"}},
+	}
+
+	process, err := runner.Start(context.Background(), session, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execProcess, ok := process.(*execProcess)
+	if !ok {
+		t.Fatalf("process = %T", process)
+	}
+	if !execProcess.waitForExit(3 * time.Second) {
+		t.Fatal("fake ffmpeg did not exit")
+	}
+	select {
+	case <-input.released:
+	case <-time.After(time.Second):
+		t.Fatal("accelerated input registration was not released")
+	}
+	if input.rawURL != request.InputURL || input.headers.Get("X-Emby-Token") != "secret" {
+		t.Fatalf("registered source = %q headers=%v", input.rawURL, input.headers)
+	}
+	logData, err := os.ReadFile(filepath.Join(dir, "ffmpeg.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "http://127.0.0.1:12345/input") {
+		t.Fatalf("ffmpeg args do not use accelerated URL: %s", logText)
+	}
+	if strings.Contains(logText, "upstream.local") || strings.Contains(logText, "-headers") || strings.Contains(logText, "secret") {
+		t.Fatalf("ffmpeg args leaked upstream source details: %s", logText)
+	}
+}
+
 func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
@@ -111,6 +214,20 @@ func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 			t.Fatalf("should not force risky probing arg %q for mkv/dts inputs: %v", risky, args)
 		}
 	}
+}
+
+type recordingInputProxy struct {
+	rawURL   string
+	headers  http.Header
+	released chan struct{}
+}
+
+func (p *recordingInputProxy) Register(rawURL string, headers http.Header) (string, func(), error) {
+	p.rawURL = rawURL
+	p.headers = headers.Clone()
+	return "http://127.0.0.1:12345/input", func() {
+		close(p.released)
+	}, nil
 }
 
 func TestBuildFFmpegArgsAppliesVAAPIHardwareDecodeBeforeInput(t *testing.T) {

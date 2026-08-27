@@ -44,6 +44,7 @@ Emby / Jellyfin 客户端
 - 软件转码会把视频输出限制到 1920x1080，并保持原始宽高比；VAAPI 模式不做缩放。
 - PlaybackInfo 重写时会预热转码会话，减少首次 playlist 请求等待。
 - FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
+- 可选用并发 HTTP Range 下载代理为 FFmpeg 加速远程输入；上游不支持 Range 时自动回退为普通单连接。
 
 不包含：虚拟媒体库、RSS、封面生成、刮削、数据库存储或管理 UI。
 
@@ -87,7 +88,7 @@ cp config/config.json config/config.local.json
 
 启动前修改 `docker/config/config.local.json`：
 
-- 将 `upstream.url` 改成你的 Emby 或 Jellyfin 地址。
+- 将 `upstream.urls` 改成你的 Emby 或 Jellyfin 入口列表；第一个是 API 主线路，失败时自动切换后续线路。
 - 如果客户端通过另一层反向代理访问本服务，设置 `server.public_url`。
 - `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
 - `transcode.hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。
@@ -135,7 +136,9 @@ go build ./cmd/emby-transcoder
     "debug": false
   },
   "upstream": {
-    "url": "http://127.0.0.1:8096"
+    "urls": [
+      "http://127.0.0.1:8096"
+    ]
   },
   "transcode": {
     "enabled": true,
@@ -144,6 +147,9 @@ go build ./cmd/emby-transcoder
     "hardware_decode": "",
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
+    "download_workers": 1,
+    "download_chunk_mb": 8,
+    "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
     "segment_seconds": 2,
@@ -161,6 +167,28 @@ go build ./cmd/emby-transcoder
 
 当前 VAAPI 模式使用硬件解码加 `h264_vaapi` 硬件编码，不再插入缩放过滤器。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
 
+`download_workers` 控制 FFmpeg 输入侧的全局并发 Range 下载数。默认值 `1` 表示关闭加速并让 FFmpeg 直接访问上游；设置为 `2` 可启用双路下载。为避免上游将额外连接计为多路播放，程序会硬性限制整个进程最多同时发出 `2` 个上游 Range 请求，即使配置了更大的值也不会突破。`download_chunk_mb` 是每个 Range 分块大小，`download_buffer_mb` 限制全局并发预读窗口，推荐使用 `2 / 8 / 64`。如果 Emby/Jellyfin 返回的流不支持字节范围请求或缺少稳定的 ETag/Last-Modified 校验，服务会自动回退到普通转发，避免并发分块混入不同版本的数据。
+
+多个线路入口写入 `upstream.urls`。第一个入口是 API 主线路；GET、HEAD、OPTIONS 等可安全重试的请求发生连接错误或返回 502/503/504 时，服务会切换并记住可用的备用入口。POST 等非幂等请求不会自动重放，避免同一操作执行两次。旧的单值 `upstream.url` 格式仍然兼容。
+
+数组顺序同时表示媒体线路优先级。只有一个转码会话时，优先使用前两条健康线路并发下载，其余线路待命；有两个转码会话时，先启动的会话固定使用第一条健康线路，第二个会话使用第二条。任一会话结束后，剩余会话自动恢复双线路模式。线路连续失败后会按数组顺序切换到下一条，但全局上游连接数始终不超过 `2`。
+
+启用双路下载后，项目会保留 PlaybackInfo 返回的真实 `DirectStreamUrl`（包括 `/original.mkv` 路径和签名参数），让两个 worker 分别请求两个入口，并各自跟随入口返回的 302 到实际媒体域名，而不是猜测或直接替换最终的媒体域名：
+
+```json
+"upstream": {
+  "urls": [
+    "https://entry-a.example.com",
+    "https://entry-b.example.com"
+  ]
+},
+"transcode": {
+  "download_workers": 2
+}
+```
+
+启动下载前会分别经过两个入口探测最终媒体响应。只有文件大小和 ETag/Last-Modified 一致的线路才会共同参与；不可用或内容不一致的线路会被排除，剩余一条线路时自动降为单路下载。
+
 ## 转码生命周期
 
 Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
@@ -174,6 +202,18 @@ Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 - 落后当前播放位置超过 `segment_retention_seconds` 的旧分片会从本地缓存删除。
 - 如果超过 `idle_timeout_seconds` 没有播放活动或 HLS 访问，idle reaper 会停止会话。
 - 新的 `master.m3u8` 请求如果带来不同的上游 stream URL，例如 seek 后 `StartTimeTicks` 变化，会重启本地会话。
+
+## 状态后台
+
+访问代理同域下的 `/emby_transcoder` 可以打开状态后台。页面使用 Emby API Key 或 Token 调用 `/emby/Users/Me` 完成校验，成功后只在 HttpOnly Cookie 中保存随机后台会话 ID，不会把 Emby Token 写入页面或状态接口。
+
+状态页每秒刷新并显示：
+
+- 两个下载 worker 的空闲、探测、下载、转发和错误状态。
+- 当前入口/最终媒体域名、字节范围、实时下载速度和累计下载量。
+- 正在转码的视频名称、FFmpeg 运行/暂停/退出状态及 `speed` 倍率。
+- 本地 HLS 向客户端发送的实时上传速度和累计流量。
+- 以“线路 → 下载 → FFmpeg → HLS 上传”展示的状态机流程图。
 
 ## 协议
 

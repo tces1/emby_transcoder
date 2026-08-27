@@ -26,6 +26,14 @@ func TestDefaultConfigIsUsable(t *testing.T) {
 	if cfg.Transcode.MaxSessions != 2 {
 		t.Fatalf("max sessions = %d", cfg.Transcode.MaxSessions)
 	}
+	if cfg.Transcode.DownloadWorkers != 1 || cfg.Transcode.DownloadChunkMB != 8 || cfg.Transcode.DownloadBufferMB != 64 {
+		t.Fatalf(
+			"download defaults = workers:%d chunk_mb:%d buffer_mb:%d",
+			cfg.Transcode.DownloadWorkers,
+			cfg.Transcode.DownloadChunkMB,
+			cfg.Transcode.DownloadBufferMB,
+		)
+	}
 	if cfg.Transcode.BufferPauseSeconds != 300 {
 		t.Fatalf("buffer pause seconds = %d", cfg.Transcode.BufferPauseSeconds)
 	}
@@ -47,8 +55,8 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	err := os.WriteFile(path, []byte(`{
 		"server": {"listen": ":9000", "debug": true},
-		"upstream": {"url": "http://emby.local:8096"},
-		"transcode": {"max_sessions": 4, "buffer_pause_seconds": 600, "buffer_resume_seconds": 90, "segment_seconds": 2, "segment_retention_seconds": 180},
+		"upstream": {"urls": ["http://emby.local:8096/", "http://emby-backup.local:8096", "http://emby.local:8096/"]},
+		"transcode": {"max_sessions": 4, "download_workers": 6, "download_chunk_mb": 4, "download_buffer_mb": 32, "buffer_pause_seconds": 600, "buffer_resume_seconds": 90, "segment_seconds": 2, "segment_retention_seconds": 180},
 		"clients": [{"name": "yamby", "match": ["Yamby"], "transcode": true}]
 	}`), 0o600)
 	if err != nil {
@@ -66,11 +74,22 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	if cfg.Upstream.URL != "http://emby.local:8096" {
 		t.Fatalf("upstream url = %q", cfg.Upstream.URL)
 	}
+	if len(cfg.Upstream.URLs) != 2 || cfg.Upstream.URLs[1] != "http://emby-backup.local:8096" {
+		t.Fatalf("upstream urls = %v", cfg.Upstream.URLs)
+	}
 	if cfg.Transcode.FFmpegPath == "" {
 		t.Fatal("ffmpeg path should be preserved from defaults")
 	}
 	if cfg.Transcode.MaxSessions != 4 {
 		t.Fatalf("max sessions = %d", cfg.Transcode.MaxSessions)
+	}
+	if cfg.Transcode.DownloadWorkers != 2 || cfg.Transcode.DownloadChunkMB != 4 || cfg.Transcode.DownloadBufferMB != 32 {
+		t.Fatalf(
+			"download config = workers:%d chunk_mb:%d buffer_mb:%d",
+			cfg.Transcode.DownloadWorkers,
+			cfg.Transcode.DownloadChunkMB,
+			cfg.Transcode.DownloadBufferMB,
+		)
 	}
 	if cfg.Transcode.BufferPauseSeconds != 600 || cfg.Transcode.BufferResumeSeconds != 90 {
 		t.Fatalf("buffer thresholds = %d/%d", cfg.Transcode.BufferPauseSeconds, cfg.Transcode.BufferResumeSeconds)

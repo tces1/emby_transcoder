@@ -85,7 +85,7 @@ cp config/config.json config/config.local.json
 
 Edit `docker/config/config.local.json` before starting:
 
-- set `upstream.url` to your Emby or Jellyfin server
+- set `upstream.urls` to your Emby or Jellyfin entrance list; the first route is primary and later routes are failover targets
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
 - leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
@@ -133,7 +133,9 @@ Copy `config.example.json` and change the upstream URL:
     "debug": false
   },
   "upstream": {
-    "url": "http://127.0.0.1:8096"
+    "urls": [
+      "http://127.0.0.1:8096"
+    ]
   },
   "transcode": {
     "enabled": true,
@@ -142,6 +144,9 @@ Copy `config.example.json` and change the upstream URL:
     "hardware_decode": "",
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
+    "download_workers": 1,
+    "download_chunk_mb": 8,
+    "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
     "segment_seconds": 2,
@@ -156,6 +161,28 @@ Leave `debug` as `false` for concise action-level logs. Set it to `true` when yo
 Leave `hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding. Set it to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
 The current VAAPI path uses hardware decode plus `h264_vaapi` hardware encoding and does not add a scale filter. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
 
+`download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds the global read-ahead window; `2 / 8 / 64` is the recommended starting point. Streams without byte-range support or a stable ETag/Last-Modified validator automatically fall back to normal forwarding so chunks from different resource versions cannot be mixed.
+
+When the same upstream has multiple entrances, configure them directly in `upstream.urls`. The first is the primary API route. For safely retryable GET, HEAD, and OPTIONS requests, a connection error or 502/503/504 response switches the service to a working backup route. Non-idempotent requests such as POST are not replayed, preventing duplicate operations. The legacy single-value `upstream.url` remains supported.
+
+Array order is also media-route priority. With one transcode session, the first two healthy routes download concurrently while later routes remain on standby. With two sessions, the earlier session is pinned to the first healthy route and the second session to the next one. When either session ends, the remaining session automatically returns to dual-route mode. Repeated route failures advance to the next configured route, while global upstream concurrency always remains capped at `2`.
+
+With dual downloading enabled, the project preserves the real `DirectStreamUrl` returned by PlaybackInfo, including its `/original.mkv` path and signed query. Each worker requests that path through a different entrance and follows its 302 redirect to the actual media host; final media hostnames are not guessed or replaced:
+
+```json
+"upstream": {
+  "urls": [
+    "https://entry-a.example.com",
+    "https://entry-b.example.com"
+  ]
+},
+"transcode": {
+  "download_workers": 2
+}
+```
+
+Both entrances are probed through their final media responses before downloading. Only routes with matching file sizes and ETag/Last-Modified validators participate. An unavailable or inconsistent route is excluded, and downloading automatically becomes single-route when only one valid entrance remains.
+
 ## Transcode Lifecycle
 
 Emby-Transcoder keeps local FFmpeg sessions tied to Emby playback check-ins:
@@ -169,6 +196,18 @@ Emby-Transcoder keeps local FFmpeg sessions tied to Emby playback check-ins:
 - Segments older than `segment_retention_seconds` behind the current playback position are deleted from the local cache.
 - If neither playback activity nor HLS access arrives before `idle_timeout_seconds`, the idle reaper stops the session.
 - A new `master.m3u8` request with a different upstream stream URL, such as a seek with a different `StartTimeTicks`, restarts the local session.
+
+## Status Dashboard
+
+Open `/emby_transcoder` on the same proxy origin to access the status dashboard. An Emby API Key or Token is validated through `/emby/Users/Me`. After login, only an opaque dashboard session ID is stored in an HttpOnly cookie; the Emby token is not embedded in the page or status API.
+
+The dashboard refreshes every second and shows:
+
+- Idle, probing, downloading, forwarding, and error states for both download workers.
+- Entrance/final media hosts, byte ranges, live download rates, and cumulative bytes.
+- Video names, FFmpeg running/paused/exited state, and FFmpeg `speed` ratio.
+- Live and cumulative HLS upload traffic sent to clients.
+- A “route → download → FFmpeg → HLS upload” state-machine view.
 
 ## License
 

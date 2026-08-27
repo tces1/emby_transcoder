@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const maxDownloadWorkers = 2
+
 type Config struct {
 	Server    Server          `json:"server"`
 	Upstream  Upstream        `json:"upstream"`
@@ -22,7 +24,8 @@ type Server struct {
 }
 
 type Upstream struct {
-	URL string `json:"url"`
+	URL  string   `json:"url"`
+	URLs []string `json:"urls"`
 }
 
 type Transcode struct {
@@ -32,6 +35,9 @@ type Transcode struct {
 	HardwareDecode          string        `json:"hardware_decode"`
 	HardwareDevice          string        `json:"hardware_device"`
 	MaxSessions             int           `json:"max_sessions"`
+	DownloadWorkers         int           `json:"download_workers"`
+	DownloadChunkMB         int           `json:"download_chunk_mb"`
+	DownloadBufferMB        int           `json:"download_buffer_mb"`
 	BufferPauseSeconds      int           `json:"buffer_pause_seconds"`
 	BufferResumeSeconds     int           `json:"buffer_resume_seconds"`
 	SegmentSeconds          int           `json:"segment_seconds"`
@@ -93,6 +99,9 @@ func Default() Config {
 			FFmpegPath:              "/usr/bin/ffmpeg",
 			TempDir:                 "/var/lib/emby-transcoder/transcode",
 			MaxSessions:             2,
+			DownloadWorkers:         1,
+			DownloadChunkMB:         8,
+			DownloadBufferMB:        64,
 			BufferPauseSeconds:      300,
 			BufferResumeSeconds:     120,
 			SegmentSeconds:          2,
@@ -132,6 +141,24 @@ func Load(path string) (Config, error) {
 func normalize(cfg *Config) {
 	cfg.Server.PublicURL = strings.TrimRight(cfg.Server.PublicURL, "/")
 	cfg.Upstream.URL = strings.TrimRight(cfg.Upstream.URL, "/")
+	var upstreamURLs []string
+	seenUpstreams := make(map[string]struct{}, len(cfg.Upstream.URLs))
+	for _, rawURL := range cfg.Upstream.URLs {
+		rawURL = strings.TrimRight(strings.TrimSpace(rawURL), "/")
+		if rawURL == "" {
+			continue
+		}
+		key := strings.ToLower(rawURL)
+		if _, ok := seenUpstreams[key]; ok {
+			continue
+		}
+		seenUpstreams[key] = struct{}{}
+		upstreamURLs = append(upstreamURLs, rawURL)
+	}
+	cfg.Upstream.URLs = upstreamURLs
+	if len(upstreamURLs) > 0 {
+		cfg.Upstream.URL = upstreamURLs[0]
+	}
 	if cfg.Server.Listen == "" {
 		cfg.Server.Listen = ":8097"
 	}
@@ -148,6 +175,18 @@ func normalize(cfg *Config) {
 	}
 	if cfg.Transcode.MaxSessions <= 0 {
 		cfg.Transcode.MaxSessions = 2
+	}
+	if cfg.Transcode.DownloadWorkers <= 0 {
+		cfg.Transcode.DownloadWorkers = 1
+	}
+	if cfg.Transcode.DownloadWorkers > maxDownloadWorkers {
+		cfg.Transcode.DownloadWorkers = maxDownloadWorkers
+	}
+	if cfg.Transcode.DownloadChunkMB <= 0 {
+		cfg.Transcode.DownloadChunkMB = 8
+	}
+	if cfg.Transcode.DownloadBufferMB <= 0 {
+		cfg.Transcode.DownloadBufferMB = 64
 	}
 	if cfg.Transcode.BufferPauseSeconds <= 0 {
 		cfg.Transcode.BufferPauseSeconds = 300

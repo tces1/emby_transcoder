@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"emby-transcoder/internal/config"
 	"emby-transcoder/internal/emby"
+	"emby-transcoder/internal/inputproxy"
 	"emby-transcoder/internal/logging"
 	"emby-transcoder/internal/policy"
 	"emby-transcoder/internal/transcode"
@@ -30,6 +32,8 @@ type Server struct {
 	transcodeHandler http.Handler
 	cancelReaper     context.CancelFunc
 	transcodeManager *transcode.Manager
+	inputProxy       *inputproxy.Proxy
+	dashboard        *dashboardAuthStore
 }
 
 var embyTokenPattern = regexp.MustCompile(`(?i)\btoken\s*=\s*"?([^",\s]+)"?`)
@@ -39,12 +43,39 @@ func New(cfg config.Config) (*Server, error) {
 }
 
 func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, error) {
-	upstream, err := url.Parse(cfg.Upstream.URL)
+	upstreams, err := configuredUpstreams(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
-	if upstream.Scheme == "" || upstream.Host == "" {
-		return nil, fmt.Errorf("invalid upstream url: %s", cfg.Upstream.URL)
+	upstream := upstreams[0]
+	apiTransport := newFailoverTransport(transport, upstreams)
+
+	var acceleratedInput *inputproxy.Proxy
+	if cfg.Transcode.DownloadWorkers > 1 {
+		var downloadOrigins []string
+		for _, route := range upstreams {
+			downloadOrigins = append(downloadOrigins, route.Scheme+"://"+route.Host)
+		}
+		if len(downloadOrigins) == 1 {
+			downloadOrigins = nil
+		}
+		acceleratedInput, err = inputproxy.New(inputproxy.Options{
+			Workers:    cfg.Transcode.DownloadWorkers,
+			ChunkSize:  int64(cfg.Transcode.DownloadChunkMB) << 20,
+			BufferSize: int64(cfg.Transcode.DownloadBufferMB) << 20,
+			Transport:  transport,
+			Origins:    downloadOrigins,
+		})
+		if err != nil {
+			return nil, err
+		}
+		logging.Infof(
+			"accelerated input configured workers=%d chunk_mb=%d buffer_mb=%d routes=%d",
+			acceleratedInput.Workers(),
+			cfg.Transcode.DownloadChunkMB,
+			cfg.Transcode.DownloadBufferMB,
+			len(downloadOrigins),
+		)
 	}
 
 	manager, err := transcode.NewManagerStrict(transcode.Options{
@@ -53,6 +84,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		FFmpegPath:            cfg.Transcode.FFmpegPath,
 		HardwareDecode:        cfg.Transcode.HardwareDecode,
 		HardwareDevice:        cfg.Transcode.HardwareDevice,
+		InputProxy:            acceleratedInput,
 		BufferPauseThreshold:  cfg.Transcode.BufferPause,
 		BufferResumeThreshold: cfg.Transcode.BufferResume,
 		SegmentDuration:       cfg.Transcode.SegmentDuration,
@@ -60,12 +92,18 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		IdleTimeout:           cfg.Transcode.IdleTimeout,
 	})
 	if err != nil {
+		if acceleratedInput != nil {
+			_ = acceleratedInput.Close(context.Background())
+		}
 		return nil, err
 	}
 	logging.SetDebug(cfg.Server.Debug)
 	handler := transcode.Handler{
 		Manager: manager,
 		InputURLForID: func(id string, r *http.Request) string {
+			if info, ok := manager.MediaInfo(id); ok && info.InputURL != "" {
+				return info.InputURL
+			}
 			return transcodeInputURL(upstream, id, r)
 		},
 	}
@@ -76,11 +114,11 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		originalDirector(req)
 		req.Host = upstream.Host
 	}
-	proxy.Transport = transport
+	proxy.Transport = apiTransport
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 	}
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: apiTransport}
 
 	reaperCtx, cancelReaper := context.WithCancel(context.Background())
 	go manager.StartReaper(reaperCtx)
@@ -93,10 +131,16 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		transcodeHandler: handler,
 		cancelReaper:     cancelReaper,
 		transcodeManager: manager,
+		inputProxy:       acceleratedInput,
+		dashboard:        newDashboardAuthStore(),
 	}, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isDashboardPath(r.URL.Path) {
+		s.serveDashboard(w, r)
+		return
+	}
 	if normalizedPath, ok := normalizeTranscodePath(r.URL.Path); ok {
 		logging.Debugf("transcode request method=%s path=%s remote=%s", r.Method, redactURLString(r.URL.String()), r.RemoteAddr)
 		transcodeReq := r.Clone(r.Context())
@@ -217,6 +261,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 				mediaInfo := transcode.MediaInfo{
 					ItemID:        itemID,
 					SourceID:      source.ID,
+					InputURL:      resolveMediaInputURL(resp.Request, s.upstream, source.BeforeDirectStreamURL),
 					Name:          source.Name,
 					Path:          source.Path,
 					Container:     source.Container,
@@ -286,6 +331,33 @@ func (s *Server) upstreamURL(in *url.URL) string {
 	return u.String()
 }
 
+func resolveMediaInputURL(responseRequest *http.Request, fallback *url.URL, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	reference, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if reference.IsAbs() {
+		return reference.String()
+	}
+	base := fallback
+	if responseRequest != nil && responseRequest.URL != nil {
+		base = responseRequest.URL
+	}
+	if base == nil {
+		return ""
+	}
+	origin := *base
+	origin.Path = "/"
+	origin.RawPath = ""
+	origin.RawQuery = ""
+	origin.Fragment = ""
+	return origin.ResolveReference(reference).String()
+}
+
 func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.RewriteReport) {
 	if s.transcodeManager == nil || len(report.Sources) == 0 {
 		return
@@ -309,6 +381,10 @@ func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.Rewri
 	}
 	if info, ok := s.transcodeManager.MediaInfo(source.SessionID); ok {
 		request.Media = info
+		if info.InputURL != "" {
+			inputURL = info.InputURL
+			request.InputURL = info.InputURL
+		}
 	}
 	logging.Infof(
 		"playbackinfo prewarm request item=%s source=%s query=%s input=%s",
@@ -596,6 +672,43 @@ func redactURLString(raw string) string {
 	return parsed.String()
 }
 
+func configuredUpstreams(upstreamConfig config.Upstream) ([]*url.URL, error) {
+	values := upstreamConfig.URLs
+	if len(values) == 0 {
+		values = []string{upstreamConfig.URL}
+	}
+	var upstreams []*url.URL
+	seen := make(map[string]struct{}, len(values))
+	basePath := ""
+	for _, value := range values {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		parsed, err := url.Parse(value)
+		if err != nil ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Host == "" ||
+			parsed.RawQuery != "" ||
+			parsed.Fragment != "" {
+			return nil, fmt.Errorf("invalid upstream url: %s", value)
+		}
+		path := strings.TrimRight(parsed.Path, "/")
+		key := strings.ToLower(parsed.Scheme + "://" + parsed.Host + path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if len(upstreams) == 0 {
+			basePath = path
+		} else if path != basePath {
+			return nil, errors.New("all upstream urls must use the same base path")
+		}
+		upstreams = append(upstreams, parsed)
+	}
+	if len(upstreams) == 0 {
+		return nil, errors.New("upstream.url or upstream.urls is required")
+	}
+	return upstreams, nil
+}
+
 func singleJoiningSlash(a, b string) string {
 	aslash := strings.HasSuffix(a, "/")
 	bslash := strings.HasPrefix(b, "/")
@@ -615,8 +728,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.transcodeManager != nil {
 		s.transcodeManager.Close()
-		return nil
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	if s.inputProxy != nil {
+		return s.inputProxy.Close(ctx)
+	}
+	return nil
 }

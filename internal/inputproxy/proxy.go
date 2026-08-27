@@ -1,0 +1,1152 @@
+package inputproxy
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"emby-transcoder/internal/logging"
+)
+
+const (
+	defaultChunkSize  = 8 << 20
+	defaultBufferSize = 64 << 20
+	maxWorkers        = 2
+	probeTimeout      = 10 * time.Second
+	chunkTimeout      = 30 * time.Second
+)
+
+var errInvalidRange = errors.New("invalid byte range")
+
+type Options struct {
+	Workers    int
+	ChunkSize  int64
+	BufferSize int64
+	Transport  http.RoundTripper
+	Origins    []string
+}
+
+// Proxy exposes a loopback-only HTTP endpoint to FFmpeg and downloads
+// seekable upstream resources with a bounded window of concurrent ranges.
+type Proxy struct {
+	client    *http.Client
+	workers   int
+	chunkSize int64
+	listener  net.Listener
+	server    *http.Server
+	baseURL   string
+	slots     chan struct{}
+	origins   []*url.URL
+
+	mu      sync.RWMutex
+	sources map[string]*source
+	closed  bool
+	nextID  atomic.Uint64
+
+	metricsMu sync.Mutex
+	metrics   []workerMetric
+}
+
+type source struct {
+	id      string
+	name    string
+	rawURL  string
+	headers http.Header
+	urls    []string
+	active  []string
+	order   uint64
+	nextURL atomic.Uint64
+
+	metaMu      sync.Mutex
+	meta        *metadata
+	unsupported bool
+	fallbackLog sync.Once
+
+	routeMu   sync.Mutex
+	failures  []int
+	dedicated atomic.Int32
+}
+
+type WorkerSnapshot struct {
+	ID          int     `json:"id"`
+	State       string  `json:"state"`
+	SessionID   string  `json:"session_id,omitempty"`
+	VideoName   string  `json:"video_name,omitempty"`
+	Route       string  `json:"route,omitempty"`
+	ByteRange   string  `json:"byte_range,omitempty"`
+	DownloadBPS float64 `json:"download_bps"`
+	TotalBytes  int64   `json:"total_bytes"`
+	LastError   string  `json:"last_error,omitempty"`
+}
+
+type workerMetric struct {
+	busy         bool
+	state        string
+	sessionID    string
+	videoName    string
+	route        string
+	byteRange    string
+	startedAt    time.Time
+	lastEndedAt  time.Time
+	lastSpeedBPS float64
+	currentBytes int64
+	totalBytes   int64
+	lastError    string
+}
+
+type metadata struct {
+	size         int64
+	contentType  string
+	etag         string
+	lastModified string
+}
+
+type byteRange struct {
+	start    int64
+	end      int64
+	urlIndex int
+}
+
+type chunkResult struct {
+	byteRange
+	data []byte
+	err  error
+}
+
+func New(options Options) (*Proxy, error) {
+	workers := options.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	chunkSize := options.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = defaultChunkSize
+	}
+	bufferSize := options.BufferSize
+	if bufferSize <= 0 {
+		bufferSize = defaultBufferSize
+	}
+	maxBufferedChunks := int(bufferSize / chunkSize)
+	if maxBufferedChunks < 1 {
+		maxBufferedChunks = 1
+	}
+	if workers > maxBufferedChunks {
+		workers = maxBufferedChunks
+	}
+	transport := options.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	origins, err := parseOrigins(options.Origins)
+	if err != nil {
+		return nil, err
+	}
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen for accelerated input: %w", err)
+	}
+	proxy := &Proxy{
+		client: &http.Client{
+			Transport:     transport,
+			CheckRedirect: safeRedirect,
+		},
+		workers:   workers,
+		chunkSize: chunkSize,
+		listener:  listener,
+		baseURL:   "http://" + listener.Addr().String(),
+		slots:     make(chan struct{}, workers),
+		origins:   origins,
+		sources:   make(map[string]*source),
+		metrics:   make([]workerMetric, workers),
+	}
+	proxy.server = &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		_ = proxy.server.Serve(listener)
+	}()
+	return proxy, nil
+}
+
+func (p *Proxy) Workers() int {
+	return p.workers
+}
+
+func (p *Proxy) Snapshot() []WorkerSnapshot {
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	now := time.Now()
+	snapshots := make([]WorkerSnapshot, len(p.metrics))
+	for index, metric := range p.metrics {
+		state := metric.state
+		speed := metric.lastSpeedBPS
+		if metric.busy {
+			if elapsed := now.Sub(metric.startedAt).Seconds(); elapsed > 0 {
+				speed = float64(metric.currentBytes) / elapsed
+			}
+		} else {
+			state = "idle"
+			if metric.lastError != "" && now.Sub(metric.lastEndedAt) <= 10*time.Second {
+				state = "error"
+			}
+			if now.Sub(metric.lastEndedAt) > 10*time.Second {
+				speed = 0
+			}
+		}
+		snapshots[index] = WorkerSnapshot{
+			ID:          index + 1,
+			State:       state,
+			SessionID:   metric.sessionID,
+			VideoName:   metric.videoName,
+			Route:       metric.route,
+			ByteRange:   metric.byteRange,
+			DownloadBPS: speed,
+			TotalBytes:  metric.totalBytes,
+			LastError:   metric.lastError,
+		}
+	}
+	return snapshots
+}
+
+func (p *Proxy) beginWorker(state string, src *source, rawURL string, rangeHeader string) int {
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	index := 0
+	for candidate := range p.metrics {
+		if !p.metrics[candidate].busy {
+			index = candidate
+			break
+		}
+	}
+	metric := &p.metrics[index]
+	metric.busy = true
+	metric.state = state
+	metric.sessionID = src.id
+	metric.videoName = src.name
+	metric.route = routeHost(rawURL)
+	metric.byteRange = rangeHeader
+	metric.startedAt = time.Now()
+	metric.currentBytes = 0
+	metric.lastError = ""
+	return index
+}
+
+func (p *Proxy) endWorker(index int, bytes int64, failed bool, finalURL string) {
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	if index < 0 || index >= len(p.metrics) {
+		return
+	}
+	metric := &p.metrics[index]
+	elapsed := time.Since(metric.startedAt).Seconds()
+	if bytes > 0 && elapsed > 0 {
+		metric.lastSpeedBPS = float64(bytes) / elapsed
+		metric.totalBytes += bytes
+	}
+	if finalURL != "" {
+		metric.route = routeHost(finalURL)
+	}
+	if failed {
+		metric.lastError = "request failed"
+	}
+	metric.busy = false
+	metric.state = "idle"
+	metric.lastEndedAt = time.Now()
+}
+
+func (p *Proxy) addWorkerBytes(index int, bytes int) {
+	if bytes <= 0 {
+		return
+	}
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	if index >= 0 && index < len(p.metrics) {
+		p.metrics[index].currentBytes += int64(bytes)
+	}
+}
+
+func routeHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
+}
+
+type workerReader struct {
+	reader io.Reader
+	proxy  *Proxy
+	worker int
+}
+
+func (r workerReader) Read(buffer []byte) (int, error) {
+	read, err := r.reader.Read(buffer)
+	r.proxy.addWorkerBytes(r.worker, read)
+	return read, err
+}
+
+// Register makes an upstream source available through an opaque loopback URL.
+// The returned release function is safe to call more than once.
+func (p *Proxy) Register(rawURL string, headers http.Header) (string, func(), error) {
+	return p.RegisterSource("", "", rawURL, headers)
+}
+
+func (p *Proxy) RegisterSource(id string, name string, rawURL string, headers http.Header) (string, func(), error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", nil, errors.New("invalid accelerated input URL")
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", nil, fmt.Errorf("create accelerated input token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+	src := &source{
+		id:      id,
+		name:    name,
+		rawURL:  rawURL,
+		headers: upstreamHeaders(headers),
+		urls:    p.sourceURLs(parsed),
+		order:   p.nextID.Add(1),
+	}
+	src.dedicated.Store(-1)
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return "", nil, errors.New("accelerated input proxy is closed")
+	}
+	p.sources[token] = src
+	p.rebalanceLocked()
+	p.mu.Unlock()
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			p.mu.Lock()
+			delete(p.sources, token)
+			p.rebalanceLocked()
+			p.mu.Unlock()
+		})
+	}
+	return p.baseURL + "/" + token, release, nil
+}
+
+func (p *Proxy) rebalanceLocked() {
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		sources = append(sources, src)
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].order < sources[j].order
+	})
+	if len(sources) == 1 {
+		sources[0].dedicated.Store(-1)
+		return
+	}
+	for index, src := range sources {
+		src.dedicated.Store(int32(index % maxWorkers))
+	}
+}
+
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	p.mu.RLock()
+	src := p.sources[token]
+	p.mu.RUnlock()
+	if src == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	meta, supported, err := p.sourceMetadata(r.Context(), src)
+	if err != nil || !supported {
+		src.fallbackLog.Do(func() {
+			reason := "range_or_validator_unsupported"
+			if err != nil {
+				reason = "range_probe_failed"
+			}
+			logging.Infof("accelerated input fallback source=%s reason=%s", sourceLabel(src.rawURL), reason)
+		})
+		p.serveFallback(w, r, src)
+		return
+	}
+	p.serveAccelerated(w, r, src, meta)
+}
+
+func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool, error) {
+	src.metaMu.Lock()
+	defer src.metaMu.Unlock()
+	if src.meta != nil {
+		return *src.meta, true, nil
+	}
+	if src.unsupported {
+		return metadata{}, false, nil
+	}
+
+	var selected metadata
+	var active []string
+	var lastErr error
+	candidates := src.urls
+	if len(candidates) == 0 {
+		candidates = []string{src.rawURL}
+	}
+	for _, candidate := range candidates {
+		meta, supported, err := p.probeMetadata(ctx, src, candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !supported {
+			continue
+		}
+		if len(active) == 0 {
+			selected = meta
+			active = append(active, candidate)
+			continue
+		}
+		merged, ok := mergeRepresentation(selected, meta)
+		if ok {
+			selected = merged
+			active = append(active, candidate)
+		}
+	}
+	if len(active) == 0 {
+		if lastErr != nil {
+			return metadata{}, false, lastErr
+		}
+		src.unsupported = true
+		return metadata{}, false, nil
+	}
+	src.routeMu.Lock()
+	src.active = active
+	src.failures = make([]int, len(active))
+	src.routeMu.Unlock()
+	src.meta = &selected
+	if len(candidates) > 1 {
+		logging.Infof(
+			"accelerated input routes source=%s active=%d configured=%d",
+			sourceLabel(src.rawURL),
+			len(active),
+			len(candidates),
+		)
+	}
+	return selected, true, nil
+}
+
+func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (result metadata, supported bool, resultErr error) {
+	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, "bytes=0-0")
+	if err != nil {
+		return metadata{}, false, err
+	}
+	if err := p.acquire(requestCtx); err != nil {
+		return metadata{}, false, err
+	}
+	defer p.release()
+	workerID := p.beginWorker("probing", src, rawURL, "bytes=0-0")
+	finalURL := ""
+	defer func() {
+		p.endWorker(workerID, 0, resultErr != nil, finalURL)
+	}()
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return metadata{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	_, _, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2))
+	if resp.StatusCode != http.StatusPartialContent || !valid || total <= 0 {
+		return metadata{}, false, nil
+	}
+	meta := metadata{
+		size:         total,
+		contentType:  resp.Header.Get("Content-Type"),
+		etag:         resp.Header.Get("ETag"),
+		lastModified: resp.Header.Get("Last-Modified"),
+	}
+	if _, _, ok := representationValidator(meta); !ok {
+		return metadata{}, false, nil
+	}
+	return meta, true, nil
+}
+
+func (p *Proxy) serveAccelerated(w http.ResponseWriter, r *http.Request, src *source, meta metadata) {
+	start, end, partial, err := parseRequestRange(r.Header.Get("Range"), meta.size)
+	if err != nil {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.size))
+		http.Error(w, "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
+	setMetadataHeaders(w.Header(), meta)
+	w.Header().Set("Accept-Ranges", "bytes")
+	if meta.size == 0 {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	if partial {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, meta.size))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	if r.Method == http.MethodHead {
+		return
+	}
+	if err := p.streamRanges(r.Context(), w, src, meta, start, end); err != nil && r.Context().Err() == nil {
+		logging.Errorf("accelerated input interrupted source=%s", sourceLabel(src.rawURL))
+	}
+}
+
+func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, meta metadata, start, end int64) error {
+	if end < start {
+		return nil
+	}
+	chunkCount := int((end-start)/p.chunkSize) + 1
+	workers := p.workers
+	if workers > chunkCount {
+		workers = chunkCount
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	tasks := make(chan byteRange, workers)
+	results := make(chan chunkResult)
+	pending := make(map[int64]chunkResult, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				data, err := p.fetchRange(workerCtx, src, meta, task)
+				select {
+				case results <- chunkResult{byteRange: task, data: data, err: err}:
+				case <-workerCtx.Done():
+					<-p.slots
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		cancel()
+		close(tasks)
+		wg.Wait()
+		for range pending {
+			<-p.slots
+		}
+	}()
+
+	nextSchedule := start
+	nextWrite := start
+	inFlight := 0
+	for nextWrite <= end {
+		var availableSlot chan struct{}
+		routeLimit := p.routeLimit(src)
+		if routeLimit > workers {
+			routeLimit = workers
+		}
+		if inFlight+len(pending) < routeLimit && nextSchedule <= end {
+			availableSlot = p.slots
+		}
+		select {
+		case availableSlot <- struct{}{}:
+			chunkEnd := nextSchedule + p.chunkSize - 1
+			if chunkEnd > end {
+				chunkEnd = end
+			}
+			urlIndex := p.nextRouteIndex(src)
+			tasks <- byteRange{start: nextSchedule, end: chunkEnd, urlIndex: urlIndex}
+			nextSchedule = chunkEnd + 1
+			inFlight++
+		case result := <-results:
+			inFlight--
+			if result.err != nil {
+				<-p.slots
+				return result.err
+			}
+			pending[result.start] = result
+			for {
+				ready, ok := pending[nextWrite]
+				if !ok {
+					break
+				}
+				written, err := dst.Write(ready.data)
+				if err != nil {
+					return err
+				}
+				if written != len(ready.data) {
+					return io.ErrShortWrite
+				}
+				delete(pending, nextWrite)
+				nextWrite = ready.end + 1
+				<-p.slots
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (p *Proxy) routeLimit(src *source) int {
+	if src.dedicated.Load() >= 0 {
+		return 1
+	}
+	if len(p.origins) == 0 {
+		return p.workers
+	}
+	healthy := src.healthyRouteIndexes()
+	if len(healthy) > p.workers {
+		return p.workers
+	}
+	if len(healthy) == 0 {
+		return 1
+	}
+	return len(healthy)
+}
+
+func (p *Proxy) nextRouteIndex(src *source) int {
+	healthy := src.healthyRouteIndexes()
+	if len(healthy) == 0 {
+		return 0
+	}
+	if src.dedicated.Load() >= 0 {
+		if assigned, ok := p.routeAssignments()[src]; ok {
+			return assigned
+		}
+		return healthy[0]
+	}
+	limit := len(healthy)
+	if limit > p.workers {
+		limit = p.workers
+	}
+	return healthy[int(src.nextURL.Add(1)-1)%limit]
+}
+
+func (p *Proxy) routeAssignments() map[*source]int {
+	p.mu.RLock()
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		if src.dedicated.Load() >= 0 {
+			sources = append(sources, src)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].order < sources[j].order
+	})
+	assignments := make(map[*source]int, len(sources))
+	used := make(map[int]struct{}, len(sources))
+	desiredOwners := make(map[int]*source, len(sources))
+	for _, src := range sources {
+		desiredOwners[int(src.dedicated.Load())] = src
+	}
+	for _, src := range sources {
+		healthy := src.healthyRouteIndexes()
+		if len(healthy) == 0 {
+			continue
+		}
+		desired := int(src.dedicated.Load())
+		selected := -1
+		if containsIndex(healthy, desired) {
+			if _, occupied := used[desired]; !occupied {
+				selected = desired
+			}
+		}
+		if selected < 0 {
+			for _, candidate := range healthy {
+				if _, occupied := used[candidate]; !occupied {
+					if owner, reserved := desiredOwners[candidate]; reserved && owner != src {
+						continue
+					}
+					selected = candidate
+					break
+				}
+			}
+		}
+		if selected < 0 {
+			for _, candidate := range healthy {
+				if _, occupied := used[candidate]; !occupied {
+					selected = candidate
+					break
+				}
+			}
+		}
+		if selected < 0 {
+			selected = healthy[desired%len(healthy)]
+		}
+		assignments[src] = selected
+		used[selected] = struct{}{}
+	}
+	p.mu.RUnlock()
+	return assignments
+}
+
+func containsIndex(indexes []int, target int) bool {
+	for _, index := range indexes {
+		if index == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *source) healthyRouteIndexes() []int {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	indexes := make([]int, 0, len(s.active))
+	for index := range s.active {
+		if index >= len(s.failures) || s.failures[index] < 2 {
+			indexes = append(indexes, index)
+		}
+	}
+	if len(indexes) == 0 {
+		for index := range s.active {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requested byteRange) ([]byte, error) {
+	if len(src.active) == 0 {
+		return nil, errors.New("no active accelerated input route")
+	}
+	var lastErr error
+	for _, index := range p.routeAttempts(src, requested.urlIndex) {
+		data, err := p.fetchRangeFromURL(ctx, src, meta, src.active[index], requested)
+		if err == nil {
+			src.recordRouteResult(index, true)
+			return data, nil
+		}
+		src.recordRouteResult(index, false)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (p *Proxy) routeAttempts(src *source, preferred int) []int {
+	assignments := p.routeAssignments()
+	src.routeMu.Lock()
+	defer src.routeMu.Unlock()
+	attempts := make([]int, 0, len(src.active))
+	add := func(index int) {
+		if index < 0 || index >= len(src.active) {
+			return
+		}
+		for _, existing := range attempts {
+			if existing == index {
+				return
+			}
+		}
+		attempts = append(attempts, index)
+	}
+	add(preferred)
+	reserved := make(map[int]struct{}, len(assignments))
+	for other, index := range assignments {
+		if other != src {
+			reserved[index] = struct{}{}
+		}
+	}
+	for index := range src.active {
+		if _, occupied := reserved[index]; occupied {
+			continue
+		}
+		if index >= len(src.failures) || src.failures[index] < 2 {
+			add(index)
+		}
+	}
+	for index := range src.active {
+		if index >= len(src.failures) || src.failures[index] < 2 {
+			add(index)
+		}
+	}
+	for index := range src.active {
+		add(index)
+	}
+	return attempts
+}
+
+func (s *source) recordRouteResult(index int, success bool) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if index < 0 || index >= len(s.failures) {
+		return
+	}
+	if success {
+		s.failures[index] = 0
+		return
+	}
+	s.failures[index]++
+}
+
+func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadata, rawURL string, requested byteRange) (data []byte, resultErr error) {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", requested.start, requested.end)
+	requestCtx, cancel := context.WithTimeout(ctx, chunkTimeout)
+	defer cancel()
+	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, rangeHeader)
+	if err != nil {
+		return nil, err
+	}
+	workerID := p.beginWorker("downloading", src, rawURL, rangeHeader)
+	finalURL := ""
+	defer func() {
+		p.endWorker(workerID, int64(len(data)), resultErr != nil, finalURL)
+	}()
+	validatorHeader, validatorValue, _ := representationValidator(meta)
+	req.Header.Set("If-Range", validatorValue)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("upstream range %s returned %s", rangeHeader, resp.Status)
+	}
+	start, end, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	if !valid || start != requested.start || end != requested.end || total != meta.size {
+		return nil, fmt.Errorf("upstream returned invalid content range %q for %s", resp.Header.Get("Content-Range"), rangeHeader)
+	}
+	if resp.Header.Get(validatorHeader) != validatorValue {
+		return nil, fmt.Errorf("upstream representation changed while fetching %s", rangeHeader)
+	}
+	expected := requested.end - requested.start + 1
+	data, err = io.ReadAll(workerReader{
+		reader: io.LimitReader(resp.Body, expected+1),
+		proxy:  p,
+		worker: workerID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != expected {
+		return nil, fmt.Errorf("upstream range %s returned %d bytes, expected %d", rangeHeader, len(data), expected)
+	}
+	return data, nil
+}
+
+func (p *Proxy) serveFallback(w http.ResponseWriter, r *http.Request, src *source) {
+	req, err := p.upstreamRequest(r.Context(), r.Method, src, src.rawURL, r.Header.Get("Range"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if err := p.acquire(r.Context()); err != nil {
+		http.Error(w, "upstream request canceled", http.StatusBadGateway)
+		return
+	}
+	defer p.release()
+	workerID := p.beginWorker("forwarding", src, src.rawURL, r.Header.Get("Range"))
+	var transferred int64
+	failed := false
+	finalURL := ""
+	defer func() {
+		p.endWorker(workerID, transferred, failed, finalURL)
+	}()
+	resp, err := p.client.Do(req)
+	if err != nil {
+		failed = true
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if r.Method != http.MethodHead {
+		transferred, err = io.Copy(w, workerReader{reader: resp.Body, proxy: p, worker: workerID})
+		failed = err != nil
+	}
+}
+
+func (p *Proxy) acquire(ctx context.Context) error {
+	select {
+	case p.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Proxy) release() {
+	<-p.slots
+}
+
+func (p *Proxy) upstreamRequest(ctx context.Context, method string, src *source, rawURL string, rangeHeader string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = src.headers.Clone()
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Del("Range")
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	return req, nil
+}
+
+func (p *Proxy) Close(ctx context.Context) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	clear(p.sources)
+	p.mu.Unlock()
+	return p.server.Shutdown(ctx)
+}
+
+func parseRequestRange(value string, size int64) (int64, int64, bool, error) {
+	if strings.TrimSpace(value) == "" {
+		if size == 0 {
+			return 0, -1, false, nil
+		}
+		return 0, size - 1, false, nil
+	}
+	if size <= 0 || !strings.HasPrefix(value, "bytes=") {
+		return 0, 0, false, errInvalidRange
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(value, "bytes="))
+	if strings.Contains(raw, ",") {
+		return 0, 0, false, errInvalidRange
+	}
+	parts := strings.SplitN(raw, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false, errInvalidRange
+	}
+	if parts[0] == "" {
+		suffix, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false, errInvalidRange
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, size - 1, true, nil
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0, 0, false, errInvalidRange
+	}
+	end := size - 1
+	if parts[1] != "" {
+		end, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || end < start {
+			return 0, 0, false, errInvalidRange
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return start, end, true, nil
+}
+
+func parseContentRange(value string) (int64, int64, int64, bool) {
+	if !strings.HasPrefix(value, "bytes ") {
+		return 0, 0, 0, false
+	}
+	rangeAndSize := strings.SplitN(strings.TrimPrefix(value, "bytes "), "/", 2)
+	if len(rangeAndSize) != 2 || rangeAndSize[1] == "*" {
+		return 0, 0, 0, false
+	}
+	bounds := strings.SplitN(rangeAndSize[0], "-", 2)
+	if len(bounds) != 2 {
+		return 0, 0, 0, false
+	}
+	start, errStart := strconv.ParseInt(bounds[0], 10, 64)
+	end, errEnd := strconv.ParseInt(bounds[1], 10, 64)
+	total, errTotal := strconv.ParseInt(rangeAndSize[1], 10, 64)
+	if errStart != nil || errEnd != nil || errTotal != nil || start < 0 || end < start || total <= end {
+		return 0, 0, 0, false
+	}
+	return start, end, total, true
+}
+
+func parseOrigins(values []string) ([]*url.URL, error) {
+	origins := make([]*url.URL, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		origin, err := url.Parse(value)
+		if err != nil ||
+			origin.Host == "" ||
+			(origin.Scheme != "http" && origin.Scheme != "https") ||
+			(origin.Path != "" && origin.Path != "/") ||
+			origin.RawQuery != "" ||
+			origin.Fragment != "" ||
+			origin.User != nil {
+			return nil, fmt.Errorf("invalid download origin %q; expected scheme and host only", value)
+		}
+		origin.Path = ""
+		key := strings.ToLower(origin.Scheme + "://" + origin.Host)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins, nil
+}
+
+func (p *Proxy) sourceURLs(sourceURL *url.URL) []string {
+	if len(p.origins) == 0 {
+		return []string{sourceURL.String()}
+	}
+	urls := make([]string, 0, len(p.origins))
+	for _, origin := range p.origins {
+		candidate := *sourceURL
+		candidate.Scheme = origin.Scheme
+		candidate.Host = origin.Host
+		urls = append(urls, candidate.String())
+	}
+	return urls
+}
+
+func mergeRepresentation(first, next metadata) (metadata, bool) {
+	if first.size != next.size {
+		return metadata{}, false
+	}
+	firstETag := strings.TrimSpace(first.etag)
+	nextETag := strings.TrimSpace(next.etag)
+	firstStrong := firstETag != "" && !strings.HasPrefix(firstETag, "W/")
+	nextStrong := nextETag != "" && !strings.HasPrefix(nextETag, "W/")
+	if firstStrong && nextStrong {
+		if firstETag != nextETag {
+			return metadata{}, false
+		}
+		return first, true
+	}
+	if first.lastModified != "" && first.lastModified == next.lastModified {
+		first.etag = ""
+		return first, true
+	}
+	return metadata{}, false
+}
+
+func representationValidator(meta metadata) (string, string, bool) {
+	etag := strings.TrimSpace(meta.etag)
+	if etag != "" && !strings.HasPrefix(etag, "W/") {
+		return "ETag", etag, true
+	}
+	if lastModified := strings.TrimSpace(meta.lastModified); lastModified != "" {
+		return "Last-Modified", lastModified, true
+	}
+	return "", "", false
+}
+
+func safeRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) == 0 || sameOrigin(via[0].URL, req.URL) {
+		return nil
+	}
+	for _, key := range []string{
+		"Authorization",
+		"Cookie",
+		"Referer",
+		"X-Emby-Authorization",
+		"X-Emby-Token",
+		"X-MediaBrowser-Token",
+	} {
+		req.Header.Del(key)
+	}
+	return nil
+}
+
+func sameOrigin(first, next *url.URL) bool {
+	if first == nil || next == nil {
+		return false
+	}
+	return strings.EqualFold(first.Scheme, next.Scheme) && strings.EqualFold(first.Host, next.Host)
+}
+
+func sourceLabel(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "unknown"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.User = nil
+	return parsed.String()
+}
+
+func upstreamHeaders(headers http.Header) http.Header {
+	out := make(http.Header)
+	for _, key := range []string{"Authorization", "X-Emby-Authorization", "X-Emby-Token", "User-Agent"} {
+		if value := headers.Get(key); value != "" {
+			out.Set(key, value)
+		}
+	}
+	return out
+}
+
+func setMetadataHeaders(headers http.Header, meta metadata) {
+	if meta.contentType != "" {
+		headers.Set("Content-Type", meta.contentType)
+	}
+	if meta.etag != "" {
+		headers.Set("ETag", meta.etag)
+	}
+	if meta.lastModified != "" {
+		headers.Set("Last-Modified", meta.lastModified)
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for key, values := range src {
+		switch strings.ToLower(key) {
+		case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}

@@ -20,7 +20,7 @@ func TestPlaybackInfoIsRewrittenForMatchedClient(t *testing.T) {
 		if got := r.Header.Get("Accept-Encoding"); got != "" {
 			t.Fatalf("Accept-Encoding should be stripped for rewriteable JSON requests, got %q", got)
 		}
-		return jsonResponse(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Container":"mkv","SupportsDirectPlay":true,"MediaStreams":[{"Type":"Video","Codec":"hevc","Width":3840,"Height":2160},{"Type":"Audio","Codec":"dts","Channels":6}]}]}`), nil
+		return jsonResponse(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Container":"mkv","SupportsDirectPlay":true,"DirectStreamUrl":"/emby/videos/item123/original.mkv?api_key=test-token","MediaStreams":[{"Type":"Video","Codec":"hevc","Width":3840,"Height":2160},{"Type":"Audio","Codec":"dts","Channels":6}]}]}`), nil
 	})
 
 	cfg := config.Default()
@@ -51,6 +51,9 @@ func TestPlaybackInfoIsRewrittenForMatchedClient(t *testing.T) {
 	}
 	if info.VideoCodec != "hevc" || info.Width != 3840 || info.Height != 2160 || info.AudioCodec != "dts" {
 		t.Fatalf("media info = %+v", info)
+	}
+	if info.InputURL != "http://upstream.local/emby/videos/item123/original.mkv?api_key=test-token" {
+		t.Fatalf("media input url = %q", info.InputURL)
 	}
 }
 

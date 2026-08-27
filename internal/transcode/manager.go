@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ type Options struct {
 	FFmpegPath            string
 	HardwareDecode        string
 	HardwareDevice        string
+	InputProxy            InputProxy
 	BufferPauseThreshold  time.Duration
 	BufferResumeThreshold time.Duration
 	SegmentDuration       time.Duration
@@ -89,9 +91,25 @@ type Session struct {
 	Paused                  bool
 	bufferPaused            bool
 	HardwarePipeline        string
+	UploadedBytes           int64
 
 	cancel  context.CancelFunc
 	process Process
+
+	uploadSampleBytes int64
+	uploadSampleTime  time.Time
+	uploadBPS         float64
+}
+
+type SessionStatus struct {
+	ID               string  `json:"id"`
+	VideoName        string  `json:"video_name"`
+	State            string  `json:"state"`
+	HardwarePipeline string  `json:"hardware_pipeline"`
+	TranscodeSpeed   float64 `json:"transcode_speed"`
+	UploadBPS        float64 `json:"upload_bps"`
+	UploadedBytes    int64   `json:"uploaded_bytes"`
+	PositionTicks    int64   `json:"position_ticks"`
 }
 
 type Process interface {
@@ -100,6 +118,14 @@ type Process interface {
 
 type Runner interface {
 	Start(ctx context.Context, session *Session, request Request) (Process, error)
+}
+
+type InputProxy interface {
+	Register(rawURL string, headers http.Header) (string, func(), error)
+}
+
+type detailedInputProxy interface {
+	RegisterSource(id string, name string, rawURL string, headers http.Header) (string, func(), error)
 }
 
 type Manager struct {
@@ -118,8 +144,9 @@ func NewManager(options Options) *Manager {
 			HardwareDevice: options.HardwareDevice,
 		}, options.HardwareProbe)
 		options.Runner = FFmpegRunner{
-			Path:    options.FFmpegPath,
-			Options: ffmpegOptions,
+			Path:       options.FFmpegPath,
+			Options:    ffmpegOptions,
+			InputProxy: options.InputProxy,
 		}
 	}
 	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}, vaapiEncodeFallback: map[string]bool{}}
@@ -139,8 +166,9 @@ func NewManagerStrict(options Options) (*Manager, error) {
 			logging.Infof("hardware transcode enabled pipeline=%s", ffmpegOptionsSummary(ffmpegOptions))
 		}
 		options.Runner = FFmpegRunner{
-			Path:    options.FFmpegPath,
-			Options: ffmpegOptions,
+			Path:       options.FFmpegPath,
+			Options:    ffmpegOptions,
+			InputProxy: options.InputProxy,
 		}
 	}
 	return &Manager{options: options, sessions: map[string]*Session{}, media: map[string]MediaInfo{}, vaapiEncodeFallback: map[string]bool{}}, nil
@@ -220,6 +248,7 @@ func hlsTimeValue(segmentTicks int64) string {
 type MediaInfo struct {
 	ItemID        string
 	SourceID      string
+	InputURL      string
 	Name          string
 	Path          string
 	Container     string
@@ -306,6 +335,7 @@ func (info MediaInfo) Summary() string {
 func (info MediaInfo) IsZero() bool {
 	return info.ItemID == "" &&
 		info.SourceID == "" &&
+		info.InputURL == "" &&
 		info.Name == "" &&
 		info.Path == "" &&
 		info.Container == "" &&
@@ -414,7 +444,15 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 			return nil, err
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		session := &Session{ID: id, Dir: dir, InputURL: request.InputURL, LastAccess: now, LastMediaAccess: now, cancel: cancel}
+		session := &Session{
+			ID:               id,
+			Dir:              dir,
+			InputURL:         request.InputURL,
+			LastAccess:       now,
+			LastMediaAccess:  now,
+			uploadSampleTime: now,
+			cancel:           cancel,
+		}
 		if runner, ok := m.options.Runner.(FFmpegRunner); ok {
 			session.HardwarePipeline = effectiveFFmpegOptions(session, runner.Options).HardwarePipeline
 		}
@@ -463,6 +501,67 @@ func (m *Manager) Get(id string) (*Session, bool) {
 		session.LastMediaAccess = now
 	}
 	return session, ok
+}
+
+func (m *Manager) RecordSessionUpload(session *Session, bytes int64) {
+	if session == nil || bytes <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.sessions[session.ID]; ok && current == session {
+		current.UploadedBytes += bytes
+	}
+}
+
+func (m *Manager) StatusSnapshot() []SessionStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	statuses := make([]SessionStatus, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		elapsed := now.Sub(session.uploadSampleTime).Seconds()
+		if session.uploadSampleTime.IsZero() {
+			elapsed = now.Sub(session.LastAccess).Seconds()
+		}
+		if elapsed >= 0.5 {
+			delta := session.UploadedBytes - session.uploadSampleBytes
+			if delta < 0 {
+				delta = 0
+			}
+			session.uploadBPS = float64(delta) / elapsed
+			session.uploadSampleBytes = session.UploadedBytes
+			session.uploadSampleTime = now
+		}
+		state := "running"
+		if session.bufferPaused {
+			state = "paused"
+		} else if sessionProcessDone(session) {
+			state = "exited"
+		}
+		name := session.Media.Name
+		if name == "" {
+			name = session.ItemID
+		}
+		speed := 0.0
+		if state == "running" {
+			process, ok := session.process.(interface{ TranscodeSpeed() float64 })
+			if ok {
+				speed = process.TranscodeSpeed()
+			}
+		}
+		statuses = append(statuses, SessionStatus{
+			ID:               session.ID,
+			VideoName:        name,
+			State:            state,
+			HardwarePipeline: session.HardwarePipeline,
+			TranscodeSpeed:   speed,
+			UploadBPS:        session.uploadBPS,
+			UploadedBytes:    session.UploadedBytes,
+			PositionTicks:    session.PositionTicks,
+		})
+	}
+	return statuses
 }
 
 func (m *Manager) RecordSegmentRequest(id string, segmentIndex int) {
@@ -915,8 +1014,9 @@ func durationToTicks(d time.Duration) int64 {
 }
 
 type FFmpegRunner struct {
-	Path    string
-	Options FFmpegOptions
+	Path       string
+	Options    FFmpegOptions
+	InputProxy InputProxy
 }
 
 type FFmpegOptions struct {
@@ -1166,7 +1266,27 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	}
 
 	options := effectiveFFmpegOptions(session, r.Options)
-	args := buildFFmpegArgs(session, request, options)
+	ffmpegRequest := request
+	releaseInput := func() {}
+	if r.InputProxy != nil {
+		var localURL string
+		var release func()
+		var err error
+		if detailed, ok := r.InputProxy.(detailedInputProxy); ok {
+			localURL, release, err = detailed.RegisterSource(session.ID, session.Media.Name, request.InputURL, request.Headers)
+		} else {
+			localURL, release, err = r.InputProxy.Register(request.InputURL, request.Headers)
+		}
+		if err != nil {
+			logging.Errorf("accelerated input unavailable id=%s err=%v fallback=direct", session.ID, err)
+		} else {
+			ffmpegRequest.InputURL = localURL
+			ffmpegRequest.Headers = nil
+			releaseInput = release
+			logging.Infof("accelerated input enabled id=%s source=%s", session.ID, redactURLString(request.InputURL))
+		}
+	}
+	args := buildFFmpegArgs(session, ffmpegRequest, options)
 	playlist := filepath.Join(session.Dir, "master.m3u8")
 	logPath := filepath.Join(session.Dir, "ffmpeg.log")
 	logging.Infof("transcode start id=%s segment=%d decode=%s audio_stream_index=%d audio_map=%s audio=optional-aac log=%s", session.ID, session.SegmentStartIndex, ffmpegOptionsSummary(options), request.AudioStreamIndex, audioMapArg(session, request), logPath)
@@ -1174,21 +1294,30 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	cmd := exec.CommandContext(ctx, r.Path, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		releaseInput()
 		return nil, fmt.Errorf("open ffmpeg stdin: %w", err)
+	}
+	progressOutput, err := cmd.StdoutPipe()
+	if err != nil {
+		releaseInput()
+		return nil, fmt.Errorf("open ffmpeg progress output: %w", err)
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		releaseInput()
 		return nil, fmt.Errorf("open ffmpeg log: %w", err)
 	}
-	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
+		releaseInput()
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
 	logging.Infof("ffmpeg started id=%s pid=%d decode=%s", session.ID, cmd.Process.Pid, ffmpegOptionsSummary(options))
 	process := &execProcess{cmd: cmd, logFile: logFile, stdin: stdin, doneCh: make(chan struct{})}
+	go process.readProgress(progressOutput)
 	go func() {
+		defer releaseInput()
 		err := cmd.Wait()
 		process.done.Store(true)
 		close(process.doneCh)
@@ -1311,6 +1440,8 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "info",
+		"-progress", "pipe:1",
+		"-nostats",
 		"-fflags", "nobuffer",
 		"-flags", "low_delay",
 	}
@@ -1475,6 +1606,7 @@ type execProcess struct {
 	doneCh  chan struct{}
 	done    atomic.Bool
 	paused  atomic.Bool
+	speed   atomic.Int64
 }
 
 func (p *execProcess) Stop() error {
@@ -1483,6 +1615,26 @@ func (p *execProcess) Stop() error {
 
 func (p *execProcess) Done() bool {
 	return p.done.Load()
+}
+
+func (p *execProcess) TranscodeSpeed() float64 {
+	return float64(p.speed.Load()) / 1000
+}
+
+func (p *execProcess) readProgress(reader io.Reader) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if !ok || key != "speed" {
+			continue
+		}
+		value = strings.TrimSuffix(strings.TrimSpace(value), "x")
+		speed, err := strconv.ParseFloat(value, 64)
+		if err != nil || speed < 0 {
+			continue
+		}
+		p.speed.Store(int64(speed * 1000))
+	}
 }
 
 func (p *execProcess) waitForExit(timeout time.Duration) bool {

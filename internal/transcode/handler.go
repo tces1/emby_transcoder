@@ -134,7 +134,26 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logging.Debugf("transcode serve file id=%s file=%s path=%s", id, name, filePath)
-	http.ServeFile(w, r, filePath)
+	counted := &countingResponseWriter{
+		ResponseWriter: w,
+		record: func(bytes int64) {
+			h.Manager.RecordSessionUpload(session, bytes)
+		},
+	}
+	http.ServeFile(counted, r, filePath)
+}
+
+type countingResponseWriter struct {
+	http.ResponseWriter
+	record func(int64)
+}
+
+func (w *countingResponseWriter) Write(data []byte) (int, error) {
+	written, err := w.ResponseWriter.Write(data)
+	if w.record != nil && written > 0 {
+		w.record(int64(written))
+	}
+	return written, err
 }
 
 func (h Handler) sessionForSegment(id string, segmentIndex int, name string, r *http.Request, requestStarted time.Time) (*Session, error) {

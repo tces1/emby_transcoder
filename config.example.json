@@ -5,7 +5,9 @@
     "debug": false
   },
   "upstream": {
-    "url": "http://127.0.0.1:8096"
+    "urls": [
+      "http://127.0.0.1:8096"
+    ]
   },
   "transcode": {
     "enabled": true,
@@ -14,6 +16,9 @@
     "hardware_decode": "",
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
+    "download_workers": 1,
+    "download_chunk_mb": 8,
+    "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,
     "buffer_resume_seconds": 120,
     "segment_seconds": 2,
