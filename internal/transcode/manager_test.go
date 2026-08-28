@@ -748,6 +748,43 @@ func TestHandlerServesVirtualPlaylistWhenDurationIsKnown(t *testing.T) {
 	}
 }
 
+func TestHandlerStartsTranscodeWhenServingVirtualPlaylist(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			return noopProcess{}, nil
+		}),
+	})
+	m.RememberMedia("item123", transcode.MediaInfo{RunTimeTicks: 10_500_0000})
+	t.Cleanup(m.Close)
+
+	handler := transcode.Handler{
+		Manager: m,
+		InputURLForID: func(id string, r *http.Request) string {
+			return "http://upstream.local/emby/Videos/" + id + "/stream?" + r.URL.RawQuery
+		},
+	}
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?X-Emby-Token=abc", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("ffmpeg starts = %d", starts.Load())
+	}
+	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:VOD") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "segment_00000.ts?") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
 func TestHandlerStartsSegmentSessionFromRequestedSegmentIndex(t *testing.T) {
 	var captured transcode.Request
 	m := transcode.NewManager(transcode.Options{

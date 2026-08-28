@@ -1486,7 +1486,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-f", "hls",
 		"-hls_time", hlsTimeValue(sessionSegmentTicks(session)),
 		"-hls_list_size", "0",
-		"-hls_flags", "independent_segments",
+		"-hls_flags", "independent_segments+temp_file",
 		"-start_number", strconv.Itoa(session.SegmentStartIndex),
 		"-hls_segment_filename", segmentPattern,
 		playlist,

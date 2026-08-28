@@ -58,6 +58,10 @@ func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testi
 	if listSizeIndex < 0 || args[listSizeIndex+1] != "0" {
 		t.Fatalf("expected unbounded HLS list size, args=%v", args)
 	}
+	flagsIndex := slices.Index(args, "-hls_flags")
+	if flagsIndex < 0 || args[flagsIndex+1] != "independent_segments+temp_file" {
+		t.Fatalf("expected HLS temp_file flag, args=%v", args)
+	}
 	hlsTimeIndex := slices.Index(args, "-hls_time")
 	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
 		t.Fatalf("expected default HLS segment duration, args=%v", args)

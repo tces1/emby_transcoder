@@ -50,6 +50,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		traceSwitch("playlist_request id=%s start_ticks=%d query=%s elapsed=%s", id, startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), time.Since(requestStarted))
 		if info, known := h.Manager.MediaInfo(id); known {
 			if playlist, ready := VirtualVODPlaylist(info, h.Manager.segmentTicks(), r.URL.RawQuery); ready {
+				if _, err := h.ensureFromRequest(id, r); err != nil {
+					h.writeEnsureError(w, id, err)
+					return
+				}
 				logging.Infof("playlist virtual id=%s duration=%s", id, formatTicks(info.RunTimeTicks))
 				traceSwitch("playlist_virtual id=%s duration=%s start_ticks=%d query=%s media=%s elapsed=%s", id, formatTicks(info.RunTimeTicks), startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), info.Summary(), time.Since(requestStarted))
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -116,7 +120,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "master.m3u8" {
 		wait := h.startupWait()
 		if !waitForFile(r.Context(), filePath, wait) {
-			logging.Errorf("transcode playlist timeout id=%s wait=%s", id, wait)
+			h.logWaitFailure(r.Context(), "playlist", id, name, wait, requestStarted)
 			http.Error(w, "playlist is not ready", http.StatusGatewayTimeout)
 			return
 		}
@@ -125,7 +129,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasSuffix(name, ".ts") {
 		wait := h.startupWait()
 		if !waitForFile(r.Context(), filePath, wait) {
-			logging.Errorf("transcode segment timeout id=%s file=%s wait=%s", id, name, wait)
+			h.logWaitFailure(r.Context(), "segment", id, name, wait, requestStarted)
 			http.Error(w, "segment is not ready", http.StatusGatewayTimeout)
 			return
 		}
@@ -206,6 +210,39 @@ func (h Handler) startupWait() time.Duration {
 		return h.StartupWait
 	}
 	return 20 * time.Second
+}
+
+func (h Handler) ensureFromRequest(id string, r *http.Request) (*Session, error) {
+	inputURL := ""
+	if h.InputURLForID != nil {
+		inputURL = h.InputURLForID(id, r)
+	}
+	if inputURL == "" {
+		return nil, nil
+	}
+	return h.Manager.Ensure(id, requestFromHTTP(id, inputURL, r))
+}
+
+func (h Handler) writeEnsureError(w http.ResponseWriter, id string, err error) {
+	logging.Errorf("transcode start error id=%s err=%v", id, err)
+	if errors.Is(err, ErrTooManySessions) {
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
+func (h Handler) logWaitFailure(ctx context.Context, kind, id, name string, wait time.Duration, started time.Time) {
+	reason := "timeout"
+	if ctx.Err() != nil {
+		reason = "canceled"
+	}
+	if name == "" {
+		logging.Errorf("transcode %s %s id=%s wait=%s", kind, reason, id, wait)
+	} else {
+		logging.Errorf("transcode %s %s id=%s file=%s wait=%s", kind, reason, id, name, wait)
+	}
+	traceSwitch("%s_%s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, time.Since(started))
 }
 
 func segmentReusable(session *Session, segmentIndex int, name string) bool {
@@ -348,5 +385,5 @@ func waitForFile(ctx context.Context, path string, timeout time.Duration) bool {
 
 func fileExists(path string) bool {
 	stat, err := os.Stat(path)
-	return err == nil && !stat.IsDir()
+	return err == nil && !stat.IsDir() && stat.Size() > 0
 }
