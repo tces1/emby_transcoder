@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,7 +25,7 @@ func TestProxyDownloadsRangesConcurrentlyAndInOrder(t *testing.T) {
 			return
 		}
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-		if start != 0 || end != 0 {
+		if !isProbeRequest(r) {
 			current := active.Add(1)
 			for {
 				seen := maxActive.Load()
@@ -81,11 +82,11 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	data := bytes.Repeat([]byte("two-origin-media"), 32*1024)
 	var firstChunks atomic.Int32
 	var secondChunks atomic.Int32
-	var thirdChunks atomic.Int32
+	var thirdRequests atomic.Int32
 	newOrigin := func(counter *atomic.Int32) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				counter.Add(1)
 			}
 			writeRange(w, data, start, end)
@@ -95,7 +96,11 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	defer first.Close()
 	second := newOrigin(&secondChunks)
 	defer second.Close()
-	third := newOrigin(&thirdChunks)
+	third := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		thirdRequests.Add(1)
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
 	defer third.Close()
 
 	proxy, err := New(Options{
@@ -129,8 +134,59 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
 		t.Fatalf("chunks were not distributed across both origins: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
 	}
-	if thirdChunks.Load() != 0 {
-		t.Fatalf("standby third origin received %d chunks", thirdChunks.Load())
+	if thirdRequests.Load() != 0 {
+		t.Fatalf("standby third origin received %d requests", thirdRequests.Load())
+	}
+}
+
+func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
+	data := bytes.Repeat([]byte("fingerprinted-media"), 32*1024)
+	var firstChunks atomic.Int32
+	var secondChunks atomic.Int32
+	newOrigin := func(counter *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+			if !isProbeRequest(r) {
+				counter.Add(1)
+			}
+			writeRangeWithoutValidator(w, data, start, end)
+		}))
+	}
+	first := newOrigin(&firstChunks)
+	defer first.Close()
+	second := newOrigin(&secondChunks)
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("fingerprinted body differs: got=%d want=%d", len(body), len(data))
+	}
+	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
+		t.Fatalf("fingerprinted routes were not both used: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
 	}
 }
 
@@ -143,7 +199,7 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	newOrigin := func(taskOne, taskTwo *atomic.Int32) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				switch r.URL.Path {
 				case "/task-one.mkv":
 					taskOne.Add(1)
@@ -267,7 +323,7 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 				return
 			}
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				counter.Add(1)
 			}
 			writeRange(w, data, start, end)
@@ -374,7 +430,7 @@ func TestProxyBoundsPrefetchWindowWhenFirstChunkIsSlow(t *testing.T) {
 	var started atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-		if start != 0 || end != 0 {
+		if !isProbeRequest(r) {
 			started.Add(1)
 		}
 		if start == 0 && end == chunkSize-1 {
@@ -555,7 +611,7 @@ func TestProxyRejectsChangedRepresentation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
 		etag := `"version-2"`
-		if start == 0 && end == 0 {
+		if isProbeRequest(r) {
 			etag = `"version-1"`
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
@@ -704,6 +760,17 @@ func requestedBounds(t *testing.T, value string, size int64) (int64, int64) {
 	return start, end
 }
 
+func isProbeRequest(r *http.Request) bool {
+	raw := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+	parts := strings.SplitN(raw, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	start, startErr := strconv.ParseInt(parts[0], 10, 64)
+	end, endErr := strconv.ParseInt(parts[1], 10, 64)
+	return startErr == nil && endErr == nil && end-start+1 == probeSampleSize
+}
+
 func writeRange(w http.ResponseWriter, data []byte, start, end int64) {
 	if end >= int64(len(data)) {
 		end = int64(len(data)) - 1
@@ -713,6 +780,18 @@ func writeRange(w http.ResponseWriter, data []byte, start, end int64) {
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.Header().Set("ETag", `"test-etag"`)
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(data[start : end+1])
+}
+
+func writeRangeWithoutValidator(w http.ResponseWriter, data []byte, start, end int64) {
+	if end >= int64(len(data)) {
+		end = int64(len(data)) - 1
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(data[start : end+1])
 }

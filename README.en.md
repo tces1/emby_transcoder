@@ -151,7 +151,7 @@ Leave `debug` as `false` for concise action-level logs. Set it to `true` when yo
 Leave `hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding. Set it to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
 The current VAAPI path uses hardware decode plus `h264_vaapi` hardware encoding and does not add a scale filter. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
 
-`download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds the global read-ahead window; `2 / 8 / 64` is the recommended starting point. Streams without byte-range support or a stable ETag/Last-Modified validator automatically fall back to normal forwarding so chunks from different resource versions cannot be mixed.
+`download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds the global read-ahead window; `2 / 8 / 64` is the recommended starting point. When ETag/Last-Modified is absent, total file size is compared and 64 KiB samples from the head, middle, and tail are combined into a SHA-256 fingerprint; normal forwarding is used only when byte ranges are unavailable or content differs.
 
 When the same upstream has multiple entrances, configure them directly in `upstream.urls`. The first is the primary API route. For safely retryable GET, HEAD, and OPTIONS requests, a connection error or 502/503/504 response switches the service to a working backup route. Non-idempotent requests such as POST are not replayed, preventing duplicate operations. The legacy single-value `upstream.url` remains supported.
 
@@ -171,7 +171,7 @@ With dual downloading enabled, the project preserves the real `DirectStreamUrl` 
 }
 ```
 
-Both entrances are probed through their final media responses before downloading. Only routes with matching file sizes and ETag/Last-Modified validators participate. An unavailable or inconsistent route is excluded, and downloading automatically becomes single-route when only one valid entrance remains.
+Only the two highest-priority routes are probed concurrently at startup. Once two usable, content-identical final media responses are found, lower-priority entrances are not contacted. The next route is probed only when a second usable route is missing. Entrances resolving to the same final media host are deduplicated, and content identity is established through ETag/Last-Modified or file size plus head, middle, and tail SHA-256 samples.
 
 ## Transcode Lifecycle
 

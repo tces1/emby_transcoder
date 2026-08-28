@@ -3,6 +3,7 @@ package inputproxy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ const (
 	probeTimeout       = 10 * time.Second
 	sourceProbeTimeout = 15 * time.Second
 	chunkTimeout       = 30 * time.Second
+	probeSampleSize    = 64 << 10
 )
 
 var errInvalidRange = errors.New("invalid byte range")
@@ -108,10 +110,13 @@ type workerMetric struct {
 }
 
 type metadata struct {
-	size         int64
-	contentType  string
-	etag         string
-	lastModified string
+	size           int64
+	contentType    string
+	etag           string
+	lastModified   string
+	finalHost      string
+	fingerprint    [sha256.Size]byte
+	hasFingerprint bool
 }
 
 type byteRange struct {
@@ -409,6 +414,7 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 
 	var selected metadata
 	var active []string
+	usedFinalHosts := make(map[string]struct{})
 	var lastErr error
 	candidates := src.urls
 	if len(candidates) == 0 {
@@ -449,15 +455,22 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 			if !result.supported {
 				continue
 			}
+			if result.meta.finalHost != "" {
+				if _, duplicate := usedFinalHosts[result.meta.finalHost]; duplicate {
+					continue
+				}
+			}
 			if len(active) == 0 {
 				selected = result.meta
 				active = append(active, candidate)
+				usedFinalHosts[result.meta.finalHost] = struct{}{}
 				continue
 			}
 			merged, ok := mergeRepresentation(selected, result.meta)
 			if ok {
 				selected = merged
 				active = append(active, candidate)
+				usedFinalHosts[result.meta.finalHost] = struct{}{}
 			}
 		}
 		cursor += batchSize
@@ -488,7 +501,8 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (result metadata, supported bool, resultErr error) {
 	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, "bytes=0-0")
+	rangeHeader := fmt.Sprintf("bytes=0-%d", probeSampleSize-1)
+	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, rangeHeader)
 	if err != nil {
 		return metadata{}, false, err
 	}
@@ -496,7 +510,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		return metadata{}, false, err
 	}
 	defer p.release()
-	workerID := p.beginWorker("probing", src, rawURL, "bytes=0-0")
+	workerID := p.beginWorker("probing", src, rawURL, rangeHeader)
 	finalURL := ""
 	defer func() {
 		p.endWorker(workerID, 0, resultErr != nil, finalURL)
@@ -514,9 +528,8 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	if resp.Request != nil && resp.Request.URL != nil {
 		finalURL = resp.Request.URL.String()
 	}
-	_, _, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2))
-	if resp.StatusCode != http.StatusPartialContent || !valid || total <= 0 {
+	start, end, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	if resp.StatusCode != http.StatusPartialContent || !valid || start != 0 || total <= 0 {
 		logging.Infof(
 			"accelerated input probe entry=%s final=%s status=%d range=%t validator=false result=unsupported",
 			routeHost(rawURL),
@@ -526,28 +539,123 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		)
 		return metadata{}, false, nil
 	}
+	expected := end - start + 1
+	sample, err := io.ReadAll(io.LimitReader(resp.Body, expected+1))
+	if err != nil {
+		return metadata{}, false, err
+	}
+	if int64(len(sample)) != expected {
+		return metadata{}, false, fmt.Errorf("probe returned %d bytes, expected %d", len(sample), expected)
+	}
+	finalHost := routeHost(finalURL)
+	if finalHost == "" {
+		finalHost = routeHost(rawURL)
+	}
 	meta := metadata{
 		size:         total,
 		contentType:  resp.Header.Get("Content-Type"),
 		etag:         resp.Header.Get("ETag"),
 		lastModified: resp.Header.Get("Last-Modified"),
+		finalHost:    finalHost,
 	}
-	if _, _, ok := representationValidator(meta); !ok {
-		logging.Infof(
-			"accelerated input probe entry=%s final=%s status=%d range=true validator=false result=unsupported",
-			routeHost(rawURL),
-			routeHost(finalURL),
-			resp.StatusCode,
-		)
-		return metadata{}, false, nil
+	fingerprint, err := p.probeFingerprint(requestCtx, src, rawURL, meta, sample)
+	if err != nil {
+		return metadata{}, false, err
 	}
+	meta.fingerprint = fingerprint
+	meta.hasFingerprint = true
+	_, _, hasValidator := representationValidator(meta)
 	logging.Infof(
-		"accelerated input probe entry=%s final=%s status=%d range=true validator=true result=ready",
+		"accelerated input probe entry=%s final=%s status=%d range=true validator=%t fingerprint=true result=ready",
 		routeHost(rawURL),
 		routeHost(finalURL),
 		resp.StatusCode,
+		hasValidator,
 	)
 	return meta, true, nil
+}
+
+func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string, meta metadata, head []byte) ([sha256.Size]byte, error) {
+	sampleSize := int64(probeSampleSize)
+	if sampleSize > meta.size {
+		sampleSize = meta.size
+	}
+	ranges := []byteRange{
+		{start: 0, end: sampleSize - 1},
+		{start: (meta.size - sampleSize) / 2, end: (meta.size-sampleSize)/2 + sampleSize - 1},
+		{start: meta.size - sampleSize, end: meta.size - 1},
+	}
+	hasher := sha256.New()
+	seen := make(map[byteRange]struct{}, len(ranges))
+	for index, requested := range ranges {
+		if _, duplicate := seen[requested]; duplicate {
+			continue
+		}
+		seen[requested] = struct{}{}
+		var sample []byte
+		if index == 0 {
+			sample = head
+		} else {
+			var err error
+			sample, err = p.fetchProbeSample(ctx, src, rawURL, meta, requested)
+			if err != nil {
+				return [sha256.Size]byte{}, err
+			}
+		}
+		_, _ = fmt.Fprintf(hasher, "%d-%d:", requested.start, requested.end)
+		_, _ = hasher.Write(sample)
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hasher.Sum(nil))
+	return fingerprint, nil
+}
+
+func (p *Proxy) fetchProbeSample(ctx context.Context, src *source, rawURL string, meta metadata, requested byteRange) ([]byte, error) {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", requested.start, requested.end)
+	req, err := p.upstreamRequest(ctx, http.MethodGet, src, rawURL, rangeHeader)
+	if err != nil {
+		return nil, err
+	}
+	validatorHeader, validatorValue, hasValidator := representationValidator(meta)
+	if hasValidator {
+		req.Header.Set("If-Range", validatorValue)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("fingerprint range %s returned %s", rangeHeader, resp.Status)
+	}
+	start, end, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	if !valid || start != requested.start || end != requested.end || total != meta.size {
+		return nil, fmt.Errorf("fingerprint range %s returned invalid content range", rangeHeader)
+	}
+	if hasValidator && resp.Header.Get(validatorHeader) != validatorValue {
+		return nil, fmt.Errorf("representation changed during fingerprint probe")
+	}
+	if finalHost := routeHostFromResponse(resp, rawURL); meta.finalHost != "" && finalHost != meta.finalHost {
+		return nil, fmt.Errorf("media route changed during fingerprint probe")
+	}
+	expected := requested.end - requested.start + 1
+	sample, err := io.ReadAll(io.LimitReader(resp.Body, expected+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(sample)) != expected {
+		return nil, fmt.Errorf("fingerprint range %s returned %d bytes, expected %d", rangeHeader, len(sample), expected)
+	}
+	return sample, nil
+}
+
+func routeHostFromResponse(resp *http.Response, fallback string) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		if host := routeHost(resp.Request.URL.String()); host != "" {
+			return host
+		}
+	}
+	return routeHost(fallback)
 }
 
 func (p *Proxy) serveAccelerated(w http.ResponseWriter, r *http.Request, src *source, meta metadata) {
@@ -881,8 +989,10 @@ func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadat
 	defer func() {
 		p.endWorker(workerID, int64(len(data)), resultErr != nil, finalURL)
 	}()
-	validatorHeader, validatorValue, _ := representationValidator(meta)
-	req.Header.Set("If-Range", validatorValue)
+	validatorHeader, validatorValue, hasValidator := representationValidator(meta)
+	if hasValidator {
+		req.Header.Set("If-Range", validatorValue)
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -898,7 +1008,7 @@ func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadat
 	if !valid || start != requested.start || end != requested.end || total != meta.size {
 		return nil, fmt.Errorf("upstream returned invalid content range %q for %s", resp.Header.Get("Content-Range"), rangeHeader)
 	}
-	if resp.Header.Get(validatorHeader) != validatorValue {
+	if hasValidator && resp.Header.Get(validatorHeader) != validatorValue {
 		return nil, fmt.Errorf("upstream representation changed while fetching %s", rangeHeader)
 	}
 	expected := requested.end - requested.start + 1
@@ -1116,6 +1226,11 @@ func mergeRepresentation(first, next metadata) (metadata, bool) {
 	}
 	if first.lastModified != "" && first.lastModified == next.lastModified {
 		first.etag = ""
+		return first, true
+	}
+	if first.hasFingerprint && next.hasFingerprint && first.fingerprint == next.fingerprint {
+		first.etag = ""
+		first.lastModified = ""
 		return first, true
 	}
 	return metadata{}, false
