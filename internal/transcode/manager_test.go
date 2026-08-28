@@ -564,9 +564,7 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 		PositionTicks: 0,
 	})
 	writeReadySegments(t, session.Dir, 0, 5)
-	for segment := 0; segment <= 5; segment++ {
-		m.RecordSegmentRequest("item123", segment)
-	}
+	m.RecordSegmentRequest("item123", 0)
 
 	if process.pauseCount.Load() != 1 {
 		t.Fatalf("pause count = %d", process.pauseCount.Load())

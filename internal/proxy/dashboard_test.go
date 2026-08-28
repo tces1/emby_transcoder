@@ -132,7 +132,7 @@ func TestDashboardStatusIncludesTranscodeBuffer(t *testing.T) {
 	if status.Code != http.StatusOK {
 		t.Fatalf("status API code = %d body=%s", status.Code, body)
 	}
-	if !strings.Contains(body, `"buffer_seconds":10`) || !strings.Contains(body, `"generated_seconds":10`) {
+	if !strings.Contains(body, `"buffer_seconds":2`) || !strings.Contains(body, `"generated_seconds":10`) {
 		t.Fatalf("status API missing buffer fields: %s", body)
 	}
 	if !strings.Contains(body, `"buffer_pause_seconds":300`) {

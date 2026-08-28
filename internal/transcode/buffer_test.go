@@ -22,7 +22,7 @@ func TestSessionBufferTicksIgnoresRequestedButUnreadySegments(t *testing.T) {
 
 	writeTestSegmentFiles(t, dir, 0, 1)
 	generated, _, buffered = sessionBufferTicks(session)
-	if generated != 4*timeSecondTicks || buffered != 4*timeSecondTicks {
+	if generated != 4*timeSecondTicks || buffered != 0 {
 		t.Fatalf("ready buffer generated=%d buffered=%d count=%d", generated, buffered, session.ReadySegmentCount)
 	}
 	if session.HighestSegmentSeen != 4 {
@@ -52,6 +52,24 @@ func TestSessionBufferTicksIncludesUnrequestedReadySegments(t *testing.T) {
 	}
 	if generated != session.StartTimeTicks+6*timeSecondTicks || buffered != 6*timeSecondTicks {
 		t.Fatalf("seeked ready generated=%d buffered=%d", generated, buffered)
+	}
+}
+
+func TestSessionBufferTicksUsesRequestedSegmentAsPlayhead(t *testing.T) {
+	dir := t.TempDir()
+	session := &Session{
+		Dir:                dir,
+		HighestSegmentSeen: 9,
+		SegmentTicks:       defaultSegmentTicks,
+	}
+	writeTestSegmentFiles(t, dir, 0, 9)
+
+	generated, played, buffered := sessionBufferTicks(session)
+	if generated != 20*timeSecondTicks {
+		t.Fatalf("generated=%d", generated)
+	}
+	if played != 18*timeSecondTicks || buffered != 2*timeSecondTicks {
+		t.Fatalf("stale progress should not inflate buffer played=%d buffered=%d", played, buffered)
 	}
 }
 

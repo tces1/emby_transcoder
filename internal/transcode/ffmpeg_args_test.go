@@ -163,7 +163,7 @@ func TestManagerStatusSnapshotReportsTranscodeBuffer(t *testing.T) {
 		t.Fatalf("statuses = %v", statuses)
 	}
 	status := statuses[0]
-	if status.GeneratedSeconds != 20 || status.BufferSeconds != 20 {
+	if status.GeneratedSeconds != 20 || status.BufferSeconds != 2 {
 		t.Fatalf("buffer status = %+v", status)
 	}
 	if status.RuntimeSeconds != 120 || status.BufferPauseSeconds != 300 || status.BufferResumeSeconds != 120 {

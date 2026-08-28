@@ -957,6 +957,9 @@ func sessionBufferTicks(session *Session) (generatedTicks, playedTicks, bufferTi
 	if playedTicks < baseTicks {
 		playedTicks = baseTicks
 	}
+	if requestTicks := int64(session.HighestSegmentSeen) * sessionSegmentTicks(session); requestTicks > playedTicks {
+		playedTicks = requestTicks
+	}
 	bufferTicks = generatedTicks - playedTicks
 	if bufferTicks < 0 {
 		bufferTicks = 0
