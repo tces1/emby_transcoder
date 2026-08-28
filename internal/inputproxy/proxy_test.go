@@ -480,6 +480,20 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	releaseSecond()
 }
 
+func TestSharedSessionDoesNotFallBackToSiblingRoute(t *testing.T) {
+	src := &source{
+		active:   []string{"route-a", "route-b"},
+		failures: []int{2, 0},
+	}
+	src.dedicated.Store(-1)
+	proxy := &Proxy{workers: 2, sources: map[string]*source{"one": src}}
+
+	attempts := proxy.routeAttempts(src, 0)
+	if len(attempts) != 1 || attempts[0] != 0 {
+		t.Fatalf("shared session attempts = %v, want only the assigned route", attempts)
+	}
+}
+
 func TestRouteFailureUsesStandbyWithoutStealingOtherSessionRoute(t *testing.T) {
 	first := &source{
 		active:   []string{"route-a", "route-b", "route-c"},
@@ -567,6 +581,130 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 	}
 	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
 		t.Fatalf("redirected chunks were not distributed: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
+	}
+}
+
+func TestProxySkipsSharedFinalHostAndUsesNextDistinctRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("distinct-final-hosts"), 32*1024)
+	var sharedChunks atomic.Int32
+	var distinctChunks atomic.Int32
+	var unusedRequests atomic.Int32
+	sharedMedia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			sharedChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer sharedMedia.Close()
+	distinctMedia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			distinctChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer distinctMedia.Close()
+	newEntrance := func(mediaURL string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, mediaURL+r.URL.RequestURI(), http.StatusFound)
+		}))
+	}
+	firstEntrance := newEntrance(sharedMedia.URL)
+	defer firstEntrance.Close()
+	duplicateEntrance := newEntrance(sharedMedia.URL)
+	defer duplicateEntrance.Close()
+	distinctEntrance := newEntrance(distinctMedia.URL)
+	defer distinctEntrance.Close()
+	unused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unusedRequests.Add(1)
+		http.Error(w, "unused", http.StatusServiceUnavailable)
+	}))
+	defer unused.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{firstEntrance.URL, duplicateEntrance.URL, distinctEntrance.URL, unused.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("shared-line body differs: got=%d want=%d", len(body), len(data))
+	}
+	if sharedChunks.Load() == 0 || distinctChunks.Load() == 0 {
+		t.Fatalf("distinct final hosts were not both used: shared=%d distinct=%d", sharedChunks.Load(), distinctChunks.Load())
+	}
+	if unusedRequests.Load() != 0 {
+		t.Fatalf("standby origin received %d requests after two distinct lines were found", unusedRequests.Load())
+	}
+
+	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 2 {
+		t.Fatalf("active final hosts = %v", got)
+	}
+}
+
+func TestProxyKeepsSingleRouteWhenEntrancesShareAFinalHost(t *testing.T) {
+	data := bytes.Repeat([]byte("shared-final-host"), 32*1024)
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer media.Close()
+	newEntrance := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, media.URL+r.URL.RequestURI(), http.StatusFound)
+		}))
+	}
+	first := newEntrance()
+	defer first.Close()
+	second := newEntrance()
+	defer second.Close()
+
+	proxy, err := New(Options{Workers: 2, Origins: []string{first.URL, second.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	src := &source{
+		rawURL:  "https://original.invalid/video.mp4",
+		headers: make(http.Header),
+		urls:    []string{first.URL, second.URL},
+	}
+	_, supported, err := proxy.sourceMetadata(context.Background(), src)
+	if err != nil || !supported {
+		t.Fatalf("metadata supported=%t err=%v", supported, err)
+	}
+	if len(src.active) != 1 {
+		t.Fatalf("active routes = %v", src.active)
+	}
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 1 {
+		t.Fatalf("final hosts = %v", got)
 	}
 }
 

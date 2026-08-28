@@ -27,10 +27,15 @@ type dashboardAuthStore struct {
 	sessions map[string]time.Time
 }
 
+type dashboardSession struct {
+	transcode.SessionStatus
+	Routes []string `json:"routes,omitempty"`
+}
+
 type dashboardStatus struct {
 	UpdatedAt time.Time                   `json:"updated_at"`
 	Workers   []inputproxy.WorkerSnapshot `json:"workers"`
-	Sessions  []transcode.SessionStatus   `json:"sessions"`
+	Sessions  []dashboardSession          `json:"sessions"`
 }
 
 func newDashboardAuthStore() *dashboardAuthStore {
@@ -192,10 +197,21 @@ func (s *Server) dashboardStatus(w http.ResponseWriter) {
 		}
 	}
 	if s.transcodeManager != nil {
-		status.Sessions = s.transcodeManager.StatusSnapshot()
-		sort.Slice(status.Sessions, func(i, j int) bool {
-			return status.Sessions[i].ID < status.Sessions[j].ID
+		sessions := s.transcodeManager.StatusSnapshot()
+		sort.Slice(sessions, func(i, j int) bool {
+			return sessions[i].ID < sessions[j].ID
 		})
+		var routes map[string][]string
+		if s.inputProxy != nil {
+			routes = s.inputProxy.SessionRoutes()
+		}
+		status.Sessions = make([]dashboardSession, 0, len(sessions))
+		for _, session := range sessions {
+			status.Sessions = append(status.Sessions, dashboardSession{
+				SessionStatus: session,
+				Routes:        routes[session.ID],
+			})
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -257,7 +273,8 @@ function render(data){
  document.getElementById('workers').innerHTML=(data.workers||[]).map(function(w){return '<div class="card"><div class="worker-head"><b>Worker '+esc(w.id)+'</b><span class="badge '+badge(w.state)+'">'+esc(w.state)+'</span></div><div class="metric">'+rate(w.download_bps)+'</div><div class="muted">累计 '+bytes(w.total_bytes)+'</div><div class="route">'+esc(w.route||'等待任务')+' · '+esc(w.byte_range||'-')+'</div><div class="muted">'+esc(w.video_name||'暂无视频')+'</div></div>'}).join('');
  const sessions=data.sessions||[];
  document.getElementById('sessions').innerHTML=sessions.length?sessions.map(s=>{
-   const ws=(data.workers||[]).filter(w=>w.session_id===s.id),down=ws.reduce((n,w)=>n+Number(w.download_bps||0),0),routes=ws.map(w=>w.route).filter(Boolean).join(' + ')||'等待线路';
+   const ws=(data.workers||[]).filter(w=>w.session_id===s.id),down=ws.reduce((n,w)=>n+Number(w.download_bps||0),0);
+   const routes=[...new Set((s.routes||[]).concat(ws.filter(w=>w.state==='downloading'||w.state==='probing').map(w=>w.route)).filter(Boolean))].join(' + ')||'等待线路';
    return '<div class="card"><div class="session-head"><div><b>'+esc(s.video_name||s.id)+'</b><div class="muted">'+esc(s.hardware_pipeline||'software')+'</div></div><span class="badge '+badge(s.state)+'">'+esc(s.state)+'</span></div><div class="pipeline"><div class="node '+(down>0?'active':'')+'"><div class="node-title">线路</div><div class="node-value">'+esc(routes)+'</div></div><div class="arrow">→</div><div class="node '+(down>0?'active':'')+'"><div class="node-title">下载</div><div class="node-value">'+rate(down)+'</div></div><div class="arrow">→</div><div class="node '+(s.state==='running'?'active':'')+'"><div class="node-title">FFmpeg</div><div class="node-value">'+Number(s.transcode_speed||0).toFixed(2)+'×</div></div><div class="arrow">→</div><div class="node '+(s.upload_bps>0?'active':'')+'"><div class="node-title">HLS 上传</div><div class="node-value">'+rate(s.upload_bps)+'</div></div></div></div>';
  }).join(''):'<div class="card empty">当前没有转码任务</div>';
 }
