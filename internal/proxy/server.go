@@ -237,6 +237,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(upstreamReq)
 	if err != nil {
+		logging.Errorf("playbackinfo upstream error item=%s err=%v", itemIDFromPlaybackPath(r.URL.Path), err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

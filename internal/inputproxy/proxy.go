@@ -711,7 +711,6 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 			byURL[result.candidate] = result
 		}
 
-		skippedUsableProbe := false
 		for _, candidate := range batchCandidates {
 			if len(active) >= need {
 				break
@@ -730,7 +729,6 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 			}
 			if finalKey != "" {
 				if _, duplicate := usedFinalHosts[finalKey]; duplicate {
-					skippedUsableProbe = true
 					logging.Infof(
 						"accelerated input probe entry=%s final=%s result=duplicate_line",
 						routeHost(candidate),
@@ -750,7 +748,6 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 			}
 			merged, ok := mergeRepresentation(selected, result.meta)
 			if !ok {
-				skippedUsableProbe = true
 				continue
 			}
 			selected = merged
@@ -760,7 +757,7 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 				usedFinalHosts[finalKey] = struct{}{}
 			}
 		}
-		if len(active) >= need || !skippedUsableProbe {
+		if len(active) >= need {
 			break
 		}
 	}

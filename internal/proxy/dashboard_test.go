@@ -59,6 +59,9 @@ func TestDashboardLoginCreatesOpaqueSessionAndServesStatus(t *testing.T) {
 	if !strings.Contains(page.Body.String(), "下载缓存") || !strings.Contains(page.Body.String(), "转码缓冲") {
 		t.Fatalf("dashboard missing buffer charts: %s", page.Body.String())
 	}
+	if !strings.Contains(page.Body.String(), "转码中") || !strings.Contains(page.Body.String(), "空闲") {
+		t.Fatalf("dashboard missing Chinese state labels: %s", page.Body.String())
+	}
 	if strings.Contains(page.Body.String(), "valid-password") {
 		t.Fatal("dashboard page leaked the configured password")
 	}

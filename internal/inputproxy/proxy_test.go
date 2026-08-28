@@ -376,8 +376,8 @@ func TestProxyRemovesStaleCacheFilesOnStartup(t *testing.T) {
 	}
 }
 
-func TestProxyDoesNotScanStandbyWhenSecondPriorityRouteFails(t *testing.T) {
-	data := bytes.Repeat([]byte("single-route-fallback"), 32*1024)
+func TestProxyUsesStandbyWhenFirstBatchCannotFillWorkers(t *testing.T) {
+	data := bytes.Repeat([]byte("second-worker-standby"), 32*1024)
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
 		writeRangeWithoutValidator(w, data, start, end)
@@ -421,10 +421,10 @@ func TestProxyDoesNotScanStandbyWhenSecondPriorityRouteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(body, data) {
-		t.Fatalf("single-route body differs: got=%d want=%d", len(body), len(data))
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
 	}
-	if standbyRequests.Load() != 0 {
-		t.Fatalf("standby route received %d requests", standbyRequests.Load())
+	if standbyRequests.Load() == 0 {
+		t.Fatal("expected standby route to fill the second worker")
 	}
 }
 
