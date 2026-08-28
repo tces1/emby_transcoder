@@ -80,6 +80,7 @@ type Session struct {
 	SegmentStartIndex       int
 	OldestSegmentKept       int
 	HighestSegmentSeen      int
+	ReadySegmentCount       int
 	SegmentTicks            int64
 	Media                   MediaInfo
 	Dir                     string
@@ -596,6 +597,23 @@ func (m *Manager) RecordSegmentRequest(id string, segmentIndex int) {
 	}
 }
 
+func (m *Manager) RecordSegmentReady(id string, segmentIndex int) {
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if segmentIndex >= session.SegmentStartIndex {
+		refreshReadySegments(session)
+	}
+	action, ok := m.bufferActionLocked(session)
+	m.mu.Unlock()
+	if ok {
+		m.applyBufferAction(action)
+	}
+}
+
 func (m *Manager) RecordProgress(event PlaybackEvent) int {
 	m.mu.Lock()
 	now := time.Now()
@@ -928,14 +946,12 @@ func sessionBufferTicks(session *Session) (generatedTicks, playedTicks, bufferTi
 	if session == nil {
 		return 0, 0, 0
 	}
+	refreshReadySegments(session)
 	baseTicks := session.StartTimeTicks
 	if baseTicks < 0 {
 		baseTicks = 0
 	}
-	generatedTicks = baseTicks
-	if session.HighestSegmentSeen >= session.SegmentStartIndex {
-		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * sessionSegmentTicks(session)
-	}
+	generatedTicks = baseTicks + int64(session.ReadySegmentCount)*sessionSegmentTicks(session)
 	playedTicks = session.PositionTicks
 	if playedTicks < baseTicks {
 		playedTicks = baseTicks
@@ -945,6 +961,26 @@ func sessionBufferTicks(session *Session) (generatedTicks, playedTicks, bufferTi
 		bufferTicks = 0
 	}
 	return generatedTicks, playedTicks, bufferTicks
+}
+
+const maxReadySegmentScan = 256
+
+func sessionSegmentPath(session *Session, index int) string {
+	return filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", index))
+}
+
+func refreshReadySegments(session *Session) {
+	if session == nil || session.Dir == "" {
+		return
+	}
+	next := session.SegmentStartIndex + session.ReadySegmentCount
+	for scanned := 0; scanned < maxReadySegmentScan; scanned++ {
+		if !fileExists(sessionSegmentPath(session, next)) {
+			return
+		}
+		session.ReadySegmentCount++
+		next++
+	}
 }
 
 func (m *Manager) applyBufferAction(action bufferAction) {

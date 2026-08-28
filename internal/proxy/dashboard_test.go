@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -89,6 +92,12 @@ func TestDashboardStatusIncludesTranscodeBuffer(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for segment := 0; segment <= 4; segment++ {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	manager.RecordSegmentRequest(session.ID, 4)
 

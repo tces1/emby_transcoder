@@ -550,7 +550,7 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 	})
 	t.Cleanup(m.Close)
 
-	_, err := m.Ensure("item123", transcode.Request{
+	session, err := m.Ensure("item123", transcode.Request{
 		InputURL:      "http://upstream/stream",
 		PlaySessionID: "play-session-1",
 	})
@@ -563,6 +563,7 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 		PlaySessionID: "play-session-1",
 		PositionTicks: 0,
 	})
+	writeReadySegments(t, session.Dir, 0, 5)
 	for segment := 0; segment <= 5; segment++ {
 		m.RecordSegmentRequest("item123", segment)
 	}
@@ -585,6 +586,39 @@ func TestManagerPausesAndResumesBufferedProcess(t *testing.T) {
 	}
 	if process.paused.Load() {
 		t.Fatal("expected process to be resumed")
+	}
+}
+
+func TestManagerDoesNotPauseForRequestedButUnreadySegments(t *testing.T) {
+	process := &pausingProcess{}
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions:           1,
+		TempDir:               t.TempDir(),
+		BufferPauseThreshold:  5 * time.Second,
+		BufferResumeThreshold: 2 * time.Second,
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			return process, nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	_, err := m.Ensure("item123", transcode.Request{
+		InputURL:      "http://upstream/stream",
+		PlaySessionID: "play-session-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for segment := 0; segment <= 5; segment++ {
+		m.RecordSegmentRequest("item123", segment)
+	}
+
+	if process.pauseCount.Load() != 0 {
+		t.Fatalf("pause count = %d", process.pauseCount.Load())
+	}
+	if process.paused.Load() {
+		t.Fatal("expected in-flight segments not to count as buffer")
 	}
 }
 
@@ -1171,6 +1205,16 @@ func TestManagerUsesShortGraceWhenRestartingSession(t *testing.T) {
 	}
 	if grace := time.Duration(first.grace.Load()); grace <= 0 || grace > time.Second {
 		t.Fatalf("restart grace = %s", grace)
+	}
+}
+
+func writeReadySegments(t *testing.T, dir string, from, to int) {
+	t.Helper()
+	for segment := from; segment <= to; segment++ {
+		path := filepath.Join(dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

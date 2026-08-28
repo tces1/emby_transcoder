@@ -142,6 +142,12 @@ func TestManagerStatusSnapshotReportsTranscodeBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for segment := 0; segment <= 9; segment++ {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	manager.RecordSegmentRequest(session.ID, 9)
 
 	statuses := manager.StatusSnapshot()
@@ -154,6 +160,28 @@ func TestManagerStatusSnapshotReportsTranscodeBuffer(t *testing.T) {
 	}
 	if status.RuntimeSeconds != 120 || status.BufferPauseSeconds != 300 || status.BufferResumeSeconds != 120 {
 		t.Fatalf("buffer thresholds = %+v", status)
+	}
+}
+
+func TestManagerStatusSnapshotIgnoresInFlightSegments(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	t.Cleanup(manager.Close)
+	session, err := manager.Ensure("item123", Request{
+		InputURL: "http://upstream/video",
+		Media:    MediaInfo{Name: "Buffered Movie", RunTimeTicks: 120 * timeSecondTicks},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordSegmentRequest(session.ID, 4)
+
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	status := statuses[0]
+	if status.GeneratedSeconds != 0 || status.BufferSeconds != 0 {
+		t.Fatalf("in-flight buffer should be empty: %+v", status)
 	}
 }
 

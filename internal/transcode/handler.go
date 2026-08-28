@@ -133,6 +133,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "segment is not ready", http.StatusGatewayTimeout)
 			return
 		}
+		if index, ok := segmentIndexFromName(name); ok {
+			h.Manager.RecordSegmentReady(id, index)
+		}
 		traceSwitch("segment_file_ready id=%s file=%s path=%s elapsed=%s", id, name, filePath, time.Since(requestStarted))
 		w.Header().Set("Content-Type", "video/mp2t")
 	}
@@ -237,12 +240,13 @@ func (h Handler) logWaitFailure(ctx context.Context, kind, id, name string, wait
 	if ctx.Err() != nil {
 		reason = "canceled"
 	}
+	elapsed := time.Since(started)
 	if name == "" {
-		logging.Errorf("transcode %s %s id=%s wait=%s", kind, reason, id, wait)
+		logging.Errorf("transcode %s %s id=%s wait=%s elapsed=%s", kind, reason, id, wait, elapsed)
 	} else {
-		logging.Errorf("transcode %s %s id=%s file=%s wait=%s", kind, reason, id, name, wait)
+		logging.Errorf("transcode %s %s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, elapsed)
 	}
-	traceSwitch("%s_%s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, time.Since(started))
+	traceSwitch("%s_%s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, elapsed)
 }
 
 func segmentReusable(session *Session, segmentIndex int, name string) bool {
