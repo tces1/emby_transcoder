@@ -17,19 +17,7 @@ Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客�
 
 ## 工作方式
 
-```text
-Emby / Jellyfin 客户端
-        |
-        v
-  Emby-Transcoder
-  - 普通请求透明转发
-  - 按客户端配置匹配 PlaybackInfo
-  - 将命中的 PlaybackInfo 改写到本地 HLS
-  - 在本机维护 FFmpeg 转码会话
-        |
-        v
-  上游 Emby / Jellyfin
-```
+![Emby-Transcoder 双线路下载与单 FFmpeg VAAPI 转码管线](docs/images/transcode-pipeline.svg)
 
 ## 当前功能
 
@@ -42,7 +30,7 @@ Emby / Jellyfin 客户端
 - 通过 Emby `/Sessions/Playing*` check-in 和 HLS 访问跟踪播放生命周期。
 - 输出目标保守固定为 H.264 视频、AAC 音频、HLS MPEG-TS 分片。
 - 软件转码会把视频输出限制到 1920x1080，并保持原始宽高比；VAAPI 模式不做缩放。
-- PlaybackInfo 重写时会预热转码会话，减少首次 playlist 请求等待。
+- 仅在客户端请求 HLS playlist 或分片时启动转码，浏览详情页不会预下载。
 - FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
 - 可选用并发 HTTP Range 下载代理为 FFmpeg 加速远程输入；上游不支持 Range 时自动回退为普通单连接。
 

@@ -21,11 +21,12 @@ import (
 )
 
 const (
-	defaultChunkSize  = 8 << 20
-	defaultBufferSize = 64 << 20
-	maxWorkers        = 2
-	probeTimeout      = 10 * time.Second
-	chunkTimeout      = 30 * time.Second
+	defaultChunkSize   = 8 << 20
+	defaultBufferSize  = 64 << 20
+	maxWorkers         = 2
+	probeTimeout       = 10 * time.Second
+	sourceProbeTimeout = 15 * time.Second
+	chunkTimeout       = 30 * time.Second
 )
 
 var errInvalidRange = errors.New("invalid byte range")
@@ -413,25 +414,53 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 	if len(candidates) == 0 {
 		candidates = []string{src.rawURL}
 	}
-	for _, candidate := range candidates {
-		meta, supported, err := p.probeMetadata(ctx, src, candidate)
-		if err != nil {
-			lastErr = err
-			continue
+	probeCtx, cancel := context.WithTimeout(ctx, sourceProbeTimeout)
+	defer cancel()
+	type probeResult struct {
+		candidate string
+		meta      metadata
+		supported bool
+		err       error
+	}
+	cursor := 0
+	for cursor < len(candidates) && len(active) < p.workers && probeCtx.Err() == nil {
+		batchSize := p.workers - len(active)
+		if remaining := len(candidates) - cursor; batchSize > remaining {
+			batchSize = remaining
 		}
-		if !supported {
-			continue
+		results := make(chan probeResult, batchSize)
+		for _, candidate := range candidates[cursor : cursor+batchSize] {
+			go func() {
+				meta, supported, err := p.probeMetadata(probeCtx, src, candidate)
+				results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
+			}()
 		}
-		if len(active) == 0 {
-			selected = meta
-			active = append(active, candidate)
-			continue
+		batch := make(map[string]probeResult, batchSize)
+		for range batchSize {
+			result := <-results
+			batch[result.candidate] = result
 		}
-		merged, ok := mergeRepresentation(selected, meta)
-		if ok {
-			selected = merged
-			active = append(active, candidate)
+		for _, candidate := range candidates[cursor : cursor+batchSize] {
+			result := batch[candidate]
+			if result.err != nil {
+				lastErr = result.err
+				continue
+			}
+			if !result.supported {
+				continue
+			}
+			if len(active) == 0 {
+				selected = result.meta
+				active = append(active, candidate)
+				continue
+			}
+			merged, ok := mergeRepresentation(selected, result.meta)
+			if ok {
+				selected = merged
+				active = append(active, candidate)
+			}
 		}
+		cursor += batchSize
 	}
 	if len(active) == 0 {
 		if lastErr != nil {
@@ -474,6 +503,11 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	}()
 	resp, err := p.client.Do(req)
 	if err != nil {
+		reason := "request_error"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			reason = "timeout"
+		}
+		logging.Infof("accelerated input probe entry=%s result=%s", routeHost(rawURL), reason)
 		return metadata{}, false, err
 	}
 	defer resp.Body.Close()
@@ -483,6 +517,13 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	_, _, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2))
 	if resp.StatusCode != http.StatusPartialContent || !valid || total <= 0 {
+		logging.Infof(
+			"accelerated input probe entry=%s final=%s status=%d range=%t validator=false result=unsupported",
+			routeHost(rawURL),
+			routeHost(finalURL),
+			resp.StatusCode,
+			valid,
+		)
 		return metadata{}, false, nil
 	}
 	meta := metadata{
@@ -492,8 +533,20 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		lastModified: resp.Header.Get("Last-Modified"),
 	}
 	if _, _, ok := representationValidator(meta); !ok {
+		logging.Infof(
+			"accelerated input probe entry=%s final=%s status=%d range=true validator=false result=unsupported",
+			routeHost(rawURL),
+			routeHost(finalURL),
+			resp.StatusCode,
+		)
 		return metadata{}, false, nil
 	}
+	logging.Infof(
+		"accelerated input probe entry=%s final=%s status=%d range=true validator=true result=ready",
+		routeHost(rawURL),
+		routeHost(finalURL),
+		resp.StatusCode,
+	)
 	return meta, true, nil
 }
 

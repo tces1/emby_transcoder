@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">Emby-Transcoder architecture</title>
+  <desc id="desc">Two prioritized HTTP range workers merge into one ordered stream consumed by one FFmpeg VAAPI pipeline and served as HLS.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081321"/>
+      <stop offset="1" stop-color="#101d31"/>
+    </linearGradient>
+    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#163c55"/>
+      <stop offset="1" stop-color="#155e75"/>
+    </linearGradient>
+    <linearGradient id="worker" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#123d38"/>
+      <stop offset="1" stop-color="#115e59"/>
+    </linearGradient>
+    <linearGradient id="ffmpeg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#493176"/>
+      <stop offset="1" stop-color="#6d3fa0"/>
+    </linearGradient>
+    <linearGradient id="output" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#704020"/>
+      <stop offset="1" stop-color="#9a531e"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity=".3"/>
+    </filter>
+    <marker id="arrow-api" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrow-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2dd4bf"/>
+    </marker>
+    <marker id="arrow-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb923c"/>
+    </marker>
+    <style>
+      .title{font:700 28px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f4f8ff}
+      .section{font:700 15px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#8da4c4;letter-spacing:1.8px}
+      .label{font:700 17px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f5f9ff}
+      .sub{font:500 13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#b7c7dc}
+      .mini{font:600 12px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#a8bdd6}
+      .badge{font:700 12px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#5eead4}
+      .box{stroke:#35506f;stroke-width:1.5}
+      .api-line{fill:none;stroke:#60a5fa;stroke-width:2;marker-end:url(#arrow-api)}
+      .input-line{fill:none;stroke:#2dd4bf;stroke-width:2.5;marker-end:url(#arrow-input)}
+      .output-line{fill:none;stroke:#fb923c;stroke-width:2.5;marker-end:url(#arrow-output)}
+      .monitor-line{fill:none;stroke:#7086a4;stroke-width:2;stroke-dasharray:6 7}
+    </style>
+  </defs>
+
+  <rect width="1400" height="760" rx="26" fill="url(#bg)"/>
+  <text x="46" y="52" class="title">Emby-Transcoder / Dual-route single transcode pipeline</text>
+  <text x="46" y="80" class="sub">Two prioritized downloads feed one ordered FFmpeg and VAAPI session</text>
+
+  <text x="46" y="124" class="section">CONTROL PLANE</text>
+  <rect x="46" y="145" width="245" height="92" rx="15" fill="#14233a" class="box" filter="url(#shadow)"/>
+  <text x="168" y="182" text-anchor="middle" class="label">Emby / Jellyfin Client</text>
+  <text x="168" y="207" text-anchor="middle" class="sub">Web / TV / Mobile</text>
+
+  <rect x="470" y="135" width="330" height="112" rx="17" fill="url(#bridge)" stroke="#38bdf8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="635" y="177" text-anchor="middle" class="label">Emby-Transcoder</text>
+  <text x="635" y="203" text-anchor="middle" class="sub">Reverse proxy / PlaybackInfo rewrite</text>
+  <text x="635" y="226" text-anchor="middle" class="mini">Session and lifecycle management</text>
+
+  <rect x="1015" y="145" width="335" height="92" rx="15" fill="#14233a" class="box" filter="url(#shadow)"/>
+  <text x="1182" y="182" text-anchor="middle" class="label">Upstream Emby Entrances</text>
+  <text x="1182" y="207" text-anchor="middle" class="sub">Primary API plus ordered failover</text>
+
+  <path d="M291 191 H470" class="api-line"/>
+  <path d="M800 191 H1015" class="api-line"/>
+  <text x="376" y="177" text-anchor="middle" class="mini">API requests</text>
+  <text x="906" y="177" text-anchor="middle" class="mini">PlaybackInfo</text>
+
+  <text x="46" y="302" class="section">DATA PLANE / ONE TRANSCODE SESSION</text>
+  <rect x="1120" y="38" width="230" height="35" rx="17" fill="#123d38" stroke="#2dd4bf" stroke-width="1"/>
+  <text x="1235" y="61" text-anchor="middle" class="badge">Global maximum: 2 connections</text>
+
+  <rect x="46" y="334" width="218" height="100" rx="15" fill="#14233a" class="box" filter="url(#shadow)"/>
+  <text x="155" y="371" text-anchor="middle" class="label">Priority Route A</text>
+  <text x="155" y="396" text-anchor="middle" class="sub">Entry A to Media A via 302</text>
+  <text x="155" y="417" text-anchor="middle" class="mini">Priority 1</text>
+
+  <rect x="46" y="486" width="218" height="100" rx="15" fill="#14233a" class="box" filter="url(#shadow)"/>
+  <text x="155" y="523" text-anchor="middle" class="label">Priority Route B</text>
+  <text x="155" y="548" text-anchor="middle" class="sub">Entry B to Media B via 302</text>
+  <text x="155" y="569" text-anchor="middle" class="mini">Priority 2</text>
+
+  <rect x="324" y="334" width="205" height="100" rx="15" fill="url(#worker)" stroke="#2dd4bf" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="426" y="371" text-anchor="middle" class="label">Download Worker 1</text>
+  <text x="426" y="397" text-anchor="middle" class="sub">HTTP Range / 8 MiB chunk</text>
+  <text x="426" y="419" text-anchor="middle" class="badge">Concurrent input</text>
+
+  <rect x="324" y="486" width="205" height="100" rx="15" fill="url(#worker)" stroke="#2dd4bf" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="426" y="523" text-anchor="middle" class="label">Download Worker 2</text>
+  <text x="426" y="549" text-anchor="middle" class="sub">HTTP Range / 8 MiB chunk</text>
+  <text x="426" y="571" text-anchor="middle" class="badge">Concurrent input</text>
+
+  <path d="M264 384 H324" class="input-line"/>
+  <path d="M264 536 H324" class="input-line"/>
+
+  <rect x="598" y="390" width="220" height="140" rx="18" fill="#173047" stroke="#38bdf8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="708" y="429" text-anchor="middle" class="label">Ordered Range Merger</text>
+  <text x="708" y="455" text-anchor="middle" class="sub">Loopback input proxy</text>
+  <rect x="630" y="478" width="156" height="30" rx="8" fill="#0d2033" stroke="#365774"/>
+  <text x="708" y="498" text-anchor="middle" class="mini">Continuous seekable bytes</text>
+
+  <path d="M529 384 C570 384 570 430 598 430" class="input-line"/>
+  <path d="M529 536 C570 536 570 490 598 490" class="input-line"/>
+
+  <rect x="888" y="370" width="260" height="180" rx="20" fill="url(#ffmpeg)" stroke="#c084fc" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="1018" y="407" text-anchor="middle" class="label">Single FFmpeg Process</text>
+  <text x="1018" y="430" text-anchor="middle" class="sub">One transcode pipeline</text>
+  <rect x="914" y="456" width="208" height="35" rx="9" fill="#332456" stroke="#9f7aea"/>
+  <text x="1018" y="479" text-anchor="middle" class="mini">Demux to VAAPI Decode</text>
+  <rect x="914" y="501" width="208" height="35" rx="9" fill="#332456" stroke="#9f7aea"/>
+  <text x="1018" y="524" text-anchor="middle" class="mini">H.264 Encode plus AAC</text>
+
+  <path d="M818 460 H888" class="input-line"/>
+
+  <rect x="1210" y="390" width="140" height="140" rx="18" fill="url(#output)" stroke="#fb923c" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="1280" y="433" text-anchor="middle" class="label">HLS</text>
+  <text x="1280" y="460" text-anchor="middle" class="sub">MPEG-TS</text>
+  <text x="1280" y="485" text-anchor="middle" class="mini">Playlist</text>
+  <text x="1280" y="506" text-anchor="middle" class="mini">Segments</text>
+  <path d="M1148 460 H1210" class="output-line"/>
+
+  <path d="M1280 390 V272 C1280 264 1272 260 1260 260 H170 C130 260 110 246 110 237" class="output-line"/>
+  <text x="934" y="283" text-anchor="middle" class="mini" fill="#fdba74">Local HLS delivery to the client</text>
+
+  <rect x="325" y="650" width="750" height="70" rx="16" fill="#111f34" stroke="#55708f" stroke-width="1.5"/>
+  <text x="700" y="680" text-anchor="middle" class="label">/emby_transcoder Status Dashboard</text>
+  <text x="700" y="704" text-anchor="middle" class="sub">Routes / download rates / FFmpeg speed / HLS upload rate</text>
+  <path d="M426 586 V650" class="monitor-line"/>
+  <path d="M708 530 V650" class="monitor-line"/>
+  <path d="M1018 550 V650" class="monitor-line"/>
+  <path d="M1280 530 V620 H1075" class="monitor-line"/>
+</svg>

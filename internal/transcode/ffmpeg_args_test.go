@@ -276,6 +276,9 @@ func TestBuildFFmpegArgsUsesFullVAAPITranscodePipeline(t *testing.T) {
 	if outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
 		t.Fatalf("missing VAAPI hardware frame output: %v", args)
 	}
+	if slices.Contains(args, "-vaapi_device") {
+		t.Fatalf("full VAAPI pipeline must not initialize a second device: %v", args)
+	}
 	codecIndex := slices.Index(args, "-c:v")
 	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
 		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
@@ -360,8 +363,8 @@ func TestBuildFFmpegArgsUsesVAAPIHybridPipelineForHEVCMain10(t *testing.T) {
 	if outputFormatIndex := slices.Index(args, "-hwaccel_output_format"); outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
 		t.Fatalf("missing VAAPI surface output: %v", args)
 	}
-	if deviceIndex := slices.Index(args, "-vaapi_device"); deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
-		t.Fatalf("missing VAAPI upload/encode device: %v", args)
+	if slices.Contains(args, "-vaapi_device") {
+		t.Fatalf("hybrid pipeline must not initialize a second VAAPI device: %v", args)
 	}
 	vfIndex := slices.Index(args, "-vf")
 	if vfIndex < 0 {

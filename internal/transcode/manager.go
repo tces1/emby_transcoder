@@ -1567,7 +1567,6 @@ func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {
 		args = append(args, "-hwaccel", "vaapi")
 		if device := strings.TrimSpace(options.HardwareDevice); device != "" {
 			args = append(args, "-hwaccel_device", device)
-			args = append(args, "-vaapi_device", device)
 		}
 		args = append(args, "-hwaccel_output_format", "vaapi")
 		return args

@@ -17,19 +17,7 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 
 ## How It Works
 
-```text
-Emby / Jellyfin client
-        |
-        v
-  Emby-Transcoder
-  - transparent proxy for ordinary requests
-  - PlaybackInfo matching by client profile
-  - PlaybackInfo rewrite to local HLS
-  - local FFmpeg transcode sessions
-        |
-        v
-  upstream Emby / Jellyfin
-```
+![Emby-Transcoder dual-route download and single FFmpeg VAAPI pipeline](docs/images/transcode-pipeline.svg)
 
 ## Current Scope
 
@@ -42,7 +30,7 @@ Emby / Jellyfin client
 - Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
 - Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
 - Software transcoding caps video output at 1920x1080 and keeps aspect ratio; VAAPI mode does not scale.
-- PlaybackInfo rewrite prewarms the transcode session before the first playlist request.
+- Transcoding starts only when the client requests an HLS playlist or segment, so browsing details does not pre-download media.
 - FFmpeg uses low-latency startup and GOP settings to cut first-segment delay.
 
 Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
