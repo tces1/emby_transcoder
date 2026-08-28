@@ -26,6 +26,7 @@ const defaultRestartGraceTimeout = 500 * time.Millisecond
 const maxTranscodeWidth = 1920
 const maxTranscodeHeight = 1080
 const lowLatencyGOP = 25
+const hlsInitTimeSeconds = 1
 
 type Options struct {
 	MaxSessions           int
@@ -1571,6 +1572,7 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	}
 	args = append(args,
 		"-f", "hls",
+		"-hls_init_time", strconv.Itoa(hlsInitTimeSeconds),
 		"-hls_time", hlsTimeValue(sessionSegmentTicks(session)),
 		"-hls_list_size", "0",
 		"-hls_flags", "independent_segments+temp_file",

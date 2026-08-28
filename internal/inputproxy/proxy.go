@@ -31,6 +31,7 @@ const (
 	sourceProbeTimeout = 15 * time.Second
 	chunkTimeout       = 30 * time.Second
 	probeSampleSize    = 64 << 10
+	sizeProbeRange     = "bytes=0-0"
 	probeRetryAttempts = 2
 	chunkRetryAttempts = 3
 	retryDelay         = 250 * time.Millisecond
@@ -953,23 +954,14 @@ func strongETag(value string) bool {
 
 func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (result metadata, supported bool, resultErr error) {
 	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
-	rangeHeader := fmt.Sprintf("bytes=0-%d", probeSampleSize-1)
-	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, rangeHeader)
+	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, sizeProbeRange)
 	if err != nil {
+		cancel()
 		return metadata{}, false, err
 	}
-	if err := p.acquire(requestCtx); err != nil {
-		return metadata{}, false, err
-	}
-	defer p.release()
-	workerID := p.beginWorker("probing", src, rawURL, rangeHeader)
-	finalURL := ""
-	defer func() {
-		p.endWorker(workerID, 0, isWorkerFailure(resultErr), finalURL)
-	}()
 	resp, err := p.doRequestWithRetry(requestCtx, req, probeRetryAttempts)
 	if err != nil {
+		cancel()
 		reason := "request_error"
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			reason = "timeout"
@@ -982,11 +974,15 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		)
 		return metadata{}, false, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		cancel()
+		_ = resp.Body.Close()
+	}()
+	finalURL := ""
 	if resp.Request != nil && resp.Request.URL != nil {
 		finalURL = resp.Request.URL.String()
 	}
-	start, end, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	start, _, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
 	if resp.StatusCode != http.StatusPartialContent || !valid || start != 0 || total <= 0 {
 		logging.Infof(
 			"accelerated input probe entry=%s final=%s status=%d range=%t validator=false result=unsupported",
@@ -996,14 +992,6 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 			valid,
 		)
 		return metadata{}, false, nil
-	}
-	expected := end - start + 1
-	sample, err := io.ReadAll(io.LimitReader(resp.Body, expected+1))
-	if err != nil {
-		return metadata{}, false, err
-	}
-	if int64(len(sample)) != expected {
-		return metadata{}, false, fmt.Errorf("probe returned %d bytes, expected %d", len(sample), expected)
 	}
 	finalHost := routeHost(finalURL)
 	if finalHost == "" {

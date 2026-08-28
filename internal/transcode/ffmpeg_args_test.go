@@ -66,6 +66,10 @@ func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testi
 	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
 		t.Fatalf("expected default HLS segment duration, args=%v", args)
 	}
+	initTimeIndex := slices.Index(args, "-hls_init_time")
+	if initTimeIndex < 0 || args[initTimeIndex+1] != "1" {
+		t.Fatalf("expected first HLS segment to use hls_init_time 1, args=%v", args)
+	}
 	if args[len(args)-1] != filepath.Join(session.Dir, "master.m3u8") {
 		t.Fatalf("playlist output = %q", args[len(args)-1])
 	}
@@ -83,6 +87,10 @@ func TestBuildFFmpegArgsUsesConfiguredSegmentDuration(t *testing.T) {
 	hlsTimeIndex := slices.Index(args, "-hls_time")
 	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
 		t.Fatalf("expected configured HLS segment duration, args=%v", args)
+	}
+	initTimeIndex := slices.Index(args, "-hls_init_time")
+	if initTimeIndex < 0 || args[initTimeIndex+1] != "1" {
+		t.Fatalf("expected first HLS segment shorter than configured duration, args=%v", args)
 	}
 }
 
@@ -261,7 +269,7 @@ func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 
 	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
 
-	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0"} {
+	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0", "-hls_init_time", "1"} {
 		if !slices.Contains(args, want) {
 			t.Fatalf("missing low-latency arg %q in %v", want, args)
 		}

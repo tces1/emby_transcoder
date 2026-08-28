@@ -315,6 +315,119 @@ func TestProxyDefersFingerprintUntilSecondRoute(t *testing.T) {
 	}
 }
 
+func TestProxyFirstRouteProbeUsesSizeRangeAndIgnoresBody(t *testing.T) {
+	data := bytes.Repeat([]byte("size-probe-body"), 16*1024)
+	var ranges []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		ranges = append(ranges, rangeHeader)
+		mu.Unlock()
+		if rangeHeader == sizeProbeRange {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusPartialContent)
+			return
+		}
+		start, end := requestedBounds(t, rangeHeader, int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{Workers: 1, ChunkSize: 16 << 10, BufferSize: 32 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	foundSizeProbe := false
+	for _, value := range ranges {
+		if value == sizeProbeRange {
+			foundSizeProbe = true
+		}
+		if strings.HasPrefix(value, "bytes=0-") && value != sizeProbeRange && isProbeRange(value) {
+			t.Fatalf("first-route probe still requested a 64KiB sample: %v", ranges)
+		}
+	}
+	if !foundSizeProbe {
+		t.Fatalf("expected %s size probe, ranges=%v", sizeProbeRange, ranges)
+	}
+}
+
+func TestProxyFirstRouteProbeDoesNotHoldDownloadSlot(t *testing.T) {
+	data := bytes.Repeat([]byte("slot-free-probe"), 16*1024)
+	blockBody := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == sizeProbeRange {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusPartialContent)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-blockBody
+			return
+		}
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+	defer close(blockBody)
+
+	proxy, err := New(Options{Workers: 1, ChunkSize: 16 << 10, BufferSize: 32 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("download waited %s for a blocked size-probe body", time.Since(started))
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
+	}
+}
+
 func TestProxyCachesCompletedChunksInSparseFile(t *testing.T) {
 	data := bytes.Repeat([]byte("disk-backed-cache"), 32*1024)
 	var chunkRequests atomic.Int32
@@ -1306,7 +1419,13 @@ func isProbeRange(value string) bool {
 	}
 	start, startErr := strconv.ParseInt(parts[0], 10, 64)
 	end, endErr := strconv.ParseInt(parts[1], 10, 64)
-	return startErr == nil && endErr == nil && end-start+1 == probeSampleSize
+	if startErr != nil || endErr != nil {
+		return false
+	}
+	if start == 0 && end == 0 {
+		return true
+	}
+	return end-start+1 == probeSampleSize
 }
 
 func registeredSource(t *testing.T, proxy *Proxy, localURL string) *source {
