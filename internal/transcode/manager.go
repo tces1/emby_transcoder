@@ -1356,6 +1356,9 @@ func selectHardwarePipeline(info MediaInfo, current string) string {
 	if pipeline != "vaapi-full" {
 		return current
 	}
+	if needsVAAPIEncodeFallback(info) {
+		return "vaapi-encode"
+	}
 	if needsVAAPIHybridPipeline(info) {
 		return "vaapi-hybrid"
 	}
@@ -1376,6 +1379,17 @@ func needsVAAPIHybridPipeline(info MediaInfo) bool {
 		return true
 	}
 	return false
+}
+
+func needsVAAPIEncodeFallback(info MediaInfo) bool {
+	codec := strings.ToLower(strings.TrimSpace(info.VideoCodec))
+	if codec != "hevc" && codec != "h265" {
+		return false
+	}
+	if needsVAAPIHybridPipeline(info) {
+		return false
+	}
+	return info.Width > maxTranscodeWidth || info.Height > maxTranscodeHeight
 }
 
 func archiveFailedTranscodeLog(session *Session, logPath string) (string, error) {

@@ -31,6 +31,9 @@ const (
 	sourceProbeTimeout = 15 * time.Second
 	chunkTimeout       = 30 * time.Second
 	probeSampleSize    = 64 << 10
+	probeRetryAttempts = 2
+	chunkRetryAttempts = 3
+	retryDelay         = 250 * time.Millisecond
 )
 
 var errInvalidRange = errors.New("invalid byte range")
@@ -541,7 +544,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	defer func() {
 		p.endWorker(workerID, 0, resultErr != nil, finalURL)
 	}()
-	resp, err := p.client.Do(req)
+	resp, err := p.doRequestWithRetry(requestCtx, req, probeRetryAttempts)
 	if err != nil {
 		reason := "request_error"
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
@@ -628,7 +631,7 @@ func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string
 			sample = head
 		} else {
 			var err error
-			sample, err = p.fetchProbeSample(ctx, src, rawURL, meta, requested)
+			sample, err = p.fetchProbeSampleWithRetry(ctx, src, rawURL, meta, requested)
 			if err != nil {
 				return [sha256.Size]byte{}, err
 			}
@@ -678,6 +681,54 @@ func (p *Proxy) fetchProbeSample(ctx context.Context, src *source, rawURL string
 		return nil, fmt.Errorf("fingerprint range %s returned %d bytes, expected %d", rangeHeader, len(sample), expected)
 	}
 	return sample, nil
+}
+
+func (p *Proxy) fetchProbeSampleWithRetry(ctx context.Context, src *source, rawURL string, meta metadata, requested byteRange) ([]byte, error) {
+	var lastErr error
+	for attempt := range probeRetryAttempts {
+		sample, err := p.fetchProbeSample(ctx, src, rawURL, meta, requested)
+		if err == nil {
+			return sample, nil
+		}
+		lastErr = err
+		if attempt+1 < probeRetryAttempts {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func (p *Proxy) doRequestWithRetry(ctx context.Context, req *http.Request, attempts int) (*http.Response, error) {
+	var lastErr error
+	for attempt := range attempts {
+		response, err := p.client.Do(req.Clone(ctx))
+		if err == nil {
+			return response, nil
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		lastErr = err
+		if attempt+1 < attempts {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func routeHostFromResponse(resp *http.Response, fallback string) string {
@@ -762,7 +813,11 @@ func (p *Proxy) serveAccelerated(w http.ResponseWriter, r *http.Request, src *so
 		return
 	}
 	if err := p.streamRanges(r.Context(), w, src, meta, start, end); err != nil && r.Context().Err() == nil {
-		logging.Errorf("accelerated input interrupted source=%s", sourceLabel(src.rawURL))
+		logging.Errorf(
+			"accelerated input interrupted source=%s detail=%q",
+			sourceLabel(src.rawURL),
+			transportErrorDetail(err),
+		)
 	}
 }
 
@@ -1078,14 +1133,32 @@ func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requ
 		return nil, errors.New("no active accelerated input route")
 	}
 	var lastErr error
-	for _, index := range p.routeAttempts(src, requested.urlIndex) {
-		data, err := p.fetchRangeFromURL(ctx, src, meta, src.active[index], requested)
-		if err == nil {
-			src.recordRouteResult(index, true)
-			return data, nil
+	for retry := range chunkRetryAttempts {
+		for _, index := range p.routeAttempts(src, requested.urlIndex) {
+			data, err := p.fetchRangeFromURL(ctx, src, meta, src.active[index], requested)
+			if err == nil {
+				src.recordRouteResult(index, true)
+				return data, nil
+			}
+			src.recordRouteResult(index, false)
+			lastErr = err
+			logging.Infof(
+				"accelerated input chunk route=%s range=%d-%d attempt=%d result=error detail=%q",
+				routeHost(src.active[index]),
+				requested.start,
+				requested.end,
+				retry+1,
+				transportErrorDetail(err),
+			)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 		}
-		src.recordRouteResult(index, false)
-		lastErr = err
+		if retry+1 < chunkRetryAttempts {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return nil, lastErr
 }

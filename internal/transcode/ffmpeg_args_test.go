@@ -327,6 +327,20 @@ func TestBuildFFmpegArgsUsesVAAPIEncodeFallbackPipeline(t *testing.T) {
 	}
 }
 
+func TestSelectHardwarePipelineUsesEncodeFallbackFor4KHEVCMain8(t *testing.T) {
+	info := MediaInfo{
+		VideoCodec:    "hevc",
+		VideoProfile:  "Main",
+		VideoBitDepth: 8,
+		VideoPixFmt:   "yuv420p",
+		Width:         3840,
+		Height:        2160,
+	}
+	if got := selectHardwarePipeline(info, "vaapi-full"); got != "vaapi-encode" {
+		t.Fatalf("pipeline = %q, want vaapi-encode", got)
+	}
+}
+
 func TestBuildFFmpegArgsUsesVAAPIHybridPipelineForHEVCMain10(t *testing.T) {
 	session := &Session{
 		ID:  "item123",

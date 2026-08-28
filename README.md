@@ -29,7 +29,7 @@ Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客�
 - 支持通过 Emby `AudioStreamIndex` 选择音轨，切换音轨时会重启本地转码。
 - 通过 Emby `/Sessions/Playing*` check-in 和 HLS 访问跟踪播放生命周期。
 - 输出目标保守固定为 H.264 视频、AAC 音频、HLS MPEG-TS 分片。
-- 软件转码会把视频输出限制到 1920x1080，并保持原始宽高比；VAAPI 模式不做缩放。
+- 软件转码和 VAAPI 兼容管线会把视频限制到 1920x1080；可用时优先使用完整 VAAPI 管线。
 - 仅在客户端请求 HLS playlist 或分片时启动转码，浏览详情页不会预下载。
 - FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
 - 可选用双线路 HTTP Range 下载，将分块按偏移写入本地稀疏缓存，再通过可 Seek 的本地 HTTP 输入 FFmpeg。
@@ -82,7 +82,7 @@ cp config/config.json config/config.local.json
 - `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
 - `transcode.hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。
 - Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_decode` 设置为 `vaapi`。
-- 当前 VAAPI 模式使用硬件解码加 `h264_vaapi` 硬件编码，不再插入缩放过滤器。
+- VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 自动使用软件解码/缩放加 VAAPI 编码，避开不支持的 VAProfile。
 - 启动时会探测 VAAPI 可用性，包括设备初始化和 `h264_vaapi`；设备、驱动或 ffmpeg 支持缺失时会启动失败。
 
 如果使用 `config.local.json`，需要把 `docker/docker-compose.yml` 的挂载改成本地配置文件：
@@ -155,7 +155,7 @@ go build ./cmd/emby-transcoder
 
 `hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。设置为 `vaapi` 可启用 VAAPI 硬件转码，默认设备是 `/dev/dri/renderD128`。
 
-当前 VAAPI 模式使用硬件解码加 `h264_vaapi` 硬件编码，不再插入缩放过滤器。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
+VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接选择软件解码/缩放加 VAAPI 编码，避免先进入不支持的完整硬件管线。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
 
 `download_workers` 控制 FFmpeg 输入侧的全局并发 Range 下载数。默认值 `1` 表示关闭加速并让 FFmpeg 直接访问上游；设置为 `2` 可启用双路下载。为避免上游将额外连接计为多路播放，程序会硬性限制整个进程最多同时发出 `2` 个上游 Range 请求，即使配置了更大的值也不会突破。`download_chunk_mb` 是每个 Range 分块大小，`download_buffer_mb` 限制稀疏文件的前向预读窗口，推荐使用 `2 / 8 / 64`。分块通过 `WriteAt` 写入 `<temp_dir>/input-cache/` 下的正确偏移，FFmpeg 经本地可 Seek HTTP 读取；会话结束后缓存自动删除。如果上游没有 ETag/Last-Modified，程序会比较文件总大小，并对文件头、中间和末尾各 64 KiB 抽样后计算组合 SHA-256 指纹；不支持字节范围或内容不一致时才回退到普通转发。
 

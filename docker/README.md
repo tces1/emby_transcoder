@@ -26,10 +26,10 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `server.debug` to `true` when you need detailed diagnostics
 - leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
 - set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI through `/dev/dri`
-- VAAPI mode uses hardware decode plus `h264_vaapi` hardware encoding and does not add a scale filter
+- VAAPI normally uses hardware decode plus `h264_vaapi`; 4K HEVC Main 8 uses software decode/scale with VAAPI encode for compatibility
 - startup probes VAAPI support, including device initialization and `h264_vaapi`, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
-- software transcoding caps video output at 1920x1080 while preserving aspect ratio; VAAPI mode does not scale
+- software and VAAPI compatibility pipelines cap output at 1920x1080 while preserving aspect ratio
 - `transcode.segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count
 - set `transcode.download_workers` to `2` to assemble dual HTTP Range downloads in a sparse file with `8` MB chunks and `64` MB read-ahead; the process hard-limits upstream concurrency to `2`
 - with two `upstream.urls`, media workers preserve the PlaybackInfo `DirectStreamUrl`, alternate requests through both entrances, and follow each entrance's redirect to its actual media host

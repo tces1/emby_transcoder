@@ -346,6 +346,53 @@ func TestProxyDoesNotScanStandbyWhenSecondPriorityRouteFails(t *testing.T) {
 	}
 }
 
+func TestProxyRetriesTransientChunkFailure(t *testing.T) {
+	data := bytes.Repeat([]byte("retryable-chunk"), 32*1024)
+	var attempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) && attempts.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+			return
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  32 << 10,
+		BufferSize: 32 << 10,
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	req, err := http.NewRequest(http.MethodGet, localURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-32767")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data[:32768]) || attempts.Load() < 2 {
+		t.Fatalf("retry body=%d attempts=%d", len(body), attempts.Load())
+	}
+}
+
 func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	data := bytes.Repeat([]byte("priority-routes"), 32*1024)
 	var firstRouteTaskOne atomic.Int32
