@@ -271,6 +271,88 @@ func TestProxyCachesCompletedChunksInSparseFile(t *testing.T) {
 	}
 }
 
+func TestProxyCacheSnapshotsReportsCachedBytes(t *testing.T) {
+	data := bytes.Repeat([]byte("cache-snapshot"), 16*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  16 << 10,
+		BufferSize: 32 << 10,
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.RegisterSource("sess-chart", "Snapshot Movie", upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	req, err := http.NewRequest(http.MethodGet, localURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-32767")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data[:32768]) {
+		t.Fatal("downloaded range differs")
+	}
+
+	snapshots := proxy.CacheSnapshots()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots = %+v", snapshots)
+	}
+	snap := snapshots[0]
+	if snap.SessionID != "sess-chart" || snap.Size != int64(len(data)) || snap.CachedBytes < 32768 {
+		t.Fatalf("cache snapshot = %+v", snap)
+	}
+	if len(snap.Ranges) == 0 || snap.Ranges[0].State != "cached" || snap.Ranges[0].Start != 0 {
+		t.Fatalf("cache ranges = %+v", snap.Ranges)
+	}
+}
+
+func TestMergeAndDownsampleCacheRanges(t *testing.T) {
+	merged := mergeCacheRanges([]CacheRange{
+		{Start: 0, End: 9, State: "cached"},
+		{Start: 10, End: 19, State: "cached"},
+		{Start: 30, End: 39, State: "downloading"},
+	})
+	if len(merged) != 2 || merged[0].End != 19 || merged[1].State != "downloading" {
+		t.Fatalf("merged = %+v", merged)
+	}
+
+	var ranges []CacheRange
+	for i := 0; i < 200; i++ {
+		if i >= 80 && i < 120 {
+			continue
+		}
+		start := int64(i * 10)
+		ranges = append(ranges, CacheRange{Start: start, End: start + 4, State: "cached"})
+	}
+	downsampled := downsampleCacheRanges(ranges, 2000, 40)
+	if len(downsampled) != 2 {
+		t.Fatalf("downsampled = %+v", downsampled)
+	}
+	if downsampled[0].Start != 0 || downsampled[1].End < 1990 {
+		t.Fatalf("downsampled = %+v", downsampled)
+	}
+}
+
 func TestProxyRemovesStaleCacheFilesOnStartup(t *testing.T) {
 	cacheDir := t.TempDir()
 	stale := filepath.Join(cacheDir, "input-stale.cache")

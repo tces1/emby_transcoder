@@ -132,6 +132,31 @@ func TestManagerStatusSnapshotReportsVideoAndUploadRate(t *testing.T) {
 	manager.Close()
 }
 
+func TestManagerStatusSnapshotReportsTranscodeBuffer(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	t.Cleanup(manager.Close)
+	session, err := manager.Ensure("item123", Request{
+		InputURL: "http://upstream/video",
+		Media:    MediaInfo{Name: "Buffered Movie", RunTimeTicks: 120 * timeSecondTicks},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordSegmentRequest(session.ID, 9)
+
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	status := statuses[0]
+	if status.GeneratedSeconds != 20 || status.BufferSeconds != 20 {
+		t.Fatalf("buffer status = %+v", status)
+	}
+	if status.RuntimeSeconds != 120 || status.BufferPauseSeconds != 300 || status.BufferResumeSeconds != 120 {
+		t.Fatalf("buffer thresholds = %+v", status)
+	}
+}
+
 func TestManagerIgnoresUploadFromReplacedSession(t *testing.T) {
 	manager := NewManager(Options{TempDir: t.TempDir()})
 	first, err := manager.Ensure("item123", Request{InputURL: "http://upstream/video", StartTimeTicks: 0})

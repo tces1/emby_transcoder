@@ -102,14 +102,19 @@ type Session struct {
 }
 
 type SessionStatus struct {
-	ID               string  `json:"id"`
-	VideoName        string  `json:"video_name"`
-	State            string  `json:"state"`
-	HardwarePipeline string  `json:"hardware_pipeline"`
-	TranscodeSpeed   float64 `json:"transcode_speed"`
-	UploadBPS        float64 `json:"upload_bps"`
-	UploadedBytes    int64   `json:"uploaded_bytes"`
-	PositionTicks    int64   `json:"position_ticks"`
+	ID                  string  `json:"id"`
+	VideoName           string  `json:"video_name"`
+	State               string  `json:"state"`
+	HardwarePipeline    string  `json:"hardware_pipeline"`
+	TranscodeSpeed      float64 `json:"transcode_speed"`
+	UploadBPS           float64 `json:"upload_bps"`
+	UploadedBytes       int64   `json:"uploaded_bytes"`
+	PositionTicks       int64   `json:"position_ticks"`
+	BufferSeconds       float64 `json:"buffer_seconds"`
+	GeneratedSeconds    float64 `json:"generated_seconds"`
+	RuntimeSeconds      float64 `json:"runtime_seconds"`
+	BufferPauseSeconds  float64 `json:"buffer_pause_seconds"`
+	BufferResumeSeconds float64 `json:"buffer_resume_seconds"`
 }
 
 type Process interface {
@@ -550,15 +555,21 @@ func (m *Manager) StatusSnapshot() []SessionStatus {
 				speed = process.TranscodeSpeed()
 			}
 		}
+		generated, _, buffered := sessionBufferTicks(session)
 		statuses = append(statuses, SessionStatus{
-			ID:               session.ID,
-			VideoName:        name,
-			State:            state,
-			HardwarePipeline: session.HardwarePipeline,
-			TranscodeSpeed:   speed,
-			UploadBPS:        session.uploadBPS,
-			UploadedBytes:    session.UploadedBytes,
-			PositionTicks:    session.PositionTicks,
+			ID:                  session.ID,
+			VideoName:           name,
+			State:               state,
+			HardwarePipeline:    session.HardwarePipeline,
+			TranscodeSpeed:      speed,
+			UploadBPS:           session.uploadBPS,
+			UploadedBytes:       session.UploadedBytes,
+			PositionTicks:       session.PositionTicks,
+			BufferSeconds:       ticksFloatSeconds(buffered),
+			GeneratedSeconds:    ticksFloatSeconds(generated),
+			RuntimeSeconds:      ticksFloatSeconds(session.Media.RunTimeTicks),
+			BufferPauseSeconds:  m.options.BufferPauseThreshold.Seconds(),
+			BufferResumeSeconds: m.options.BufferResumeThreshold.Seconds(),
 		})
 	}
 	return statuses
@@ -865,22 +876,7 @@ func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {
 	if !ok {
 		return bufferAction{}, false
 	}
-	baseTicks := session.StartTimeTicks
-	if baseTicks < 0 {
-		baseTicks = 0
-	}
-	generatedTicks := baseTicks
-	if session.HighestSegmentSeen >= session.SegmentStartIndex {
-		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * sessionSegmentTicks(session)
-	}
-	playedTicks := session.PositionTicks
-	if playedTicks < baseTicks {
-		playedTicks = baseTicks
-	}
-	bufferTicks := generatedTicks - playedTicks
-	if bufferTicks < 0 {
-		bufferTicks = 0
-	}
+	_, _, bufferTicks := sessionBufferTicks(session)
 
 	if session.bufferPaused {
 		if bufferTicks < durationToTicks(m.options.BufferResumeThreshold) {
@@ -894,6 +890,29 @@ func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {
 		return bufferAction{sessionID: session.ID, process: process, pause: true, bufferTicks: bufferTicks}, true
 	}
 	return bufferAction{}, false
+}
+
+func sessionBufferTicks(session *Session) (generatedTicks, playedTicks, bufferTicks int64) {
+	if session == nil {
+		return 0, 0, 0
+	}
+	baseTicks := session.StartTimeTicks
+	if baseTicks < 0 {
+		baseTicks = 0
+	}
+	generatedTicks = baseTicks
+	if session.HighestSegmentSeen >= session.SegmentStartIndex {
+		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * sessionSegmentTicks(session)
+	}
+	playedTicks = session.PositionTicks
+	if playedTicks < baseTicks {
+		playedTicks = baseTicks
+	}
+	bufferTicks = generatedTicks - playedTicks
+	if bufferTicks < 0 {
+		bufferTicks = 0
+	}
+	return generatedTicks, playedTicks, bufferTicks
 }
 
 func (m *Manager) applyBufferAction(action bufferAction) {

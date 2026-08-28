@@ -71,15 +71,15 @@ type Proxy struct {
 }
 
 type source struct {
-	id      string
-	name    string
-	rawURL  string
-	headers http.Header
+	id         string
+	name       string
+	rawURL     string
+	headers    http.Header
 	urls       []string
 	active     []string
 	finalHosts []string
 	order      uint64
-	nextURL atomic.Uint64
+	nextURL    atomic.Uint64
 
 	metaMu      sync.Mutex
 	meta        *metadata
@@ -106,6 +106,23 @@ type WorkerSnapshot struct {
 	DownloadBPS float64 `json:"download_bps"`
 	TotalBytes  int64   `json:"total_bytes"`
 	LastError   string  `json:"last_error,omitempty"`
+}
+
+type CacheRange struct {
+	Start int64  `json:"start"`
+	End   int64  `json:"end"`
+	State string `json:"state"`
+}
+
+type CacheSnapshot struct {
+	SessionID    string       `json:"session_id,omitempty"`
+	VideoName    string       `json:"video_name,omitempty"`
+	Size         int64        `json:"size"`
+	CachedBytes  int64        `json:"cached_bytes"`
+	PendingBytes int64        `json:"pending_bytes"`
+	WindowBytes  int64        `json:"window_bytes"`
+	ChunkSize    int64        `json:"chunk_size"`
+	Ranges       []CacheRange `json:"ranges,omitempty"`
 }
 
 type workerMetric struct {
@@ -283,6 +300,79 @@ func (p *Proxy) SessionRoutes() map[string][]string {
 	return routes
 }
 
+func (p *Proxy) CacheSnapshots() []CacheSnapshot {
+	p.mu.RLock()
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		sources = append(sources, src)
+	}
+	p.mu.RUnlock()
+
+	snapshots := make([]CacheSnapshot, 0, len(sources))
+	for _, src := range sources {
+		if snap, ok := p.cacheSnapshot(src); ok {
+			snapshots = append(snapshots, snap)
+		}
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].SessionID < snapshots[j].SessionID
+	})
+	return snapshots
+}
+
+func (p *Proxy) cacheSnapshot(src *source) (CacheSnapshot, bool) {
+	src.metaMu.Lock()
+	size := int64(0)
+	if src.meta != nil {
+		size = src.meta.size
+	}
+	src.metaMu.Unlock()
+
+	src.cacheMu.Lock()
+	defer src.cacheMu.Unlock()
+	if src.cacheChunks == nil && size == 0 {
+		return CacheSnapshot{}, false
+	}
+
+	ranges := make([]CacheRange, 0, len(src.cacheChunks))
+	var cached, pending int64
+	for index, chunk := range src.cacheChunks {
+		if chunk == nil {
+			continue
+		}
+		start := index * p.chunkSize
+		end := start + p.chunkSize - 1
+		if size > 0 && end >= size {
+			end = size - 1
+		}
+		if end < start {
+			continue
+		}
+		length := end - start + 1
+		state := "downloading"
+		if chunk.completed && chunk.err == nil {
+			state = "cached"
+			cached += length
+		} else if !chunk.completed {
+			pending += length
+		} else {
+			continue
+		}
+		ranges = append(ranges, CacheRange{Start: start, End: end, State: state})
+	}
+	ranges = downsampleCacheRanges(mergeCacheRanges(ranges), size, 160)
+	return CacheSnapshot{
+		SessionID:    src.id,
+		VideoName:    src.name,
+		Size:         size,
+		CachedBytes:  cached,
+		PendingBytes: pending,
+		WindowBytes:  int64(p.prefetchChunks) * p.chunkSize,
+		ChunkSize:    p.chunkSize,
+		Ranges:       ranges,
+	}, true
+}
+
 func (p *Proxy) beginWorker(state string, src *source, rawURL string, rangeHeader string) int {
 	p.metricsMu.Lock()
 	defer p.metricsMu.Unlock()
@@ -384,6 +474,71 @@ func uniqueRouteHosts(active, finalHosts []string) []string {
 		hosts = append(hosts, host)
 	}
 	return hosts
+}
+
+func mergeCacheRanges(ranges []CacheRange) []CacheRange {
+	if len(ranges) <= 1 {
+		return ranges
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Start == ranges[j].Start {
+			if ranges[i].State == ranges[j].State {
+				return ranges[i].End < ranges[j].End
+			}
+			return ranges[i].State < ranges[j].State
+		}
+		return ranges[i].Start < ranges[j].Start
+	})
+	out := []CacheRange{ranges[0]}
+	for _, next := range ranges[1:] {
+		last := &out[len(out)-1]
+		if last.State == next.State && next.Start <= last.End+1 {
+			if next.End > last.End {
+				last.End = next.End
+			}
+			continue
+		}
+		out = append(out, next)
+	}
+	return out
+}
+
+func downsampleCacheRanges(ranges []CacheRange, size int64, limit int) []CacheRange {
+	if limit <= 0 || len(ranges) <= limit {
+		return ranges
+	}
+	if size <= 0 {
+		return ranges[:limit]
+	}
+	bucket := size / int64(limit)
+	if bucket < 1 {
+		bucket = 1
+	}
+	out := make([]CacheRange, 0, limit)
+	for start := int64(0); start < size; start += bucket {
+		end := start + bucket - 1
+		if end >= size {
+			end = size - 1
+		}
+		state := ""
+		for _, r := range ranges {
+			if r.End < start || r.Start > end {
+				continue
+			}
+			if r.State == "downloading" {
+				state = "downloading"
+				break
+			}
+			if r.State == "cached" {
+				state = "cached"
+			}
+		}
+		if state == "" {
+			continue
+		}
+		out = append(out, CacheRange{Start: start, End: end, State: state})
+	}
+	return mergeCacheRanges(out)
 }
 
 type workerReader struct {
