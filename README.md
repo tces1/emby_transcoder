@@ -157,7 +157,7 @@ go build ./cmd/emby-transcoder
 
 VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接选择软件解码/缩放加 VAAPI 编码，避免先进入不支持的完整硬件管线。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
 
-`download_workers` 控制 FFmpeg 输入侧的全局并发 Range 下载数。默认值 `1` 表示关闭加速并让 FFmpeg 直接访问上游；设置为 `2` 可启用双路下载。为避免上游将额外连接计为多路播放，程序会硬性限制整个进程最多同时发出 `2` 个上游 Range 请求，即使配置了更大的值也不会突破。`download_chunk_mb` 是每个 Range 分块大小，`download_buffer_mb` 限制稀疏文件的前向预读窗口，推荐使用 `2 / 8 / 64`。分块通过 `WriteAt` 写入 `<temp_dir>/input-cache/` 下的正确偏移，FFmpeg 经本地可 Seek HTTP 读取；会话结束后缓存自动删除。如果上游没有 ETag/Last-Modified，程序会比较文件总大小，并对文件头、中间和末尾各 64 KiB 抽样后计算组合 SHA-256 指纹；不支持字节范围或内容不一致时才回退到普通转发。
+`download_workers` 控制 FFmpeg 输入侧的全局并发 Range 下载数。默认值 `1` 表示关闭加速并让 FFmpeg 直接访问上游；设置为 `2` 可启用双路下载。为避免上游将额外连接计为多路播放，程序会硬性限制整个进程最多同时发出 `2` 个上游 Range 请求，即使配置了更大的值也不会突破。`download_chunk_mb` 是每个 Range 分块大小，`download_buffer_mb` 限制稀疏文件的前向预读窗口，推荐使用 `2 / 8 / 64`。分块通过 `WriteAt` 写入 `<temp_dir>/input-cache/` 下的正确偏移，FFmpeg 经本地可 Seek HTTP 读取；会话结束后缓存自动删除。第一条可用线路确认 Range 和文件大小后立刻开始给 FFmpeg 送数据；第二条不同最终域的线路在后台继续探测。没有 ETag/Last-Modified 时，才会再对文件头、中间和末尾各 64 KiB 抽样做 SHA-256 指纹，用来对齐第二条线。不支持字节范围或内容不一致时才回退到普通转发。
 
 多个线路入口写入 `upstream.urls`。第一个入口是 API 主线路；GET、HEAD、OPTIONS 等可安全重试的请求发生连接错误或返回 502/503/504 时，服务会切换并记住可用的备用入口。POST 等非幂等请求不会自动重放，避免同一操作执行两次。旧的单值 `upstream.url` 格式仍然兼容。
 
@@ -177,7 +177,7 @@ VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接
 }
 ```
 
-启动下载时只并行探测优先级最高的两条线路，后续入口不会被媒体下载探测；其中只有一条可用时立即降为单线，不会继续扫描备用地址。需要更换下载线路时应调整 `upstream.urls` 的前两项。最终媒体域名相同的入口会去重；线路通过 ETag/Last-Modified，或文件大小加头部、中间、尾部三段 SHA-256 指纹确认内容一致。
+启动下载时先用第一条可用线路给 FFmpeg 送数据，同时继续扫描后续入口，直到凑满两条不同最终域，或候选用尽。最终媒体域名相同的入口会去重。线路通过 ETag/Last-Modified 对齐；没有这些校验头时，才用文件大小加头部、中间、尾部三段 SHA-256 指纹确认第二条线内容一致。
 
 ## 转码生命周期
 
@@ -195,6 +195,8 @@ Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 
 ## 状态后台
 
+![状态后台](docs/images/dashboard.png)
+
 先在配置文件中设置非空的 `server.dashboard_password`，然后访问代理同域下的 `/emby_transcoder`。密码为空时后台保持禁用。登录成功后浏览器只在 HttpOnly Cookie 中保存随机后台会话 ID，配置密码不会写入页面或状态接口。
 
 状态页每秒刷新并显示：
@@ -204,6 +206,7 @@ Emby-Transcoder 会把本地 FFmpeg 会话绑定到 Emby 播放 check-in：
 - 正在转码的视频名称、FFmpeg 运行/暂停/退出状态及 `speed` 倍率。
 - 本地 HLS 向客户端发送的实时上传速度和累计流量。
 - 以“线路 → 下载 → FFmpeg → HLS 上传”展示的状态机流程图。
+- 下载缓存覆盖范围、在途分块和约 90 秒速率曲线，以及相对暂停阈值的转码缓冲。
 
 ## 协议
 

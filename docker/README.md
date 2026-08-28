@@ -34,7 +34,8 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `transcode.download_workers` to `2` to assemble dual HTTP Range downloads in a sparse file with `8` MB chunks and `64` MB read-ahead; the process hard-limits upstream concurrency to `2`
 - with two `upstream.urls`, media workers preserve the PlaybackInfo `DirectStreamUrl`, alternate requests through both entrances, and follow each entrance's redirect to its actual media host
 - `upstream.urls` order is route priority: one session uses the first two healthy routes, while two sessions are pinned one route each; later entries are failover routes
-- only the top two routes are probed for media; lower routes are not scanned, and missing ETag/Last-Modified falls back to file-size plus head/middle/tail SHA-256 validation
+- media download starts as soon as the first usable route confirms Range support; a second distinct final host is probed in the background
+- missing ETag/Last-Modified falls back to file-size plus head/middle/tail SHA-256 validation only when adding that second route
 - transcoding starts only on an HLS playlist or segment request; PlaybackInfo browsing does not prewarm or download media
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 - old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback

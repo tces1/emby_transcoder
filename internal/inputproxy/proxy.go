@@ -94,6 +94,10 @@ type source struct {
 	cacheFile   *os.File
 	cachePath   string
 	cacheChunks map[int64]*cacheChunk
+
+	closed     atomic.Bool
+	expandDone chan struct{}
+	expandOnce sync.Once
 }
 
 type WorkerSnapshot struct {
@@ -581,6 +585,7 @@ func (p *Proxy) RegisterSource(id string, name string, rawURL string, headers ht
 		urls:        p.sourceURLs(parsed),
 		order:       p.nextID.Add(1),
 		cacheChunks: make(map[int64]*cacheChunk),
+		expandDone:  make(chan struct{}),
 	}
 	src.dedicated.Store(-1)
 
@@ -596,11 +601,13 @@ func (p *Proxy) RegisterSource(id string, name string, rawURL string, headers ht
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
+			src.closed.Store(true)
 			p.mu.Lock()
 			delete(p.sources, token)
 			p.rebalanceLocked()
 			p.mu.Unlock()
 			src.closeCache()
+			src.markExpandDone()
 		})
 	}
 	return p.baseURL + "/" + token, release, nil
@@ -655,11 +662,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool, error) {
 	src.metaMu.Lock()
-	defer src.metaMu.Unlock()
+	if src.expandDone == nil {
+		src.expandDone = make(chan struct{})
+	}
 	if src.meta != nil {
-		return *src.meta, true, nil
+		meta := *src.meta
+		src.metaMu.Unlock()
+		return meta, true, nil
 	}
 	if src.unsupported {
+		src.metaMu.Unlock()
 		return metadata{}, false, nil
 	}
 
@@ -675,109 +687,24 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 		need = len(candidates)
 	}
 
-	var selected metadata
-	var active []string
-	var finalHosts []string
-	usedFinalHosts := make(map[string]struct{})
-	var lastErr error
 	probeCtx, cancel := context.WithTimeout(ctx, sourceProbeTimeout)
-	defer cancel()
-	type probeResult struct {
-		candidate string
-		meta      metadata
-		supported bool
-		err       error
-	}
-
-	offset := 0
-	for offset < len(candidates) && len(active) < need {
-		remaining := need - len(active)
-		batchSize := p.workers
-		if remaining < batchSize {
-			batchSize = remaining
-		}
-		if batchSize > len(candidates)-offset {
-			batchSize = len(candidates) - offset
-		}
-		batchCandidates := candidates[offset : offset+batchSize]
-		offset += batchSize
-
-		results := make(chan probeResult, batchSize)
-		for _, candidate := range batchCandidates {
-			go func() {
-				meta, supported, err := p.probeMetadata(probeCtx, src, candidate)
-				results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
-			}()
-		}
-		byURL := make(map[string]probeResult, batchSize)
-		for range batchCandidates {
-			result := <-results
-			byURL[result.candidate] = result
-		}
-
-		for _, candidate := range batchCandidates {
-			if len(active) >= need {
-				break
-			}
-			result := byURL[candidate]
-			if result.err != nil {
-				lastErr = result.err
-				continue
-			}
-			if !result.supported {
-				continue
-			}
-			finalKey := canonicalHost(result.meta.finalHost)
-			if finalKey == "" {
-				finalKey = canonicalHost(routeHost(candidate))
-			}
-			if finalKey != "" {
-				if _, duplicate := usedFinalHosts[finalKey]; duplicate {
-					logging.Infof(
-						"accelerated input probe entry=%s final=%s result=duplicate_line",
-						routeHost(candidate),
-						result.meta.finalHost,
-					)
-					continue
-				}
-			}
-			if len(active) == 0 {
-				selected = result.meta
-				active = append(active, candidate)
-				finalHosts = append(finalHosts, result.meta.finalHost)
-				if finalKey != "" {
-					usedFinalHosts[finalKey] = struct{}{}
-				}
-				continue
-			}
-			merged, ok := mergeRepresentation(selected, result.meta)
-			if !ok {
-				continue
-			}
-			selected = merged
-			active = append(active, candidate)
-			finalHosts = append(finalHosts, result.meta.finalHost)
-			if finalKey != "" {
-				usedFinalHosts[finalKey] = struct{}{}
-			}
-		}
-		if len(active) >= need {
-			break
-		}
-	}
+	selected, active, finalHosts, lastErr := p.collectFirstRoute(probeCtx, src, candidates)
+	cancel()
 	if len(active) == 0 {
 		if lastErr != nil {
+			src.metaMu.Unlock()
+			src.markExpandDone()
 			return metadata{}, false, lastErr
 		}
 		src.unsupported = true
+		src.metaMu.Unlock()
+		src.markExpandDone()
 		return metadata{}, false, nil
 	}
-	src.routeMu.Lock()
-	src.active = active
-	src.finalHosts = finalHosts
-	src.failures = make([]int, len(active))
-	src.routeMu.Unlock()
+	src.replaceRoutes(active, finalHosts)
 	if err := src.prepareCache(p.cacheDir, selected.size); err != nil {
+		src.metaMu.Unlock()
+		src.markExpandDone()
 		return metadata{}, false, err
 	}
 	src.meta = &selected
@@ -789,7 +716,239 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 			len(candidates),
 		)
 	}
+	needExpand := need > 1
+	remaining := remainingCandidates(candidates, active)
+	usedFinalHosts := map[string]struct{}{}
+	if key := routeKey(finalHosts[0], active[0]); key != "" {
+		usedFinalHosts[key] = struct{}{}
+	}
+	src.metaMu.Unlock()
+	if needExpand {
+		go p.expandRoutes(src, remaining, usedFinalHosts, need, len(candidates))
+	} else {
+		src.markExpandDone()
+	}
 	return selected, true, nil
+}
+
+type probeResult struct {
+	candidate string
+	meta      metadata
+	supported bool
+	err       error
+}
+
+func (p *Proxy) collectFirstRoute(ctx context.Context, src *source, candidates []string) (metadata, []string, []string, error) {
+	if len(candidates) == 0 {
+		return metadata{}, nil, nil, nil
+	}
+	results := make(chan probeResult, len(candidates))
+	next := 0
+	inFlight := 0
+	launch := func() {
+		candidate := candidates[next]
+		next++
+		inFlight++
+		go func() {
+			meta, supported, err := p.probeMetadata(ctx, src, candidate)
+			results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
+		}()
+	}
+	batch := p.workers
+	if batch < 1 {
+		batch = 1
+	}
+	for inFlight < batch && next < len(candidates) {
+		launch()
+	}
+	var lastErr error
+	for inFlight > 0 {
+		var result probeResult
+		select {
+		case result = <-results:
+			inFlight--
+		case <-ctx.Done():
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			return metadata{}, nil, nil, lastErr
+		}
+		if result.err != nil {
+			lastErr = result.err
+		} else if result.supported {
+			return result.meta, []string{result.candidate}, []string{result.meta.finalHost}, nil
+		}
+		if next < len(candidates) {
+			launch()
+		}
+	}
+	return metadata{}, nil, nil, lastErr
+}
+
+func (p *Proxy) expandRoutes(src *source, candidates []string, usedFinalHosts map[string]struct{}, need, configured int) {
+	defer src.markExpandDone()
+	if src.closed.Load() || len(candidates) == 0 || need <= 1 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sourceProbeTimeout)
+	defer cancel()
+	if usedFinalHosts == nil {
+		usedFinalHosts = map[string]struct{}{}
+	}
+
+	results := make(chan probeResult, len(candidates))
+	next := 0
+	inFlight := 0
+	batch := p.workers
+	if batch < 1 {
+		batch = 1
+	}
+	launch := func() {
+		candidate := candidates[next]
+		next++
+		inFlight++
+		go func() {
+			meta, supported, err := p.probeMetadata(ctx, src, candidate)
+			results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
+		}()
+	}
+	launchMore := func() {
+		for next < len(candidates) && !src.closed.Load() {
+			remainingNeed := need - activeCount(src)
+			if remainingNeed <= 0 || inFlight >= remainingNeed || inFlight >= batch {
+				return
+			}
+			launch()
+		}
+	}
+	launchMore()
+	for inFlight > 0 && !src.closed.Load() {
+		var result probeResult
+		select {
+		case result = <-results:
+			inFlight--
+		case <-ctx.Done():
+			return
+		}
+		if result.err == nil && result.supported {
+			finalKey := routeKey(result.meta.finalHost, result.candidate)
+			if finalKey != "" {
+				if _, duplicate := usedFinalHosts[finalKey]; duplicate {
+					logging.Infof(
+						"accelerated input probe entry=%s final=%s result=duplicate_line",
+						routeHost(result.candidate),
+						result.meta.finalHost,
+					)
+				} else if p.adoptAdditionalRoute(ctx, src, result.candidate, result.meta) {
+					usedFinalHosts[finalKey] = struct{}{}
+					active := activeCount(src)
+					logging.Infof(
+						"accelerated input routes source=%s active=%d configured=%d",
+						sourceLabel(src.rawURL),
+						active,
+						configured,
+					)
+					if active >= need {
+						return
+					}
+				}
+			}
+		}
+		launchMore()
+	}
+}
+
+func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate string, next metadata) bool {
+	src.routeMu.Lock()
+	if len(src.active) == 0 {
+		src.routeMu.Unlock()
+		return false
+	}
+	firstURL := src.active[0]
+	src.routeMu.Unlock()
+
+	src.metaMu.Lock()
+	if src.meta == nil {
+		src.metaMu.Unlock()
+		return false
+	}
+	first := *src.meta
+	src.metaMu.Unlock()
+
+	if _, ok := mergeRepresentation(first, next); ok {
+		src.addRoute(candidate, next.finalHost)
+		return true
+	}
+	if first.size != next.size {
+		return false
+	}
+	if strongETag(first.etag) && strongETag(next.etag) {
+		return false
+	}
+
+	fingerprintedFirst, err := p.ensureFingerprint(ctx, src, firstURL, first)
+	if err != nil {
+		logging.Infof(
+			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
+			routeHost(firstURL),
+			transportErrorDetail(err),
+		)
+		return false
+	}
+	fingerprintedNext, err := p.ensureFingerprint(ctx, src, candidate, next)
+	if err != nil {
+		logging.Infof(
+			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
+			routeHost(candidate),
+			transportErrorDetail(err),
+		)
+		return false
+	}
+	if _, ok := mergeRepresentation(fingerprintedFirst, fingerprintedNext); !ok {
+		return false
+	}
+	src.metaMu.Lock()
+	if src.meta != nil && !src.meta.hasFingerprint {
+		updated := fingerprintedFirst
+		src.meta = &updated
+	}
+	src.metaMu.Unlock()
+	src.addRoute(candidate, next.finalHost)
+	return true
+}
+
+func remainingCandidates(candidates, active []string) []string {
+	used := make(map[string]struct{}, len(active))
+	for _, url := range active {
+		used[url] = struct{}{}
+	}
+	rest := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := used[candidate]; exists {
+			continue
+		}
+		rest = append(rest, candidate)
+	}
+	return rest
+}
+
+func routeKey(finalHost, candidate string) string {
+	key := canonicalHost(finalHost)
+	if key == "" {
+		key = canonicalHost(routeHost(candidate))
+	}
+	return key
+}
+
+func activeCount(src *source) int {
+	src.routeMu.Lock()
+	defer src.routeMu.Unlock()
+	return len(src.active)
+}
+
+func strongETag(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !strings.HasPrefix(value, "W/")
 }
 
 func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (result metadata, supported bool, resultErr error) {
@@ -857,21 +1016,28 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		lastModified: resp.Header.Get("Last-Modified"),
 		finalHost:    finalHost,
 	}
-	fingerprint, err := p.probeFingerprint(requestCtx, src, rawURL, meta, sample)
-	if err != nil {
-		return metadata{}, false, err
-	}
-	meta.fingerprint = fingerprint
-	meta.hasFingerprint = true
 	_, _, hasValidator := representationValidator(meta)
 	logging.Infof(
-		"accelerated input probe entry=%s final=%s status=%d range=true validator=%t fingerprint=true result=ready",
+		"accelerated input probe entry=%s final=%s status=%d range=true validator=%t fingerprint=false result=ready",
 		routeHost(rawURL),
 		routeHost(finalURL),
 		resp.StatusCode,
 		hasValidator,
 	)
 	return meta, true, nil
+}
+
+func (p *Proxy) ensureFingerprint(ctx context.Context, src *source, rawURL string, meta metadata) (metadata, error) {
+	if meta.hasFingerprint {
+		return meta, nil
+	}
+	fingerprint, err := p.probeFingerprint(ctx, src, rawURL, meta, nil)
+	if err != nil {
+		return metadata{}, err
+	}
+	meta.fingerprint = fingerprint
+	meta.hasFingerprint = true
+	return meta, nil
 }
 
 func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string, meta metadata, head []byte) ([sha256.Size]byte, error) {
@@ -892,7 +1058,7 @@ func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string
 		}
 		seen[requested] = struct{}{}
 		var sample []byte
-		if index == 0 {
+		if index == 0 && len(head) > 0 {
 			sample = head
 		} else {
 			var err error
@@ -1394,13 +1560,17 @@ func (s *source) healthyRouteIndexes() []int {
 }
 
 func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requested byteRange) ([]byte, error) {
-	if len(src.active) == 0 {
+	if _, ok := src.routeURL(0); !ok {
 		return nil, errors.New("no active accelerated input route")
 	}
 	var lastErr error
 	for retry := range chunkRetryAttempts {
 		for _, index := range p.routeAttempts(src, requested.urlIndex) {
-			data, err := p.fetchRangeFromURL(ctx, src, meta, src.active[index], requested)
+			rawURL, ok := src.routeURL(index)
+			if !ok {
+				continue
+			}
+			data, err := p.fetchRangeFromURL(ctx, src, meta, rawURL, requested)
 			if err == nil {
 				src.recordRouteResult(index, true)
 				return data, nil
@@ -1409,7 +1579,7 @@ func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requ
 			lastErr = err
 			logging.Infof(
 				"accelerated input chunk route=%s range=%d-%d attempt=%d result=error detail=%q",
-				routeHost(src.active[index]),
+				routeHost(rawURL),
 				requested.start,
 				requested.end,
 				retry+1,
@@ -1471,6 +1641,83 @@ func (p *Proxy) routeAttempts(src *source, preferred int) []int {
 		add(index)
 	}
 	return attempts
+}
+
+func (s *source) markExpandDone() {
+	if s == nil || s.expandDone == nil {
+		return
+	}
+	s.expandOnce.Do(func() {
+		close(s.expandDone)
+	})
+}
+
+func (s *source) replaceRoutes(active, finalHosts []string) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	s.active = append([]string{}, active...)
+	s.finalHosts = append([]string{}, finalHosts...)
+	s.failures = make([]int, len(active))
+}
+
+func (s *source) addRoute(rawURL, finalHost string) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	s.active = append(append([]string{}, s.active...), rawURL)
+	s.finalHosts = append(append([]string{}, s.finalHosts...), finalHost)
+	s.failures = append(append([]int{}, s.failures...), 0)
+	s.orderRoutesLocked()
+}
+
+func (s *source) orderRoutesLocked() {
+	if len(s.urls) == 0 || len(s.active) < 2 {
+		return
+	}
+	rank := make(map[string]int, len(s.urls))
+	for index, candidate := range s.urls {
+		rank[candidate] = index
+	}
+	type pair struct {
+		url  string
+		host string
+		fail int
+	}
+	pairs := make([]pair, len(s.active))
+	for index, rawURL := range s.active {
+		item := pair{url: rawURL}
+		if index < len(s.finalHosts) {
+			item.host = s.finalHosts[index]
+		}
+		if index < len(s.failures) {
+			item.fail = s.failures[index]
+		}
+		pairs[index] = item
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		ri, oi := rank[pairs[i].url]
+		rj, oj := rank[pairs[j].url]
+		if oi && oj {
+			return ri < rj
+		}
+		return oi && !oj
+	})
+	s.active = make([]string, len(pairs))
+	s.finalHosts = make([]string, len(pairs))
+	s.failures = make([]int, len(pairs))
+	for index, item := range pairs {
+		s.active[index] = item.url
+		s.finalHosts[index] = item.host
+		s.failures[index] = item.fail
+	}
+}
+
+func (s *source) routeURL(index int) (string, bool) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if index < 0 || index >= len(s.active) {
+		return "", false
+	}
+	return s.active[index], true
 }
 
 func (s *source) recordRouteResult(index int, success bool) {
@@ -1620,7 +1867,9 @@ func (p *Proxy) Close(ctx context.Context) error {
 	clear(p.sources)
 	p.mu.Unlock()
 	for _, src := range sources {
+		src.closed.Store(true)
 		src.closeCache()
+		src.markExpandDone()
 	}
 	return shutdownErr
 }

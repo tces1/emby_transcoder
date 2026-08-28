@@ -120,6 +120,7 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -174,6 +175,7 @@ func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -189,6 +191,127 @@ func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
 	}
 	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
 		t.Fatalf("fingerprinted routes were not both used: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
+	}
+}
+
+func TestProxyServesAfterFirstRouteBeforeSecondProbeCompletes(t *testing.T) {
+	data := bytes.Repeat([]byte("first-route-first"), 32*1024)
+	releaseSecond := make(chan struct{})
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseSecond
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("first-route GET waited %s for the second probe", time.Since(started))
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("early body differs: got=%d want=%d", len(body), len(data))
+	}
+
+	close(releaseSecond)
+	waitForRouteExpansion(t, registeredSource(t, proxy, localURL))
+	src := registeredSource(t, proxy, localURL)
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 2 {
+		t.Fatalf("active final hosts = %v", got)
+	}
+}
+
+func TestProxyDefersFingerprintUntilSecondRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("fingerprint-later"), 32*1024)
+	var firstRanges []string
+	var firstMu sync.Mutex
+	releaseSecond := make(chan struct{})
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstMu.Lock()
+		firstRanges = append(firstRanges, r.Header.Get("Range"))
+		firstMu.Unlock()
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseSecond
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Head(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	firstMu.Lock()
+	probeCount := 0
+	for _, value := range firstRanges {
+		if strings.HasPrefix(value, "bytes=0-") && isProbeRange(value) {
+			probeCount++
+		}
+	}
+	firstMu.Unlock()
+	if probeCount != 1 {
+		t.Fatalf("first-route probe ranges before second line = %v", firstRanges)
+	}
+
+	close(releaseSecond)
+	waitForRouteExpansion(t, registeredSource(t, proxy, localURL))
+	src := registeredSource(t, proxy, localURL)
+	if !src.meta.hasFingerprint {
+		t.Fatal("expected fingerprint after adopting the second route")
+	}
+	if len(src.active) != 2 {
+		t.Fatalf("active routes = %v", src.active)
 	}
 }
 
@@ -410,6 +533,7 @@ func TestProxyUsesStandbyWhenFirstBatchCannotFillWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -520,6 +644,8 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer releaseSecond()
+	probeRegisteredSource(t, proxy, firstURL)
+	probeRegisteredSource(t, proxy, secondURL)
 
 	var wg sync.WaitGroup
 	errorsByRequest := make(chan error, 2)
@@ -648,6 +774,7 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -719,6 +846,7 @@ func TestProxySkipsSharedFinalHostAndUsesNextDistinctRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	src := probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -739,13 +867,6 @@ func TestProxySkipsSharedFinalHostAndUsesNextDistinctRoute(t *testing.T) {
 		t.Fatalf("standby origin received %d requests after two distinct lines were found", unusedRequests.Load())
 	}
 
-	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
-	proxy.mu.RLock()
-	src := proxy.sources[token]
-	proxy.mu.RUnlock()
-	if src == nil {
-		t.Fatal("registered source not found")
-	}
 	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 2 {
 		t.Fatalf("active final hosts = %v", got)
 	}
@@ -782,6 +903,7 @@ func TestProxyKeepsSingleRouteWhenEntrancesShareAFinalHost(t *testing.T) {
 	if err != nil || !supported {
 		t.Fatalf("metadata supported=%t err=%v", supported, err)
 	}
+	waitForRouteExpansion(t, src)
 	if len(src.active) != 1 {
 		t.Fatalf("active routes = %v", src.active)
 	}
@@ -1079,7 +1201,8 @@ func TestProxyExcludesOriginWithDifferentRepresentation(t *testing.T) {
 	if err != nil || !supported {
 		t.Fatalf("metadata supported=%t err=%v", supported, err)
 	}
-	if len(src.active) != 1 || src.active[0] != first.URL {
+	waitForRouteExpansion(t, src)
+	if len(src.active) != 1 {
 		t.Fatalf("active routes = %v", src.active)
 	}
 }
@@ -1172,7 +1295,11 @@ func requestedBounds(t *testing.T, value string, size int64) (int64, int64) {
 }
 
 func isProbeRequest(r *http.Request) bool {
-	raw := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+	return isProbeRange(r.Header.Get("Range"))
+}
+
+func isProbeRange(value string) bool {
+	raw := strings.TrimPrefix(value, "bytes=")
 	parts := strings.SplitN(raw, "-", 2)
 	if len(parts) != 2 {
 		return false
@@ -1180,6 +1307,44 @@ func isProbeRequest(r *http.Request) bool {
 	start, startErr := strconv.ParseInt(parts[0], 10, 64)
 	end, endErr := strconv.ParseInt(parts[1], 10, 64)
 	return startErr == nil && endErr == nil && end-start+1 == probeSampleSize
+}
+
+func registeredSource(t *testing.T, proxy *Proxy, localURL string) *source {
+	t.Helper()
+	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+	return src
+}
+
+func waitForRouteExpansion(t *testing.T, src *source) {
+	t.Helper()
+	if src == nil || src.expandDone == nil {
+		return
+	}
+	select {
+	case <-src.expandDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for additional download routes")
+	}
+}
+
+func probeRegisteredSource(t *testing.T, proxy *Proxy, localURL string) *source {
+	t.Helper()
+	src := registeredSource(t, proxy, localURL)
+	resp, err := http.Head(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	waitForRouteExpansion(t, src)
+	return src
 }
 
 func writeRange(w http.ResponseWriter, data []byte, start, end int64) {
