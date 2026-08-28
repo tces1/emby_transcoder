@@ -146,13 +146,14 @@ type workerMetric struct {
 }
 
 type metadata struct {
-	size           int64
-	contentType    string
-	etag           string
-	lastModified   string
-	finalHost      string
-	fingerprint    [sha256.Size]byte
-	hasFingerprint bool
+	size                int64
+	contentType         string
+	etag                string
+	lastModified        string
+	finalHost           string
+	fingerprint         [sha256.Size]byte
+	hasFingerprint      bool
+	fingerprintHeadOnly bool
 }
 
 type byteRange struct {
@@ -689,7 +690,7 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, sourceProbeTimeout)
-	selected, active, finalHosts, lastErr := p.collectFirstRoute(probeCtx, src, candidates)
+	selected, active, finalHosts, launched, lastErr := p.collectFirstRoute(probeCtx, src, candidates)
 	cancel()
 	if len(active) == 0 {
 		if lastErr != nil {
@@ -718,7 +719,7 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 		)
 	}
 	needExpand := need > 1
-	remaining := remainingCandidates(candidates, active)
+	remaining := remainingCandidates(candidates, active, launched)
 	usedFinalHosts := map[string]struct{}{}
 	if key := routeKey(finalHosts[0], active[0]); key != "" {
 		usedFinalHosts[key] = struct{}{}
@@ -739,17 +740,19 @@ type probeResult struct {
 	err       error
 }
 
-func (p *Proxy) collectFirstRoute(ctx context.Context, src *source, candidates []string) (metadata, []string, []string, error) {
+func (p *Proxy) collectFirstRoute(ctx context.Context, src *source, candidates []string) (metadata, []string, []string, []string, error) {
 	if len(candidates) == 0 {
-		return metadata{}, nil, nil, nil
+		return metadata{}, nil, nil, nil, nil
 	}
 	results := make(chan probeResult, len(candidates))
 	next := 0
 	inFlight := 0
+	launched := make([]string, 0, len(candidates))
 	launch := func() {
 		candidate := candidates[next]
 		next++
 		inFlight++
+		launched = append(launched, candidate)
 		go func() {
 			meta, supported, err := p.probeMetadata(ctx, src, candidate)
 			results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
@@ -772,18 +775,18 @@ func (p *Proxy) collectFirstRoute(ctx context.Context, src *source, candidates [
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
-			return metadata{}, nil, nil, lastErr
+			return metadata{}, nil, nil, launched, lastErr
 		}
 		if result.err != nil {
 			lastErr = result.err
 		} else if result.supported {
-			return result.meta, []string{result.candidate}, []string{result.meta.finalHost}, nil
+			return result.meta, []string{result.candidate}, []string{result.meta.finalHost}, launched, nil
 		}
 		if next < len(candidates) {
 			launch()
 		}
 	}
-	return metadata{}, nil, nil, lastErr
+	return metadata{}, nil, nil, launched, lastErr
 }
 
 func (p *Proxy) expandRoutes(src *source, candidates []string, usedFinalHosts map[string]struct{}, need, configured int) {
@@ -887,7 +890,14 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 		return false
 	}
 
-	fingerprintedFirst, err := p.ensureFingerprint(ctx, src, firstURL, first)
+	if src.closed.Load() {
+		return false
+	}
+	fingerprintCtx, cancel := context.WithTimeout(context.Background(), sourceProbeTimeout)
+	defer cancel()
+
+	cacheFirst := src.hasInFlightChunks()
+	fingerprintedFirst, used, err := p.ensureFingerprint(fingerprintCtx, src, firstURL, first, cacheFirst)
 	if err != nil {
 		logging.Infof(
 			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
@@ -896,7 +906,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 		)
 		return false
 	}
-	fingerprintedNext, err := p.ensureFingerprint(ctx, src, candidate, next)
+	fingerprintedNext, err := p.fingerprintRanges(fingerprintCtx, src, candidate, next, used, false)
 	if err != nil {
 		logging.Infof(
 			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
@@ -918,19 +928,28 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 	return true
 }
 
-func remainingCandidates(candidates, active []string) []string {
+func remainingCandidates(candidates, active, delayed []string) []string {
 	used := make(map[string]struct{}, len(active))
 	for _, url := range active {
 		used[url] = struct{}{}
 	}
+	hold := make(map[string]struct{}, len(delayed))
+	for _, url := range delayed {
+		hold[url] = struct{}{}
+	}
 	rest := make([]string, 0, len(candidates))
+	later := make([]string, 0, len(delayed))
 	for _, candidate := range candidates {
 		if _, exists := used[candidate]; exists {
 			continue
 		}
+		if _, paused := hold[candidate]; paused {
+			later = append(later, candidate)
+			continue
+		}
 		rest = append(rest, candidate)
 	}
-	return rest
+	return append(rest, later...)
 }
 
 func routeKey(finalHost, candidate string) string {
@@ -1015,39 +1034,92 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	return meta, true, nil
 }
 
-func (p *Proxy) ensureFingerprint(ctx context.Context, src *source, rawURL string, meta metadata) (metadata, error) {
+func (p *Proxy) ensureFingerprint(ctx context.Context, src *source, rawURL string, meta metadata, cacheFirst bool) (metadata, []byteRange, error) {
+	if meta.hasFingerprint {
+		return meta, fingerprintSampleRanges(meta.size, meta.fingerprintHeadOnly), nil
+	}
+	headOnly := false
+	fromCache := false
+	if cacheFirst {
+		head := fingerprintSampleRanges(meta.size, true)
+		if _, ok := p.readCachedSample(src, head[0]); !ok {
+			p.waitCachedSample(ctx, src, head[0], 2*time.Second)
+		}
+		if _, ok := p.readCachedSample(src, head[0]); ok {
+			headOnly = true
+			fromCache = true
+		}
+	}
+	ranges := fingerprintSampleRanges(meta.size, headOnly)
+	fingerprint, err := p.hashFingerprint(ctx, src, rawURL, meta, ranges, fromCache)
+	if err != nil {
+		return metadata{}, nil, err
+	}
+	meta.fingerprint = fingerprint
+	meta.hasFingerprint = true
+	meta.fingerprintHeadOnly = headOnly
+	return meta, ranges, nil
+}
+
+func (p *Proxy) fingerprintRanges(ctx context.Context, src *source, rawURL string, meta metadata, ranges []byteRange, fromCache bool) (metadata, error) {
 	if meta.hasFingerprint {
 		return meta, nil
 	}
-	fingerprint, err := p.probeFingerprint(ctx, src, rawURL, meta, nil)
+	if len(ranges) == 0 {
+		ranges = fingerprintSampleRanges(meta.size, false)
+	}
+	fingerprint, err := p.hashFingerprint(ctx, src, rawURL, meta, ranges, fromCache)
 	if err != nil {
 		return metadata{}, err
 	}
 	meta.fingerprint = fingerprint
 	meta.hasFingerprint = true
+	meta.fingerprintHeadOnly = len(dedupeByteRanges(ranges)) == 1
 	return meta, nil
 }
 
-func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string, meta metadata, head []byte) ([sha256.Size]byte, error) {
+func fingerprintSampleRanges(size int64, headOnly bool) []byteRange {
+	if size <= 0 {
+		return nil
+	}
 	sampleSize := int64(probeSampleSize)
-	if sampleSize > meta.size {
-		sampleSize = meta.size
+	if sampleSize > size {
+		sampleSize = size
 	}
-	ranges := []byteRange{
-		{start: 0, end: sampleSize - 1},
-		{start: (meta.size - sampleSize) / 2, end: (meta.size-sampleSize)/2 + sampleSize - 1},
-		{start: meta.size - sampleSize, end: meta.size - 1},
+	ranges := []byteRange{{start: 0, end: sampleSize - 1}}
+	if headOnly {
+		return ranges
 	}
-	hasher := sha256.New()
+	return dedupeByteRanges([]byteRange{
+		ranges[0],
+		{start: (size - sampleSize) / 2, end: (size-sampleSize)/2 + sampleSize - 1},
+		{start: size - sampleSize, end: size - 1},
+	})
+}
+
+func dedupeByteRanges(ranges []byteRange) []byteRange {
 	seen := make(map[byteRange]struct{}, len(ranges))
-	for index, requested := range ranges {
+	out := make([]byteRange, 0, len(ranges))
+	for _, requested := range ranges {
 		if _, duplicate := seen[requested]; duplicate {
 			continue
 		}
 		seen[requested] = struct{}{}
+		out = append(out, requested)
+	}
+	return out
+}
+
+func (p *Proxy) hashFingerprint(ctx context.Context, src *source, rawURL string, meta metadata, ranges []byteRange, fromCache bool) ([sha256.Size]byte, error) {
+	hasher := sha256.New()
+	for _, requested := range dedupeByteRanges(ranges) {
 		var sample []byte
-		if index == 0 && len(head) > 0 {
-			sample = head
+		if fromCache {
+			cached, ok := p.readCachedSample(src, requested)
+			if !ok {
+				return [sha256.Size]byte{}, fmt.Errorf("fingerprint range %d-%d missing from cache", requested.start, requested.end)
+			}
+			sample = cached
 		} else {
 			var err error
 			sample, err = p.fetchProbeSampleWithRetry(ctx, src, rawURL, meta, requested)
@@ -1063,7 +1135,65 @@ func (p *Proxy) probeFingerprint(ctx context.Context, src *source, rawURL string
 	return fingerprint, nil
 }
 
+func (s *source) hasInFlightChunks() bool {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	for _, chunk := range s.cacheChunks {
+		if chunk != nil && !chunk.completed {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) readCachedSample(src *source, requested byteRange) ([]byte, bool) {
+	if requested.end < requested.start || p.chunkSize <= 0 {
+		return nil, false
+	}
+	first := requested.start / p.chunkSize
+	last := requested.end / p.chunkSize
+	length := requested.end - requested.start + 1
+	src.cacheMu.Lock()
+	defer src.cacheMu.Unlock()
+	if src.cacheFile == nil {
+		return nil, false
+	}
+	for index := first; index <= last; index++ {
+		chunk, ok := src.cacheChunks[index]
+		if !ok || !chunk.completed || chunk.err != nil {
+			return nil, false
+		}
+	}
+	buf := make([]byte, length)
+	n, err := src.cacheFile.ReadAt(buf, requested.start)
+	if err != nil || int64(n) != length {
+		return nil, false
+	}
+	return buf, true
+}
+
+func (p *Proxy) waitCachedSample(ctx context.Context, src *source, requested byteRange, wait time.Duration) {
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, ok := p.readCachedSample(src, requested); ok {
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (p *Proxy) fetchProbeSample(ctx context.Context, src *source, rawURL string, meta metadata, requested byteRange) ([]byte, error) {
+	if err := p.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer p.release()
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", requested.start, requested.end)
 	req, err := p.upstreamRequest(ctx, http.MethodGet, src, rawURL, rangeHeader)
 	if err != nil {

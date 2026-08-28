@@ -94,6 +94,15 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 			writeRange(w, data, start, end)
 		}))
 	}
+	canceled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(8 * time.Second):
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer canceled.Close()
 	first := newOrigin(&firstChunks)
 	defer first.Close()
 	second := newOrigin(&secondChunks)
@@ -109,7 +118,7 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 		Workers:    2,
 		ChunkSize:  32 << 10,
 		BufferSize: 64 << 10,
-		Origins:    []string{first.URL, second.URL, third.URL},
+		Origins:    []string{canceled.URL, first.URL, second.URL, third.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +321,78 @@ func TestProxyDefersFingerprintUntilSecondRoute(t *testing.T) {
 	}
 	if len(src.active) != 2 {
 		t.Fatalf("active routes = %v", src.active)
+	}
+}
+
+func TestProxyExpandsSecondRouteWithoutWaitingOnCanceledEntrance(t *testing.T) {
+	data := bytes.Repeat([]byte("expand-past-canceled"), 32*1024)
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	canceled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(8 * time.Second):
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer canceled.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{canceled.URL, first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	src := probeRegisteredSource(t, proxy, localURL)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("second-route expand waited %s on canceled entrance", elapsed)
+	}
+	hosts := uniqueRouteHosts(src.active, src.finalHosts)
+	if len(hosts) != 2 {
+		t.Fatalf("active final hosts = %v", hosts)
+	}
+	canceledHost := canonicalHost(routeHost(canceled.URL))
+	for _, host := range hosts {
+		if canonicalHost(host) == canceledHost {
+			t.Fatalf("canceled entrance was kept as a download route: %v", hosts)
+		}
+	}
+}
+
+func TestRemainingCandidatesDeprioritizesLaunchedEntrances(t *testing.T) {
+	got := remainingCandidates(
+		[]string{"tv", "media1", "media2", "media3"},
+		[]string{"media1"},
+		[]string{"tv", "media1"},
+	)
+	want := []string{"media2", "media3", "tv"}
+	if len(got) != len(want) {
+		t.Fatalf("remaining = %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("remaining = %v want %v", got, want)
+		}
 	}
 }
 
