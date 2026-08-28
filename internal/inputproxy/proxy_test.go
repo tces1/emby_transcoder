@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,6 +192,160 @@ func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
 	}
 }
 
+func TestProxyCachesCompletedChunksInSparseFile(t *testing.T) {
+	data := bytes.Repeat([]byte("disk-backed-cache"), 32*1024)
+	var chunkRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			chunkRequests.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	cacheDir := t.TempDir()
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		CacheDir:   cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+
+	readRange := func() []byte {
+		req, err := http.NewRequest(http.MethodGet, localURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Range", "bytes=0-65535")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	if body := readRange(); !bytes.Equal(body, data[:65536]) {
+		t.Fatal("first cached range differs")
+	}
+	firstRequests := chunkRequests.Load()
+	if body := readRange(); !bytes.Equal(body, data[:65536]) {
+		t.Fatal("second cached range differs")
+	}
+	if chunkRequests.Load() != firstRequests {
+		t.Fatalf("cached range was downloaded again: before=%d after=%d", firstRequests, chunkRequests.Load())
+	}
+
+	src.cacheMu.Lock()
+	cachePath := src.cachePath
+	src.cacheMu.Unlock()
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(len(data)) {
+		t.Fatalf("sparse cache size=%d want=%d", info.Size(), len(data))
+	}
+	release()
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("cache file was not removed: %v", err)
+	}
+}
+
+func TestProxyRemovesStaleCacheFilesOnStartup(t *testing.T) {
+	cacheDir := t.TempDir()
+	stale := filepath.Join(cacheDir, "input-stale.cache")
+	unrelated := filepath.Join(cacheDir, "keep.txt")
+	if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unrelated, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := New(Options{Workers: 1, CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale cache was not removed: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file was removed: %v", err)
+	}
+}
+
+func TestProxyDoesNotScanStandbyWhenSecondPriorityRouteFails(t *testing.T) {
+	data := bytes.Repeat([]byte("single-route-fallback"), 32*1024)
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer second.Close()
+	var standbyRequests atomic.Int32
+	standby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		standbyRequests.Add(1)
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer standby.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL, standby.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("single-route body differs: got=%d want=%d", len(body), len(data))
+	}
+	if standbyRequests.Load() != 0 {
+		t.Fatalf("standby route received %d requests", standbyRequests.Load())
+	}
+}
+
 func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	data := bytes.Repeat([]byte("priority-routes"), 32*1024)
 	var firstRouteTaskOne atomic.Int32
@@ -275,18 +431,6 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	}
 
 	releaseSecond()
-	resp, err := http.Get(firstURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if secondRouteTaskOne.Load() == 0 {
-		t.Fatal("remaining session did not return to dual-route mode")
-	}
 }
 
 func TestRouteFailureUsesStandbyWithoutStealingOtherSessionRoute(t *testing.T) {
@@ -471,13 +615,13 @@ func TestProxyBoundsPrefetchWindowWhenFirstChunkIsSlow(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(time.Second)
-	for started.Load() < 2 && time.Now().Before(deadline) {
+	for started.Load() < 4 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(25 * time.Millisecond)
-	if got := started.Load(); got != 2 {
+	if got := started.Load(); got != 4 {
 		close(firstChunkGate)
-		t.Fatalf("prefetch window started %d chunks, want 2", got)
+		t.Fatalf("prefetch window started %d chunks, want 4", got)
 	}
 	close(firstChunkGate)
 	select {

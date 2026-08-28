@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,19 +41,22 @@ type Options struct {
 	BufferSize int64
 	Transport  http.RoundTripper
 	Origins    []string
+	CacheDir   string
 }
 
 // Proxy exposes a loopback-only HTTP endpoint to FFmpeg and downloads
 // seekable upstream resources with a bounded window of concurrent ranges.
 type Proxy struct {
-	client    *http.Client
-	workers   int
-	chunkSize int64
-	listener  net.Listener
-	server    *http.Server
-	baseURL   string
-	slots     chan struct{}
-	origins   []*url.URL
+	client         *http.Client
+	workers        int
+	chunkSize      int64
+	listener       net.Listener
+	server         *http.Server
+	baseURL        string
+	slots          chan struct{}
+	origins        []*url.URL
+	cacheDir       string
+	prefetchChunks int
 
 	mu      sync.RWMutex
 	sources map[string]*source
@@ -80,6 +85,11 @@ type source struct {
 	routeMu   sync.Mutex
 	failures  []int
 	dedicated atomic.Int32
+
+	cacheMu     sync.Mutex
+	cacheFile   *os.File
+	cachePath   string
+	cacheChunks map[int64]*cacheChunk
 }
 
 type WorkerSnapshot struct {
@@ -126,9 +136,14 @@ type byteRange struct {
 }
 
 type chunkResult struct {
-	byteRange
-	data []byte
-	err  error
+	index int64
+	err   error
+}
+
+type cacheChunk struct {
+	done      chan struct{}
+	completed bool
+	err       error
 }
 
 func New(options Options) (*Proxy, error) {
@@ -162,6 +177,14 @@ func New(options Options) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
+	cacheDir := strings.TrimSpace(options.CacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join(os.TempDir(), "emby-transcoder-input")
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create input cache directory: %w", err)
+	}
+	cleanupStaleCacheFiles(cacheDir)
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -172,14 +195,16 @@ func New(options Options) (*Proxy, error) {
 			Transport:     transport,
 			CheckRedirect: safeRedirect,
 		},
-		workers:   workers,
-		chunkSize: chunkSize,
-		listener:  listener,
-		baseURL:   "http://" + listener.Addr().String(),
-		slots:     make(chan struct{}, workers),
-		origins:   origins,
-		sources:   make(map[string]*source),
-		metrics:   make([]workerMetric, workers),
+		workers:        workers,
+		chunkSize:      chunkSize,
+		listener:       listener,
+		baseURL:        "http://" + listener.Addr().String(),
+		slots:          make(chan struct{}, workers),
+		origins:        origins,
+		cacheDir:       cacheDir,
+		prefetchChunks: maxBufferedChunks,
+		sources:        make(map[string]*source),
+		metrics:        make([]workerMetric, workers),
 	}
 	proxy.server = &http.Server{
 		Handler:           proxy,
@@ -325,12 +350,13 @@ func (p *Proxy) RegisterSource(id string, name string, rawURL string, headers ht
 	}
 	token := hex.EncodeToString(tokenBytes)
 	src := &source{
-		id:      id,
-		name:    name,
-		rawURL:  rawURL,
-		headers: upstreamHeaders(headers),
-		urls:    p.sourceURLs(parsed),
-		order:   p.nextID.Add(1),
+		id:          id,
+		name:        name,
+		rawURL:      rawURL,
+		headers:     upstreamHeaders(headers),
+		urls:        p.sourceURLs(parsed),
+		order:       p.nextID.Add(1),
+		cacheChunks: make(map[int64]*cacheChunk),
 	}
 	src.dedicated.Store(-1)
 
@@ -350,6 +376,7 @@ func (p *Proxy) RegisterSource(id string, name string, rawURL string, headers ht
 			delete(p.sources, token)
 			p.rebalanceLocked()
 			p.mu.Unlock()
+			src.closeCache()
 		})
 	}
 	return p.baseURL + "/" + token, release, nil
@@ -428,52 +455,48 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 		supported bool
 		err       error
 	}
-	cursor := 0
-	for cursor < len(candidates) && len(active) < p.workers && probeCtx.Err() == nil {
-		batchSize := p.workers - len(active)
-		if remaining := len(candidates) - cursor; batchSize > remaining {
-			batchSize = remaining
+	batchSize := p.workers
+	if batchSize > len(candidates) {
+		batchSize = len(candidates)
+	}
+	results := make(chan probeResult, batchSize)
+	for _, candidate := range candidates[:batchSize] {
+		go func() {
+			meta, supported, err := p.probeMetadata(probeCtx, src, candidate)
+			results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
+		}()
+	}
+	batch := make(map[string]probeResult, batchSize)
+	for range batchSize {
+		result := <-results
+		batch[result.candidate] = result
+	}
+	for _, candidate := range candidates[:batchSize] {
+		result := batch[candidate]
+		if result.err != nil {
+			lastErr = result.err
+			continue
 		}
-		results := make(chan probeResult, batchSize)
-		for _, candidate := range candidates[cursor : cursor+batchSize] {
-			go func() {
-				meta, supported, err := p.probeMetadata(probeCtx, src, candidate)
-				results <- probeResult{candidate: candidate, meta: meta, supported: supported, err: err}
-			}()
+		if !result.supported {
+			continue
 		}
-		batch := make(map[string]probeResult, batchSize)
-		for range batchSize {
-			result := <-results
-			batch[result.candidate] = result
-		}
-		for _, candidate := range candidates[cursor : cursor+batchSize] {
-			result := batch[candidate]
-			if result.err != nil {
-				lastErr = result.err
+		if result.meta.finalHost != "" {
+			if _, duplicate := usedFinalHosts[result.meta.finalHost]; duplicate {
 				continue
 			}
-			if !result.supported {
-				continue
-			}
-			if result.meta.finalHost != "" {
-				if _, duplicate := usedFinalHosts[result.meta.finalHost]; duplicate {
-					continue
-				}
-			}
-			if len(active) == 0 {
-				selected = result.meta
-				active = append(active, candidate)
-				usedFinalHosts[result.meta.finalHost] = struct{}{}
-				continue
-			}
-			merged, ok := mergeRepresentation(selected, result.meta)
-			if ok {
-				selected = merged
-				active = append(active, candidate)
-				usedFinalHosts[result.meta.finalHost] = struct{}{}
-			}
 		}
-		cursor += batchSize
+		if len(active) == 0 {
+			selected = result.meta
+			active = append(active, candidate)
+			usedFinalHosts[result.meta.finalHost] = struct{}{}
+			continue
+		}
+		merged, ok := mergeRepresentation(selected, result.meta)
+		if ok {
+			selected = merged
+			active = append(active, candidate)
+			usedFinalHosts[result.meta.finalHost] = struct{}{}
+		}
 	}
 	if len(active) == 0 {
 		if lastErr != nil {
@@ -486,6 +509,9 @@ func (p *Proxy) sourceMetadata(ctx context.Context, src *source) (metadata, bool
 	src.active = active
 	src.failures = make([]int, len(active))
 	src.routeMu.Unlock()
+	if err := src.prepareCache(p.cacheDir, selected.size); err != nil {
+		return metadata{}, false, err
+	}
 	src.meta = &selected
 	if len(candidates) > 1 {
 		logging.Infof(
@@ -521,7 +547,12 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			reason = "timeout"
 		}
-		logging.Infof("accelerated input probe entry=%s result=%s", routeHost(rawURL), reason)
+		logging.Infof(
+			"accelerated input probe entry=%s result=%s detail=%q",
+			routeHost(rawURL),
+			reason,
+			transportErrorDetail(err),
+		)
 		return metadata{}, false, err
 	}
 	defer resp.Body.Close()
@@ -658,6 +689,53 @@ func routeHostFromResponse(resp *http.Response, fallback string) string {
 	return routeHost(fallback)
 }
 
+func transportErrorDetail(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (s *source) prepareCache(cacheDir string, size int64) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cacheFile != nil {
+		return nil
+	}
+	file, err := os.CreateTemp(cacheDir, "input-*.cache")
+	if err != nil {
+		return fmt.Errorf("create sparse input cache: %w", err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return fmt.Errorf("size sparse input cache: %w", err)
+	}
+	s.cacheFile = file
+	s.cachePath = file.Name()
+	return nil
+}
+
+func (s *source) closeCache() {
+	s.cacheMu.Lock()
+	file := s.cacheFile
+	path := s.cachePath
+	s.cacheFile = nil
+	s.cachePath = ""
+	s.cacheChunks = make(map[int64]*cacheChunk)
+	s.cacheMu.Unlock()
+	if file != nil {
+		_ = file.Close()
+	}
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
 func (p *Proxy) serveAccelerated(w http.ResponseWriter, r *http.Request, src *source, meta metadata) {
 	start, end, partial, err := parseRequestRange(r.Header.Get("Range"), meta.size)
 	if err != nil {
@@ -692,17 +770,29 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 	if end < start {
 		return nil
 	}
-	chunkCount := int((end-start)/p.chunkSize) + 1
+	firstChunk := start / p.chunkSize
+	lastChunk := end / p.chunkSize
+	chunkCount := int(lastChunk-firstChunk) + 1
 	workers := p.workers
+	if routeLimit := p.routeLimit(src); workers > routeLimit {
+		workers = routeLimit
+	}
 	if workers > chunkCount {
 		workers = chunkCount
 	}
 	if workers < 1 {
 		workers = 1
 	}
+	window := p.prefetchChunks
+	if window < workers {
+		window = workers
+	}
+	if window > chunkCount {
+		window = chunkCount
+	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	tasks := make(chan byteRange, workers)
+	tasks := make(chan int64, window)
 	results := make(chan chunkResult)
 	pending := make(map[int64]chunkResult, workers)
 	var wg sync.WaitGroup
@@ -710,12 +800,11 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for task := range tasks {
-				data, err := p.fetchRange(workerCtx, src, meta, task)
+			for index := range tasks {
+				err := p.ensureChunk(workerCtx, src, meta, index)
 				select {
-				case results <- chunkResult{byteRange: task, data: data, err: err}:
+				case results <- chunkResult{index: index, err: err}:
 				case <-workerCtx.Done():
-					<-p.slots
 					return
 				}
 				if err != nil {
@@ -728,59 +817,139 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 		cancel()
 		close(tasks)
 		wg.Wait()
-		for range pending {
-			<-p.slots
-		}
 	}()
 
-	nextSchedule := start
-	nextWrite := start
+	nextSchedule := firstChunk
+	nextWrite := firstChunk
 	inFlight := 0
-	for nextWrite <= end {
-		var availableSlot chan struct{}
-		routeLimit := p.routeLimit(src)
-		if routeLimit > workers {
-			routeLimit = workers
-		}
-		if inFlight+len(pending) < routeLimit && nextSchedule <= end {
-			availableSlot = p.slots
+	for nextWrite <= lastChunk {
+		for inFlight+len(pending) < window && nextSchedule <= lastChunk {
+			tasks <- nextSchedule
+			nextSchedule++
+			inFlight++
 		}
 		select {
-		case availableSlot <- struct{}{}:
-			chunkEnd := nextSchedule + p.chunkSize - 1
-			if chunkEnd > end {
-				chunkEnd = end
-			}
-			urlIndex := p.nextRouteIndex(src)
-			tasks <- byteRange{start: nextSchedule, end: chunkEnd, urlIndex: urlIndex}
-			nextSchedule = chunkEnd + 1
-			inFlight++
 		case result := <-results:
 			inFlight--
 			if result.err != nil {
-				<-p.slots
 				return result.err
 			}
-			pending[result.start] = result
+			pending[result.index] = result
 			for {
 				ready, ok := pending[nextWrite]
 				if !ok {
 					break
 				}
-				written, err := dst.Write(ready.data)
-				if err != nil {
+				if err := p.copyCachedChunk(dst, src, ready.index, start, end); err != nil {
 					return err
 				}
-				if written != len(ready.data) {
-					return io.ErrShortWrite
-				}
 				delete(pending, nextWrite)
-				nextWrite = ready.end + 1
-				<-p.slots
+				nextWrite++
 			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	return nil
+}
+
+func (p *Proxy) ensureChunk(ctx context.Context, src *source, meta metadata, index int64) error {
+	for {
+		src.cacheMu.Lock()
+		if src.cacheFile == nil {
+			src.cacheMu.Unlock()
+			return errors.New("input cache is closed")
+		}
+		if existing, ok := src.cacheChunks[index]; ok {
+			if existing.completed {
+				if existing.err == nil {
+					src.cacheMu.Unlock()
+					return nil
+				}
+				delete(src.cacheChunks, index)
+			} else {
+				done := existing.done
+				src.cacheMu.Unlock()
+				select {
+				case <-done:
+					continue
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		chunk := &cacheChunk{done: make(chan struct{})}
+		src.cacheChunks[index] = chunk
+		src.cacheMu.Unlock()
+
+		err := p.downloadChunk(ctx, src, meta, index)
+		src.cacheMu.Lock()
+		chunk.completed = true
+		chunk.err = err
+		close(chunk.done)
+		src.cacheMu.Unlock()
+		return err
+	}
+}
+
+func (p *Proxy) downloadChunk(ctx context.Context, src *source, meta metadata, index int64) error {
+	start := index * p.chunkSize
+	end := start + p.chunkSize - 1
+	if end >= meta.size {
+		end = meta.size - 1
+	}
+	if err := p.acquire(ctx); err != nil {
+		return err
+	}
+	defer p.release()
+	requested := byteRange{start: start, end: end, urlIndex: p.nextRouteIndex(src)}
+	data, err := p.fetchRange(ctx, src, meta, requested)
+	if err != nil {
+		return err
+	}
+	src.cacheMu.Lock()
+	file := src.cacheFile
+	src.cacheMu.Unlock()
+	if file == nil {
+		return errors.New("input cache is closed")
+	}
+	written, err := file.WriteAt(data, start)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (p *Proxy) copyCachedChunk(dst io.Writer, src *source, index int64, requestStart, requestEnd int64) error {
+	chunkStart := index * p.chunkSize
+	chunkEnd := chunkStart + p.chunkSize - 1
+	readStart := chunkStart
+	if readStart < requestStart {
+		readStart = requestStart
+	}
+	readEnd := chunkEnd
+	if readEnd > requestEnd {
+		readEnd = requestEnd
+	}
+	if readEnd < readStart {
+		return nil
+	}
+	src.cacheMu.Lock()
+	file := src.cacheFile
+	src.cacheMu.Unlock()
+	if file == nil {
+		return errors.New("input cache is closed")
+	}
+	length := readEnd - readStart + 1
+	written, err := io.CopyN(dst, io.NewSectionReader(file, readStart, length), length)
+	if err != nil {
+		return err
+	}
+	if written != length {
+		return io.ErrShortWrite
 	}
 	return nil
 }
@@ -1096,9 +1265,41 @@ func (p *Proxy) Close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
+	p.mu.Unlock()
+	shutdownErr := p.server.Shutdown(ctx)
+	if shutdownErr != nil {
+		_ = p.server.Close()
+	}
+
+	p.mu.Lock()
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		sources = append(sources, src)
+	}
 	clear(p.sources)
 	p.mu.Unlock()
-	return p.server.Shutdown(ctx)
+	for _, src := range sources {
+		src.closeCache()
+	}
+	return shutdownErr
+}
+
+func cleanupStaleCacheFiles(cacheDir string) {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() ||
+			!strings.HasPrefix(entry.Name(), "input-") ||
+			!strings.HasSuffix(entry.Name(), ".cache") {
+			continue
+		}
+		path := filepath.Join(cacheDir, entry.Name())
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logging.Errorf("remove stale input cache file=%s err=%v", entry.Name(), err)
+		}
+	}
 }
 
 func parseRequestRange(value string, size int64) (int64, int64, bool, error) {

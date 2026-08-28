@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
   <title id="title">Emby-Transcoder architecture</title>
-  <desc id="desc">Two prioritized HTTP range workers merge into one ordered stream consumed by one FFmpeg VAAPI pipeline and served as HLS.</desc>
+  <desc id="desc">Two prioritized HTTP range workers assemble a sparse local cache consumed through seekable HTTP by one FFmpeg VAAPI pipeline.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#081321"/>
@@ -52,7 +52,7 @@
 
   <rect width="1400" height="760" rx="26" fill="url(#bg)"/>
   <text x="46" y="52" class="title">Emby-Transcoder / Dual-route single transcode pipeline</text>
-  <text x="46" y="80" class="sub">Two prioritized downloads feed one ordered FFmpeg and VAAPI session</text>
+  <text x="46" y="80" class="sub">Two prioritized downloads assemble one seekable sparse cache for FFmpeg</text>
 
   <text x="46" y="124" class="section">CONTROL PLANE</text>
   <rect x="46" y="145" width="245" height="92" rx="15" fill="#14233a" class="box" filter="url(#shadow)"/>
@@ -101,10 +101,10 @@
   <path d="M264 536 H324" class="input-line"/>
 
   <rect x="598" y="390" width="220" height="140" rx="18" fill="#173047" stroke="#38bdf8" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="708" y="429" text-anchor="middle" class="label">Ordered Range Merger</text>
-  <text x="708" y="455" text-anchor="middle" class="sub">Loopback input proxy</text>
+  <text x="708" y="429" text-anchor="middle" class="label">Sparse File Cache</text>
+  <text x="708" y="455" text-anchor="middle" class="sub">WriteAt plus chunk bitmap</text>
   <rect x="630" y="478" width="156" height="30" rx="8" fill="#0d2033" stroke="#365774"/>
-  <text x="708" y="498" text-anchor="middle" class="mini">Continuous seekable bytes</text>
+  <text x="708" y="498" text-anchor="middle" class="mini">Seekable loopback HTTP</text>
 
   <path d="M529 384 C570 384 570 430 598 430" class="input-line"/>
   <path d="M529 536 C570 536 570 490 598 490" class="input-line"/>

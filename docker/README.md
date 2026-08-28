@@ -31,10 +31,10 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
 - software transcoding caps video output at 1920x1080 while preserving aspect ratio; VAAPI mode does not scale
 - `transcode.segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count
-- set `transcode.download_workers` to `2` to enable dual HTTP Range input downloads with `8` MB chunks and a `64` MB global buffer; the process hard-limits upstream Range concurrency to `2`
+- set `transcode.download_workers` to `2` to assemble dual HTTP Range downloads in a sparse file with `8` MB chunks and `64` MB read-ahead; the process hard-limits upstream concurrency to `2`
 - with two `upstream.urls`, media workers preserve the PlaybackInfo `DirectStreamUrl`, alternate requests through both entrances, and follow each entrance's redirect to its actual media host
 - `upstream.urls` order is route priority: one session uses the first two healthy routes, while two sessions are pinned one route each; later entries are failover routes
-- only the top two routes are probed initially; lower routes are contacted only when needed, and missing ETag/Last-Modified falls back to file-size plus head/middle/tail SHA-256 validation
+- only the top two routes are probed for media; lower routes are not scanned, and missing ETag/Last-Modified falls back to file-size plus head/middle/tail SHA-256 validation
 - transcoding starts only on an HLS playlist or segment request; PlaybackInfo browsing does not prewarm or download media
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 - old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback

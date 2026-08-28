@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 			BufferSize: int64(cfg.Transcode.DownloadBufferMB) << 20,
 			Transport:  transport,
 			Origins:    downloadOrigins,
+			CacheDir:   filepath.Join(cfg.Transcode.TempDir, "input-cache"),
 		})
 		if err != nil {
 			return nil, err

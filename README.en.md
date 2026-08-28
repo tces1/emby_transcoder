@@ -32,6 +32,7 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 - Software transcoding caps video output at 1920x1080 and keeps aspect ratio; VAAPI mode does not scale.
 - Transcoding starts only when the client requests an HLS playlist or segment, so browsing details does not pre-download media.
 - FFmpeg uses low-latency startup and GOP settings to cut first-segment delay.
+- Optional dual-route HTTP Range workers assemble chunks by offset in a local sparse cache that FFmpeg reads through seekable loopback HTTP.
 
 Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
 
@@ -151,7 +152,7 @@ Leave `debug` as `false` for concise action-level logs. Set it to `true` when yo
 Leave `hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding. Set it to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
 The current VAAPI path uses hardware decode plus `h264_vaapi` hardware encoding and does not add a scale filter. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
 
-`download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds the global read-ahead window; `2 / 8 / 64` is the recommended starting point. When ETag/Last-Modified is absent, total file size is compared and 64 KiB samples from the head, middle, and tail are combined into a SHA-256 fingerprint; normal forwarding is used only when byte ranges are unavailable or content differs.
+`download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds sparse-file read-ahead; `2 / 8 / 64` is the recommended starting point. Chunks are written with `WriteAt` to their correct offsets under `<temp_dir>/input-cache/`, exposed to FFmpeg through seekable loopback HTTP, and deleted when the session ends. When ETag/Last-Modified is absent, total file size is compared and 64 KiB samples from the head, middle, and tail are combined into a SHA-256 fingerprint; normal forwarding is used only when byte ranges are unavailable or content differs.
 
 When the same upstream has multiple entrances, configure them directly in `upstream.urls`. The first is the primary API route. For safely retryable GET, HEAD, and OPTIONS requests, a connection error or 502/503/504 response switches the service to a working backup route. Non-idempotent requests such as POST are not replayed, preventing duplicate operations. The legacy single-value `upstream.url` remains supported.
 
@@ -171,7 +172,7 @@ With dual downloading enabled, the project preserves the real `DirectStreamUrl` 
 }
 ```
 
-Only the two highest-priority routes are probed concurrently at startup. Once two usable, content-identical final media responses are found, lower-priority entrances are not contacted. The next route is probed only when a second usable route is missing. Entrances resolving to the same final media host are deduplicated, and content identity is established through ETag/Last-Modified or file size plus head, middle, and tail SHA-256 samples.
+Only the two highest-priority routes are probed for media downloads. Lower entries are never scanned for the same session; if just one of the first two is usable, downloading immediately becomes single-route. Change the first two `upstream.urls` entries to select different download routes. Entrances resolving to the same final media host are deduplicated, and content identity is established through ETag/Last-Modified or file size plus head, middle, and tail SHA-256 samples.
 
 ## Transcode Lifecycle
 
