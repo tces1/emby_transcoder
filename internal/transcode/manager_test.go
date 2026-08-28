@@ -326,6 +326,60 @@ func TestManagerRestartsSessionWhenRequestedStartTimeTicksChangesWithinSameSegme
 	}
 }
 
+func TestManagerPlaylistSeekStartsAtSegmentAndSurvivesReload(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			return noopProcess{}, nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	first, err := m.Ensure("item123", transcode.Request{
+		InputURL:                "http://upstream/stream",
+		StartTimeTicks:          6418677540,
+		RequestedStartTimeTicks: 6418677540,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SegmentStartIndex != 320 || first.StartTimeTicks != 6400000000 {
+		t.Fatalf("playlist seek window = segment %d ticks %d", first.SegmentStartIndex, first.StartTimeTicks)
+	}
+
+	reload, err := m.Ensure("item123", transcode.Request{
+		InputURL:                "http://upstream/stream",
+		StartTimeTicks:          6418677540,
+		RequestedStartTimeTicks: 6418677540,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reload != first {
+		t.Fatal("playlist reload restarted the seeked session")
+	}
+
+	segment, err := m.Ensure("item123", transcode.Request{
+		InputURL:                "http://upstream/stream",
+		StartTimeTicks:          6400000000,
+		RequestedStartTimeTicks: 6418677540,
+		SegmentStartIndex:       320,
+		SegmentRequest:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if segment != first {
+		t.Fatal("segment request restarted the playlist session")
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("starts = %d", starts.Load())
+	}
+}
+
 func TestManagerRestartsSessionWhenProcessAlreadyExited(t *testing.T) {
 	var starts atomic.Int32
 	m := transcode.NewManager(transcode.Options{
@@ -850,6 +904,53 @@ func TestHandlerReusesVirtualPlaylistWhenPlaySessionIdChanges(t *testing.T) {
 
 	if firstRec.Code != http.StatusOK || secondRec.Code != http.StatusOK {
 		t.Fatalf("status first=%d second=%d", firstRec.Code, secondRec.Code)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("ffmpeg starts = %d", starts.Load())
+	}
+}
+
+func TestHandlerVirtualPlaylistSeekDoesNotRestartOnSegmentAndReload(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			name := fmt.Sprintf("segment_%05d.ts", request.SegmentStartIndex)
+			return noopProcess{}, os.WriteFile(filepath.Join(session.Dir, name), []byte("ts"), 0o644)
+		}),
+	})
+	m.RememberMedia("item123", transcode.MediaInfo{RunTimeTicks: 3600 * 10_000_000})
+	t.Cleanup(m.Close)
+
+	handler := transcode.Handler{
+		Manager: m,
+		InputURLForID: func(id string, r *http.Request) string {
+			return "http://upstream.local/emby/Videos/" + id + "/stream?" + r.URL.RawQuery
+		},
+		StartupWait: 50 * time.Millisecond,
+	}
+
+	playlist := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?StartTimeTicks=6418677540", nil)
+	playlistRec := httptest.NewRecorder()
+	handler.ServeHTTP(playlistRec, playlist)
+	if playlistRec.Code != http.StatusOK {
+		t.Fatalf("playlist status = %d body=%s", playlistRec.Code, playlistRec.Body.String())
+	}
+
+	segment := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00320.ts?StartTimeTicks=6418677540&runtimeTicks=6400000000", nil)
+	segmentRec := httptest.NewRecorder()
+	handler.ServeHTTP(segmentRec, segment)
+	if segmentRec.Code != http.StatusOK {
+		t.Fatalf("segment status = %d body=%s", segmentRec.Code, segmentRec.Body.String())
+	}
+
+	reload := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?StartTimeTicks=6418677540", nil)
+	reloadRec := httptest.NewRecorder()
+	handler.ServeHTTP(reloadRec, reload)
+	if reloadRec.Code != http.StatusOK {
+		t.Fatalf("reload status = %d body=%s", reloadRec.Code, reloadRec.Body.String())
 	}
 	if starts.Load() != 1 {
 		t.Fatalf("ffmpeg starts = %d", starts.Load())

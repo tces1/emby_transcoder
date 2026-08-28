@@ -419,6 +419,10 @@ func (p *Proxy) endWorker(index int, bytes int64, failed bool, finalURL string) 
 	metric.lastEndedAt = time.Now()
 }
 
+func isWorkerFailure(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled)
+}
+
 func (p *Proxy) addWorkerBytes(index int, bytes int) {
 	if bytes <= 0 {
 		return
@@ -803,7 +807,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	workerID := p.beginWorker("probing", src, rawURL, rangeHeader)
 	finalURL := ""
 	defer func() {
-		p.endWorker(workerID, 0, resultErr != nil, finalURL)
+		p.endWorker(workerID, 0, isWorkerFailure(resultErr), finalURL)
 	}()
 	resp, err := p.doRequestWithRetry(requestCtx, req, probeRetryAttempts)
 	if err != nil {
@@ -1493,7 +1497,7 @@ func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadat
 	workerID := p.beginWorker("downloading", src, rawURL, rangeHeader)
 	finalURL := ""
 	defer func() {
-		p.endWorker(workerID, int64(len(data)), resultErr != nil, finalURL)
+		p.endWorker(workerID, int64(len(data)), isWorkerFailure(resultErr), finalURL)
 	}()
 	validatorHeader, validatorValue, hasValidator := representationValidator(meta)
 	if hasValidator {
@@ -1552,7 +1556,7 @@ func (p *Proxy) serveFallback(w http.ResponseWriter, r *http.Request, src *sourc
 	}()
 	resp, err := p.client.Do(req)
 	if err != nil {
-		failed = true
+		failed = isWorkerFailure(err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

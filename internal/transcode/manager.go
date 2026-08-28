@@ -389,6 +389,7 @@ func (m *Manager) MediaInfo(id string) (MediaInfo, bool) {
 }
 
 func (m *Manager) Ensure(id string, request Request) (*Session, error) {
+	request = m.normalizedRequest(request)
 	for {
 		var stale *Session
 		fastStop := false
@@ -748,6 +749,15 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.SegmentRequest && session.OldestSegmentKept > session.SegmentStartIndex && request.SegmentStartIndex < session.OldestSegmentKept {
 		return true
 	}
+	if request.AudioStreamIndex != session.AudioStreamIndex {
+		return true
+	}
+	if request.InputURL != "" && session.InputURL != "" && !segmentInputCompatible(session.InputURL, request.InputURL) {
+		return true
+	}
+	if !request.SegmentRequest {
+		return playlistSeekChanged(session, request)
+	}
 	if request.StartTimeTicks != session.StartTimeTicks {
 		return true
 	}
@@ -757,10 +767,32 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.SegmentStartIndex != session.SegmentStartIndex {
 		return true
 	}
-	if request.AudioStreamIndex != session.AudioStreamIndex {
-		return true
+	return false
+}
+
+func playlistSeekChanged(session *Session, request Request) bool {
+	requested := request.RequestedStartTimeTicks
+	if requested == 0 {
+		requested = request.StartTimeTicks
 	}
-	return request.InputURL != "" && session.InputURL != "" && !segmentInputCompatible(session.InputURL, request.InputURL)
+	current := session.RequestedStartTimeTicks
+	if current == 0 {
+		current = session.StartTimeTicks
+	}
+	return requested != current
+}
+
+func (m *Manager) normalizedRequest(request Request) Request {
+	if request.RequestedStartTimeTicks == 0 {
+		request.RequestedStartTimeTicks = request.StartTimeTicks
+	}
+	if request.SegmentRequest || request.SegmentStartIndex != 0 || request.StartTimeTicks <= 0 {
+		return request
+	}
+	segmentTicks := m.segmentTicks()
+	request.SegmentStartIndex = int(request.StartTimeTicks / segmentTicks)
+	request.StartTimeTicks = int64(request.SegmentStartIndex) * segmentTicks
+	return request
 }
 
 func touchSession(session *Session, request Request, now time.Time, mediaAccess bool) {
