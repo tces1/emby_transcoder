@@ -749,7 +749,7 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.AudioStreamIndex != session.AudioStreamIndex {
 		return true
 	}
-	return request.InputURL != "" && session.InputURL != "" && request.InputURL != session.InputURL
+	return request.InputURL != "" && session.InputURL != "" && !segmentInputCompatible(session.InputURL, request.InputURL)
 }
 
 func touchSession(session *Session, request Request, now time.Time, mediaAccess bool) {

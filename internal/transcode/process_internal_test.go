@@ -68,6 +68,15 @@ func TestSegmentInputCompatibleIgnoresPlaybackSessionOptions(t *testing.T) {
 	}
 }
 
+func TestSegmentInputCompatibleIgnoresDirectStreamPlaySessionId(t *testing.T) {
+	existing := "https://tv.example/videos/260981/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-a&api_key=secret"
+	next := "https://tv.example/videos/260981/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-b&api_key=secret"
+
+	if !segmentInputCompatible(existing, next) {
+		t.Fatal("expected compatible input when only upstream PlaySessionId changes")
+	}
+}
+
 func TestSegmentInputCompatibleRejectsMediaSourceChange(t *testing.T) {
 	existing := "https://upstream/emby/Videos/item123/stream?AudioStreamIndex=1&MediaSourceId=source1&X-Emby-Token=abc"
 	next := "https://upstream/emby/Videos/item123/stream?AudioStreamIndex=1&MediaSourceId=source2&X-Emby-Token=abc"

@@ -125,11 +125,11 @@ func TestManagerRestartsSessionWhenInputURLChanges(t *testing.T) {
 	})
 	t.Cleanup(m.Close)
 
-	first, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream?StartTimeTicks=0"})
+	first, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream?MediaSourceId=source1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream?StartTimeTicks=900000000"})
+	second, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream?MediaSourceId=source2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,10 +137,45 @@ func TestManagerRestartsSessionWhenInputURLChanges(t *testing.T) {
 	if first == second {
 		t.Fatal("expected a new session when the input URL changes")
 	}
-	if second.InputURL != "http://upstream/stream?StartTimeTicks=900000000" {
+	if second.InputURL != "http://upstream/stream?MediaSourceId=source2" {
 		t.Fatalf("input url = %q", second.InputURL)
 	}
 	if stopped.Load() != 1 {
+		t.Fatalf("stopped = %d", stopped.Load())
+	}
+}
+
+func TestManagerReusesSessionWhenOnlyPlaySessionIdChanges(t *testing.T) {
+	var stopped atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			return stopFunc(func() error {
+				stopped.Add(1)
+				return nil
+			}), nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	first, err := m.Ensure("item123", transcode.Request{
+		InputURL: "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-a&api_key=secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Ensure("item123", transcode.Request{
+		InputURL: "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-b&api_key=secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first != second {
+		t.Fatal("expected the same session when only PlaySessionId changes")
+	}
+	if stopped.Load() != 0 {
 		t.Fatalf("stopped = %d", stopped.Load())
 	}
 }
@@ -782,6 +817,42 @@ func TestHandlerStartsTranscodeWhenServingVirtualPlaylist(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "segment_00000.ts?") {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestHandlerReusesVirtualPlaylistWhenPlaySessionIdChanges(t *testing.T) {
+	var starts atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			starts.Add(1)
+			return noopProcess{}, nil
+		}),
+	})
+	m.RememberMedia("item123", transcode.MediaInfo{RunTimeTicks: 10_500_0000})
+	t.Cleanup(m.Close)
+
+	handler := transcode.Handler{
+		Manager: m,
+		InputURLForID: func(id string, r *http.Request) string {
+			return "https://tv.example/videos/" + id + "/original.mp4?MediaSourceId=source1&PlaySessionId=" + r.URL.Query().Get("PlaySessionId")
+		},
+	}
+
+	first := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?PlaySessionId=session-a", nil)
+	firstRec := httptest.NewRecorder()
+	handler.ServeHTTP(firstRec, first)
+
+	second := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?PlaySessionId=session-b", nil)
+	secondRec := httptest.NewRecorder()
+	handler.ServeHTTP(secondRec, second)
+
+	if firstRec.Code != http.StatusOK || secondRec.Code != http.StatusOK {
+		t.Fatalf("status first=%d second=%d", firstRec.Code, secondRec.Code)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("ffmpeg starts = %d", starts.Load())
 	}
 }
 
