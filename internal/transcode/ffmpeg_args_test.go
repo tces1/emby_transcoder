@@ -261,7 +261,41 @@ func TestFFmpegRunnerUsesAcceleratedInputAndReleasesIt(t *testing.T) {
 	}
 }
 
-func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
+func TestFFmpegProcessIsNotDoneUntilAcceleratedInputIsReleased(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := &blockingReleaseInputProxy{
+		releaseStarted: make(chan struct{}),
+		allowRelease:   make(chan struct{}),
+	}
+	runner := FFmpegRunner{Path: ffmpegPath, InputProxy: input}
+	process, err := runner.Start(context.Background(), &Session{ID: "item123", Dir: dir}, Request{InputURL: "http://upstream/video"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execProcess := process.(*execProcess)
+
+	select {
+	case <-input.releaseStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("input release did not start")
+	}
+	if execProcess.waitForExit(20 * time.Millisecond) {
+		t.Fatal("process reported done before input release completed")
+	}
+	close(input.allowRelease)
+	if !execProcess.waitForExit(time.Second) {
+		t.Fatal("process did not report done after input release")
+	}
+}
+
+func TestBuildFFmpegArgsKeepsOutputLowLatencyWithoutUnsafeInputFlags(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
 		Dir: t.TempDir(),
@@ -269,12 +303,12 @@ func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 
 	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
 
-	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0", "-hls_init_time", "1"} {
+	for _, want := range []string{"-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0", "-hls_init_time", "1"} {
 		if !slices.Contains(args, want) {
 			t.Fatalf("missing low-latency arg %q in %v", want, args)
 		}
 	}
-	for _, risky := range []string{"-analyzeduration", "-probesize"} {
+	for _, risky := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "-probesize"} {
 		if slices.Contains(args, risky) {
 			t.Fatalf("should not force risky probing arg %q for mkv/dts inputs: %v", risky, args)
 		}
@@ -285,6 +319,18 @@ type recordingInputProxy struct {
 	rawURL   string
 	headers  http.Header
 	released chan struct{}
+}
+
+type blockingReleaseInputProxy struct {
+	releaseStarted chan struct{}
+	allowRelease   chan struct{}
+}
+
+func (p *blockingReleaseInputProxy) Register(string, http.Header) (string, func(), error) {
+	return "http://127.0.0.1:12345/input", func() {
+		close(p.releaseStarted)
+		<-p.allowRelease
+	}, nil
 }
 
 func (p *recordingInputProxy) Register(rawURL string, headers http.Header) (string, func(), error) {
@@ -593,6 +639,29 @@ func TestBuildFFmpegArgsMapsRequestedAudioStreamIndex(t *testing.T) {
 
 	args := buildFFmpegArgs(session, request)
 
+	mapIndexes := allIndexes(args, "-map")
+	if len(mapIndexes) < 2 {
+		t.Fatalf("missing map args: %v", args)
+	}
+	if got := args[mapIndexes[1]+1]; got != "0:a:1?" {
+		t.Fatalf("audio map = %q, args=%v", got, args)
+	}
+}
+
+func TestBuildFFmpegArgsMapsExplicitAudioStreamIndexZero(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+		Media: MediaInfo{AudioStreams: []AudioStreamInfo{
+			{Index: 2, Ordinal: 0, Codec: "aac"},
+			{Index: 0, Ordinal: 1, Codec: "eac3"},
+		}},
+	}
+	args := buildFFmpegArgs(session, Request{
+		InputURL:            "http://upstream/stream?AudioStreamIndex=0",
+		AudioStreamIndex:    0,
+		HasAudioStreamIndex: true,
+	})
 	mapIndexes := allIndexes(args, "-map")
 	if len(mapIndexes) < 2 {
 		t.Fatalf("missing map args: %v", args)

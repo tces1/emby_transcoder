@@ -11,9 +11,10 @@ import (
 const (
 	timeSecondTicks     int64 = 10_000_000
 	defaultSegmentTicks       = 2 * timeSecondTicks
+	playlistLookahead         = 1
 )
 
-func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (string, bool) {
+func GrowingMediaPlaylist(info MediaInfo, segmentTicks int64, rawQuery string, firstIndex, readyCount int) (string, bool) {
 	if info.RunTimeTicks <= 0 || segmentTicks <= 0 {
 		return "", false
 	}
@@ -22,19 +23,46 @@ func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (st
 	if segmentCount <= 0 {
 		return "", false
 	}
+	if firstIndex < 0 {
+		firstIndex = 0
+	}
+	if firstIndex >= segmentCount {
+		firstIndex = segmentCount - 1
+	}
+	if readyCount < 0 {
+		readyCount = 0
+	}
+	remaining := segmentCount - firstIndex
+	if readyCount > remaining {
+		readyCount = remaining
+	}
+	complete := readyCount == remaining
+	listed := readyCount
+	if readyCount > 0 && !complete {
+		listed += playlistLookahead
+	}
+	if listed > remaining {
+		listed = remaining
+	}
 
 	var builder strings.Builder
 	builder.WriteString("#EXTM3U\n")
 	builder.WriteString("#EXT-X-VERSION:6\n")
 	builder.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(ticksFloatSeconds(segmentTicks)))))
-	builder.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-	if startTicks := startTimeTicksFromRawQuery(rawQuery); startTicks > 0 {
-		builder.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", ticksFloatSeconds(startTicks)))
+	if complete {
+		builder.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	} else {
+		builder.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
 	}
-	builder.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	if firstIndex == 0 {
+		if startTicks := startTimeTicksFromRawQuery(rawQuery); startTicks > 0 && startTicks < segmentTicks {
+			builder.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", ticksFloatSeconds(startTicks)))
+		}
+	}
+	builder.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", firstIndex))
 	builder.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 
-	for index := 0; index < segmentCount; index++ {
+	for index := firstIndex; index < firstIndex+listed; index++ {
 		segmentStart := int64(index) * segmentTicks
 		durationTicks := min(segmentTicks, info.RunTimeTicks-segmentStart)
 		builder.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", ticksFloatSeconds(durationTicks)))
@@ -52,7 +80,9 @@ func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (st
 		builder.WriteString(strconv.FormatInt(durationTicks, 10))
 		builder.WriteString("\n")
 	}
-	builder.WriteString("#EXT-X-ENDLIST\n")
+	if complete {
+		builder.WriteString("#EXT-X-ENDLIST\n")
+	}
 	return builder.String(), true
 }
 

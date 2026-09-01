@@ -3,10 +3,12 @@ package inputproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -77,6 +79,69 @@ func TestProxyDownloadsRangesConcurrentlyAndInOrder(t *testing.T) {
 	}
 	if downloaded != int64(len(data)) {
 		t.Fatalf("worker metrics downloaded=%d want=%d", downloaded, len(data))
+	}
+}
+
+func TestFastRouteHedgesBlockingChunkFromSlowRoute(t *testing.T) {
+	const chunkSize = 1024
+	data := bytes.Repeat([]byte("hedged-download-"), 512)
+	var fastHedged atomic.Bool
+
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if start == chunkSize {
+			fastHedged.Store(true)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer fast.Close()
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if start == chunkSize {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer slow.Close()
+
+	proxy := &Proxy{
+		client:         http.DefaultClient,
+		workers:        2,
+		chunkSize:      chunkSize,
+		prefetchChunks: 4,
+		slots:          make(chan struct{}, 2),
+		origins:        []*url.URL{{Scheme: "http", Host: "fast"}, {Scheme: "http", Host: "slow"}},
+		sources:        make(map[string]*source),
+		metrics:        make([]workerMetric, 2),
+	}
+	src := &source{
+		rawURL:      fast.URL,
+		headers:     make(http.Header),
+		active:      []string{fast.URL, slow.URL},
+		failures:    []int{0, 0},
+		finalHosts:  []string{"fast", "slow"},
+		cacheChunks: make(map[int64]*cacheChunk),
+	}
+	src.dedicated.Store(-1)
+	if err := src.prepareCache(t.TempDir(), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	defer src.closeCache()
+
+	var output bytes.Buffer
+	if err := proxy.streamRanges(context.Background(), &output, src, metadata{size: int64(len(data))}, 0, int64(len(data)-1)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatalf("hedged body differs: got=%d want=%d", output.Len(), len(data))
+	}
+	if !fastHedged.Load() {
+		t.Fatal("fast route did not duplicate the blocking chunk from the slow route")
 	}
 }
 
@@ -606,7 +671,7 @@ func TestProxyCacheSnapshotsReportsCachedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProxy(t, proxy)
-	localURL, release, err := proxy.RegisterSource("sess-chart", "Snapshot Movie", upstream.URL+"/video.mp4", nil)
+	localURL, release, err := proxy.RegisterSource("sess-chart", "Snapshot Movie", 7, upstream.URL+"/video.mp4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,11 +700,58 @@ func TestProxyCacheSnapshotsReportsCachedBytes(t *testing.T) {
 		t.Fatalf("snapshots = %+v", snapshots)
 	}
 	snap := snapshots[0]
-	if snap.SessionID != "sess-chart" || snap.Size != int64(len(data)) || snap.CachedBytes < 32768 {
+	if snap.SessionID != "sess-chart" || snap.GenerationID != 7 || snap.Size != int64(len(data)) || snap.CachedBytes < 32768 {
 		t.Fatalf("cache snapshot = %+v", snap)
+	}
+	for _, worker := range proxy.Snapshot() {
+		if worker.TotalBytes > 0 && worker.GenerationID != 7 {
+			t.Fatalf("worker generation = %d, want 7", worker.GenerationID)
+		}
 	}
 	if len(snap.Ranges) == 0 || snap.Ranges[0].State != "cached" || snap.Ranges[0].Start != 0 {
 		t.Fatalf("cache ranges = %+v", snap.Ranges)
+	}
+}
+
+func TestReleaseClearsWorkerMetricsAndRejectsLateUpdates(t *testing.T) {
+	proxy, err := New(Options{Workers: 2, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+
+	localURL, release, err := proxy.RegisterSource("item123", "Movie", 9, "https://example.com/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Trim(parsed.Path, "/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+
+	lease := proxy.beginWorker("downloading", src, src.rawURL, "bytes=0-1023")
+	proxy.addWorkerBytes(lease, 512)
+	release()
+	proxy.endWorker(lease, 1024, false, src.rawURL)
+	proxy.addWorkerBytes(lease, 512)
+
+	snapshot := proxy.Snapshot()[lease.index]
+	if snapshot.State != "idle" ||
+		snapshot.SessionID != "" ||
+		snapshot.GenerationID != 0 ||
+		snapshot.VideoName != "" ||
+		snapshot.Route != "" ||
+		snapshot.ByteRange != "" ||
+		snapshot.DownloadBPS != 0 ||
+		snapshot.TotalBytes != 0 {
+		t.Fatalf("released worker retained stale metrics: %+v", snapshot)
 	}
 }
 
@@ -790,6 +902,57 @@ func TestProxyRetriesTransientChunkFailure(t *testing.T) {
 	}
 	if !bytes.Equal(body, data[:32768]) || attempts.Load() < 2 {
 		t.Fatalf("retry body=%d attempts=%d", len(body), attempts.Load())
+	}
+}
+
+func TestCanceledRangeDoesNotPenalizeRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("canceled request should not reach upstream")
+	}))
+	defer upstream.Close()
+
+	src := &source{
+		rawURL:   upstream.URL,
+		headers:  make(http.Header),
+		active:   []string{upstream.URL},
+		failures: []int{1},
+	}
+	src.dedicated.Store(-1)
+	proxy := &Proxy{
+		client:  http.DefaultClient,
+		workers: 1,
+		sources: map[string]*source{"one": src},
+		metrics: make([]workerMetric, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := proxy.fetchRange(ctx, src, metadata{size: 1024}, byteRange{start: 0, end: 1023})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetch error = %v, want context canceled", err)
+	}
+
+	src.routeMu.Lock()
+	failures := src.failures[0]
+	src.routeMu.Unlock()
+	if failures != 1 {
+		t.Fatalf("route failures = %d, want unchanged count 1", failures)
+	}
+}
+
+func TestRouteMovesTenChunksAheadAfterThreeHedgeLosses(t *testing.T) {
+	src := &source{active: []string{"fast", "slow"}}
+
+	for range hedgeLossThreshold {
+		src.recordHedgeResult(1, true)
+	}
+	if got := src.hedgeOffset(1); got != hedgeChunkOffset {
+		t.Fatalf("hedge offset = %d, want %d", got, hedgeChunkOffset)
+	}
+
+	src.recordHedgeResult(1, false)
+	if got := src.hedgeOffset(1); got != 0 {
+		t.Fatalf("hedge offset after success = %d, want 0", got)
 	}
 }
 

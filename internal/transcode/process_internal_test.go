@@ -9,13 +9,24 @@ import (
 	"time"
 )
 
+func TestRequestFromHTTPSeparatesClientAndUpstreamPlaySessionIDs(t *testing.T) {
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00000.ts?CurrentPlaySessionId=current-session&PlaySessionId=query-session", nil)
+
+	request := requestFromHTTP("item123", "http://upstream/stream?PlaySessionId=upstream-session", req)
+
+	if request.PlaySessionID != "query-session" {
+		t.Fatalf("client play session id = %q", request.PlaySessionID)
+	}
+	if request.UpstreamPlaySessionID != "upstream-session" {
+		t.Fatalf("upstream play session id = %q", request.UpstreamPlaySessionID)
+	}
+}
+
 func TestRequestFromHTTPUsesCurrentPlaySessionIDFallback(t *testing.T) {
-	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00000.ts?CurrentPlaySessionId=current-session", nil)
-
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?CurrentPlaySessionId=current-session", nil)
 	request := requestFromHTTP("item123", "http://upstream/stream", req)
-
 	if request.PlaySessionID != "current-session" {
-		t.Fatalf("play session id = %q", request.PlaySessionID)
+		t.Fatalf("client play session id = %q", request.PlaySessionID)
 	}
 }
 

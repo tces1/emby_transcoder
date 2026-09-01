@@ -65,7 +65,7 @@ func TestManagerReusesExistingSession(t *testing.T) {
 	if first != second {
 		t.Fatal("expected same session pointer")
 	}
-	if first.Dir == "" || filepath.Base(first.Dir) != "one" {
+	if first.Dir == "" || filepath.Base(first.Dir) != "one-g1" || first.GenerationID != 1 {
 		t.Fatalf("session dir = %q", first.Dir)
 	}
 }
@@ -145,7 +145,7 @@ func TestManagerRestartsSessionWhenInputURLChanges(t *testing.T) {
 	}
 }
 
-func TestManagerReusesSessionWhenOnlyPlaySessionIdChanges(t *testing.T) {
+func TestManagerReusesSessionWhenOnlyUpstreamPlaySessionIdChanges(t *testing.T) {
 	var stopped atomic.Int32
 	m := transcode.NewManager(transcode.Options{
 		MaxSessions: 1,
@@ -160,13 +160,15 @@ func TestManagerReusesSessionWhenOnlyPlaySessionIdChanges(t *testing.T) {
 	t.Cleanup(m.Close)
 
 	first, err := m.Ensure("item123", transcode.Request{
-		InputURL: "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-a&api_key=secret",
+		InputURL:              "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-a&api_key=secret",
+		UpstreamPlaySessionID: "session-a",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := m.Ensure("item123", transcode.Request{
-		InputURL: "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-b&api_key=secret",
+		InputURL:              "https://tv.example/videos/item123/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-b&api_key=secret",
+		UpstreamPlaySessionID: "session-b",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +178,46 @@ func TestManagerReusesSessionWhenOnlyPlaySessionIdChanges(t *testing.T) {
 		t.Fatal("expected the same session when only PlaySessionId changes")
 	}
 	if stopped.Load() != 0 {
+		t.Fatalf("stopped = %d", stopped.Load())
+	}
+	if second.UpstreamPlaySessionID != "session-a" {
+		t.Fatalf("running upstream play session changed to %q", second.UpstreamPlaySessionID)
+	}
+}
+
+func TestManagerRestartsWhenClientPlaySessionChanges(t *testing.T) {
+	var stopped atomic.Int32
+	m := transcode.NewManager(transcode.Options{
+		MaxSessions: 1,
+		TempDir:     t.TempDir(),
+		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
+			return stopFunc(func() error {
+				stopped.Add(1)
+				return nil
+			}), nil
+		}),
+	})
+	t.Cleanup(m.Close)
+
+	first, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream", PlaySessionID: "client-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Ensure("item123", transcode.Request{InputURL: "http://upstream/stream", PlaySessionID: "client-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first == second {
+		t.Fatal("expected a new transcode generation for a different client play session")
+	}
+	if first.GenerationID == second.GenerationID {
+		t.Fatalf("generation id was reused: %d", second.GenerationID)
+	}
+	if second.PlaySessionID != "client-b" {
+		t.Fatalf("client play session = %q", second.PlaySessionID)
+	}
+	if stopped.Load() != 1 {
 		t.Fatalf("stopped = %d", stopped.Load())
 	}
 }
@@ -840,7 +882,7 @@ func TestHandlerStartsSessionAndServesPlaylist(t *testing.T) {
 	}
 }
 
-func TestHandlerServesVirtualPlaylistWhenDurationIsKnown(t *testing.T) {
+func TestHandlerServesEmptyGrowingPlaylistWhenDurationIsKnown(t *testing.T) {
 	var starts atomic.Int32
 	m := transcode.NewManager(transcode.Options{
 		MaxSessions: 1,
@@ -864,18 +906,25 @@ func TestHandlerServesVirtualPlaylistWhenDurationIsKnown(t *testing.T) {
 	if starts.Load() != 0 {
 		t.Fatalf("ffmpeg starts = %d", starts.Load())
 	}
-	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:VOD") {
+	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:EVENT") {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "segment_") || strings.Contains(rec.Body.String(), "#EXT-X-ENDLIST") {
+		t.Fatalf("unready playlist advertised media: %s", rec.Body.String())
 	}
 }
 
-func TestHandlerStartsTranscodeWhenServingVirtualPlaylist(t *testing.T) {
+func TestHandlerStartsTranscodeBeforeServingGrowingPlaylist(t *testing.T) {
 	var starts atomic.Int32
 	m := transcode.NewManager(transcode.Options{
 		MaxSessions: 1,
 		TempDir:     t.TempDir(),
 		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
 			starts.Add(1)
+			go func() {
+				time.Sleep(25 * time.Millisecond)
+				_ = os.WriteFile(filepath.Join(session.Dir, "segment_00000.ts"), []byte("ts"), 0o644)
+			}()
 			return noopProcess{}, nil
 		}),
 	})
@@ -887,9 +936,11 @@ func TestHandlerStartsTranscodeWhenServingVirtualPlaylist(t *testing.T) {
 		InputURLForID: func(id string, r *http.Request) string {
 			return "http://upstream.local/emby/Videos/" + id + "/stream?" + r.URL.RawQuery
 		},
+		StartupWait: time.Second,
 	}
 	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?X-Emby-Token=abc", nil)
 	rec := httptest.NewRecorder()
+	started := time.Now()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -898,22 +949,25 @@ func TestHandlerStartsTranscodeWhenServingVirtualPlaylist(t *testing.T) {
 	if starts.Load() != 1 {
 		t.Fatalf("ffmpeg starts = %d", starts.Load())
 	}
-	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:VOD") {
+	if time.Since(started) < 20*time.Millisecond {
+		t.Fatal("playlist returned before the first segment was ready")
+	}
+	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:EVENT") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "segment_00000.ts?") {
-		t.Fatalf("body = %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "segment_00000.ts") {
+		t.Fatalf("ready first segment was not advertised: %s", rec.Body.String())
 	}
 }
 
-func TestHandlerReusesVirtualPlaylistWhenPlaySessionIdChanges(t *testing.T) {
+func TestHandlerStartsNewGenerationWhenClientPlaySessionIdChanges(t *testing.T) {
 	var starts atomic.Int32
 	m := transcode.NewManager(transcode.Options{
 		MaxSessions: 1,
 		TempDir:     t.TempDir(),
 		Runner: runnerFunc(func(ctx context.Context, session *transcode.Session, request transcode.Request) (transcode.Process, error) {
 			starts.Add(1)
-			return noopProcess{}, nil
+			return noopProcess{}, os.WriteFile(filepath.Join(session.Dir, "segment_00000.ts"), []byte("ts"), 0o644)
 		}),
 	})
 	m.RememberMedia("item123", transcode.MediaInfo{RunTimeTicks: 10_500_0000})
@@ -937,7 +991,7 @@ func TestHandlerReusesVirtualPlaylistWhenPlaySessionIdChanges(t *testing.T) {
 	if firstRec.Code != http.StatusOK || secondRec.Code != http.StatusOK {
 		t.Fatalf("status first=%d second=%d", firstRec.Code, secondRec.Code)
 	}
-	if starts.Load() != 1 {
+	if starts.Load() != 2 {
 		t.Fatalf("ffmpeg starts = %d", starts.Load())
 	}
 }
@@ -969,6 +1023,10 @@ func TestHandlerVirtualPlaylistSeekDoesNotRestartOnSegmentAndReload(t *testing.T
 	handler.ServeHTTP(playlistRec, playlist)
 	if playlistRec.Code != http.StatusOK {
 		t.Fatalf("playlist status = %d body=%s", playlistRec.Code, playlistRec.Body.String())
+	}
+	if !strings.Contains(playlistRec.Body.String(), "#EXT-X-MEDIA-SEQUENCE:320") ||
+		!strings.Contains(playlistRec.Body.String(), "segment_00320.ts") {
+		t.Fatalf("seek playlist = %s", playlistRec.Body.String())
 	}
 
 	segment := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00320.ts?StartTimeTicks=6418677540&runtimeTicks=6400000000", nil)

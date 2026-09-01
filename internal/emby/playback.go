@@ -38,6 +38,8 @@ type SourceReport struct {
 	AudioChannels            int
 	AudioTitle               string
 	AudioStreams             []AudioStreamReport
+	DefaultAudioStreamIndex  int
+	HasDefaultAudioStream    bool
 	Bitrate                  int64
 	RunTimeTicks             int64
 	BeforeSupportsDirectPlay bool
@@ -48,11 +50,12 @@ type SourceReport struct {
 }
 
 type AudioStreamReport struct {
-	Index    int
-	Ordinal  int
-	Codec    string
-	Channels int
-	Title    string
+	Index     int
+	Ordinal   int
+	Codec     string
+	Channels  int
+	Title     string
+	IsDefault bool
 }
 
 func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string, rawQuery ...string) ([]byte, bool, RewriteReport, error) {
@@ -81,7 +84,7 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 		beforeTranscodingURL, _ := source["TranscodingUrl"].(string)
 		sourceReport := sourceReportFromMap(source)
 		transcodeURL := fmt.Sprintf("/streambridge/transcode/%s/master.m3u8", sessionID)
-		if enrichedQuery := transcodeQueryForSource(firstRawQuery(rawQuery), sourceID, sourceReport.AudioStreams); enrichedQuery != "" {
+		if enrichedQuery := transcodeQueryForSource(firstRawQuery(rawQuery), sourceID, sourceReport); enrichedQuery != "" {
 			transcodeURL += "?" + enrichedQuery
 		}
 		sourceReport.Index = index
@@ -109,6 +112,8 @@ func RewritePlaybackInfoWithReport(body []byte, itemID string, publicURL string,
 			AudioChannels:            sourceReport.AudioChannels,
 			AudioTitle:               sourceReport.AudioTitle,
 			AudioStreams:             sourceReport.AudioStreams,
+			DefaultAudioStreamIndex:  sourceReport.DefaultAudioStreamIndex,
+			HasDefaultAudioStream:    sourceReport.HasDefaultAudioStream,
 			Bitrate:                  sourceReport.Bitrate,
 			RunTimeTicks:             sourceReport.RunTimeTicks,
 			BeforeSupportsDirectPlay: sourceReport.BeforeSupportsDirectPlay,
@@ -146,7 +151,7 @@ func firstRawQuery(rawQuery []string) string {
 	return rawQuery[0]
 }
 
-func transcodeQueryForSource(rawQuery string, sourceID string, audioStreams []AudioStreamReport) string {
+func transcodeQueryForSource(rawQuery string, sourceID string, source SourceReport) string {
 	query, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return rawQuery
@@ -154,8 +159,10 @@ func transcodeQueryForSource(rawQuery string, sourceID string, audioStreams []Au
 	if sourceID != "" && query.Get("MediaSourceId") == "" {
 		query.Set("MediaSourceId", sourceID)
 	}
-	if query.Get("AudioStreamIndex") == "" && len(audioStreams) > 0 {
-		query.Set("AudioStreamIndex", strconv.Itoa(audioStreams[0].Index))
+	if query.Get("AudioStreamIndex") == "" {
+		if audioIndex, ok := preferredAudioStream(source); ok {
+			query.Set("AudioStreamIndex", strconv.Itoa(audioIndex))
+		}
 	}
 	return query.Encode()
 }
@@ -167,6 +174,10 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 		Container:    stringValue(source, "Container"),
 		Bitrate:      int64Value(source, "Bitrate"),
 		RunTimeTicks: int64Value(source, "RunTimeTicks"),
+	}
+	if defaultIndex, ok := optionalIntValue(source, "DefaultAudioStreamIndex"); ok {
+		report.DefaultAudioStreamIndex = defaultIndex
+		report.HasDefaultAudioStream = true
 	}
 
 	rawStreams, _ := source["MediaStreams"].([]any)
@@ -186,11 +197,12 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 			report.Height = intValue(stream, "Height")
 		case strings.EqualFold(stringValue(stream, "Type"), "Audio"):
 			audio := AudioStreamReport{
-				Index:    intValue(stream, "Index"),
-				Ordinal:  audioOrdinal,
-				Codec:    stringValue(stream, "Codec"),
-				Channels: intValue(stream, "Channels"),
-				Title:    stringValue(stream, "DisplayTitle"),
+				Index:     intValue(stream, "Index"),
+				Ordinal:   audioOrdinal,
+				Codec:     stringValue(stream, "Codec"),
+				Channels:  intValue(stream, "Channels"),
+				Title:     stringValue(stream, "DisplayTitle"),
+				IsDefault: boolValue(stream, "IsDefault"),
 			}
 			report.AudioStreams = append(report.AudioStreams, audio)
 			audioOrdinal++
@@ -201,8 +213,58 @@ func sourceReportFromMap(source map[string]any) SourceReport {
 			}
 		}
 	}
+	if selected, ok := preferredAudioStream(report); ok {
+		for _, audio := range report.AudioStreams {
+			if audio.Index == selected {
+				report.AudioCodec = audio.Codec
+				report.AudioChannels = audio.Channels
+				report.AudioTitle = audio.Title
+				break
+			}
+		}
+	}
 
 	return report
+}
+
+func preferredAudioStream(source SourceReport) (int, bool) {
+	if source.HasDefaultAudioStream {
+		for _, stream := range source.AudioStreams {
+			if stream.Index == source.DefaultAudioStreamIndex {
+				return source.DefaultAudioStreamIndex, true
+			}
+		}
+	}
+	for _, stream := range source.AudioStreams {
+		if stream.IsDefault {
+			return stream.Index, true
+		}
+	}
+	if len(source.AudioStreams) == 1 {
+		return source.AudioStreams[0].Index, true
+	}
+	return 0, false
+}
+
+func optionalIntValue(values map[string]any, key string) (int, bool) {
+	value, ok := values[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case int:
+		return typed, true
+	}
+	return 0, false
+}
+
+func boolValue(values map[string]any, key string) bool {
+	value, _ := values[key].(bool)
+	return value
 }
 
 func stringValue(values map[string]any, key string) string {
