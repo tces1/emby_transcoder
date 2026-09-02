@@ -24,8 +24,8 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set `server.dashboard_password` to enable password login for `/emby_transcoder`
 - set `server.debug` to `true` when you need detailed diagnostics
-- leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
-- set `transcode.hardware_decode` to `vaapi` to use Intel or AMD VAAPI through `/dev/dri`
+- set `transcode.hardware_acceleration` to `false` to disable hardware acceleration and use CPU transcoding
+- set `transcode.hardware_acceleration` to `true` to use Intel or AMD VAAPI through `/dev/dri`; an empty device path defaults to `/dev/dri/renderD128`
 - VAAPI normally uses hardware decode plus `h264_vaapi`; 4K HEVC Main 8 uses software decode/scale with VAAPI encode for compatibility
 - startup probes VAAPI support, including device initialization and `h264_vaapi`, and fails startup when the device, driver, or ffmpeg support is unavailable
 - the image includes common Intel and AMD VAAPI userspace drivers plus `vainfo`
@@ -40,6 +40,7 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - ffmpeg runs with low-latency startup and GOP settings to reduce first-segment delay
 - old `segment_*.ts` files are deleted once they are more than `transcode.segment_retention_seconds` behind playback
 - open `/emby_transcoder` on the proxy and authenticate with `server.dashboard_password` to view worker, FFmpeg, download, and HLS upload status
+- the authenticated dashboard includes Chinese/English switching, a validated JSON configuration editor, and a service restart action; keep the config bind mount writable
 
 For GitHub Actions publishing to Docker Hub, set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in the repository secrets.
 

@@ -9,5 +9,5 @@ services:
     devices:
       - /dev/dri:/dev/dri
     volumes:
-      - ./config/config.json:/app/config/config.json:ro
+      - ./config/config.json:/app/config/config.json
       - ./data/transcode:/var/lib/emby-transcoder/transcode

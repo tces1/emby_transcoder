@@ -62,7 +62,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     volumes:
-      - ./config/config.json:/app/config/config.json:ro
+      - ./config/config.json:/app/config/config.json
       - ./data/transcode:/var/lib/emby-transcoder/transcode
 ```
 
@@ -77,9 +77,10 @@ Edit `docker/config/config.local.json` before starting:
 - set `upstream.urls` to your Emby or Jellyfin entrance list; the first route is primary and later routes are failover targets
 - set `server.public_url` if clients reach the proxy through another reverse proxy
 - set a non-empty `server.dashboard_password` to enable the `/emby_transcoder` status dashboard
+- after signing in, the dashboard can switch languages, validate and save configuration, and restart a Docker-managed service; mount the configuration file writable
 - leave `server.debug` as `false` for concise logs, or set it to `true` for detailed diagnostics
-- leave `transcode.hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding
-- set `transcode.hardware_decode` to `vaapi` on Linux hosts with Intel or AMD `/dev/dri` VAAPI support
+- set `transcode.hardware_acceleration` to `false` to disable hardware acceleration and use CPU transcoding
+- set `transcode.hardware_acceleration` to `true` on Linux hosts with Intel or AMD `/dev/dri` VAAPI support
 - VAAPI normally uses hardware decode plus `h264_vaapi`; 4K HEVC Main 8 uses software decode/scale with VAAPI encode to avoid unsupported VAProfile failures
 - startup will probe VAAPI availability, including device initialization and `h264_vaapi`, and fail startup if the device, driver, or ffmpeg support is missing
 
@@ -87,7 +88,7 @@ Update `docker/docker-compose.yml` to mount the local config file if you use `co
 
 ```yaml
 volumes:
-  - ./config/config.local.json:/app/config/config.json:ro
+  - ./config/config.local.json:/app/config/config.json
   - ./data/transcode:/var/lib/emby-transcoder/transcode
 ```
 
@@ -132,7 +133,7 @@ Copy `config.example.json` and change the upstream URL:
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
-    "hardware_decode": "",
+    "hardware_acceleration": false,
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
@@ -149,7 +150,7 @@ Copy `config.example.json` and change the upstream URL:
 
 Leave `public_url` empty when clients connect directly to Emby-Transcoder. Set it when Emby-Transcoder sits behind another reverse proxy.
 Leave `debug` as `false` for concise action-level logs. Set it to `true` when you want detailed `TRACE_SWITCH` and request-level diagnostics.
-Leave `hardware_decode` as `""` to disable hardware acceleration and use CPU transcoding. Set it to `vaapi` to enable VAAPI hardware transcoding. The default `hardware_device` is `/dev/dri/renderD128`.
+Set `hardware_acceleration` to `false` for software decode and encode, or `true` to enable VAAPI transcoding. An empty `hardware_device` is normalized to `/dev/dri/renderD128` but is only used when VAAPI is enabled. The legacy `hardware_decode` field remains readable and is migrated on save.
 VAAPI normally uses hardware decode plus `h264_vaapi`. 4K HEVC Main 8 selects software decode/scale with VAAPI encode immediately, avoiding a known unsupported full-pipeline VAProfile failure. If the device, driver, or `h264_vaapi` probe fails, startup stops with an error.
 
 `download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds sparse-file read-ahead; `2 / 8 / 64` is the recommended starting point. Chunks are written with `WriteAt` to their correct offsets under `<temp_dir>/input-cache/`, exposed to FFmpeg through seekable loopback HTTP, and deleted when the session ends. The first usable route starts feeding FFmpeg as soon as Range support and file size are confirmed; a second distinct final host is probed in the background. When ETag/Last-Modified is absent, 64 KiB samples from the head, middle, and tail are hashed only to align that second route. Normal forwarding is used only when byte ranges are unavailable or content differs.

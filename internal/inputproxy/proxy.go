@@ -93,10 +93,12 @@ type source struct {
 	unsupported bool
 	fallbackLog sync.Once
 
-	routeMu   sync.Mutex
-	failures  []int
-	hedgeLoss map[string]int
-	dedicated atomic.Int32
+	routeMu     sync.Mutex
+	failures    []int
+	hedgeLoss   map[string]int
+	routeChecks map[string]routeCheck
+	routeGates  map[string]chan struct{}
+	dedicated   atomic.Int32
 
 	cacheMu     sync.Mutex
 	cacheFile   *os.File
@@ -139,6 +141,24 @@ type CacheSnapshot struct {
 	Ranges       []CacheRange `json:"ranges,omitempty"`
 }
 
+type RouteSnapshot struct {
+	SessionID    string `json:"session_id,omitempty"`
+	GenerationID uint64 `json:"generation_id,omitempty"`
+	Entry        string `json:"entry"`
+	Final        string `json:"final,omitempty"`
+	State        string `json:"state"`
+	Reason       string `json:"reason,omitempty"`
+	Active       bool   `json:"active"`
+	Failures     int    `json:"failures"`
+	HedgeLosses  int    `json:"hedge_losses"`
+}
+
+type routeCheck struct {
+	state  string
+	final  string
+	reason string
+}
+
 type workerMetric struct {
 	token        uint64
 	busy         bool
@@ -173,9 +193,11 @@ type metadata struct {
 }
 
 type byteRange struct {
-	start    int64
-	end      int64
-	urlIndex int
+	start       int64
+	end         int64
+	urlIndex    int
+	workerIndex int
+	fixedWorker bool
 }
 
 type chunkResult struct {
@@ -336,6 +358,62 @@ func (p *Proxy) SessionRoutes() map[string][]string {
 	return routes
 }
 
+func (p *Proxy) RouteSnapshots() []RouteSnapshot {
+	p.mu.RLock()
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		sources = append(sources, src)
+	}
+	p.mu.RUnlock()
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].order < sources[j].order
+	})
+
+	var snapshots []RouteSnapshot
+	for _, src := range sources {
+		src.routeMu.Lock()
+		for _, candidate := range src.urls {
+			check := src.routeChecks[candidate]
+			snapshot := RouteSnapshot{
+				SessionID:    src.id,
+				GenerationID: src.generation,
+				Entry:        routeHost(candidate),
+				Final:        check.final,
+				State:        check.state,
+				Reason:       check.reason,
+				HedgeLosses:  src.hedgeLoss[candidate],
+			}
+			if snapshot.State == "" {
+				snapshot.State = "pending"
+				snapshot.Reason = "not_probed"
+			}
+			for index, active := range src.active {
+				if active != candidate {
+					continue
+				}
+				snapshot.Active = true
+				if index < len(src.finalHosts) && src.finalHosts[index] != "" {
+					snapshot.Final = src.finalHosts[index]
+				}
+				if index < len(src.failures) {
+					snapshot.Failures = src.failures[index]
+				}
+				if snapshot.Failures >= 2 {
+					snapshot.State = "unhealthy"
+					snapshot.Reason = "consecutive_failures"
+				} else {
+					snapshot.State = "active"
+					snapshot.Reason = "accepted"
+				}
+				break
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		src.routeMu.Unlock()
+	}
+	return snapshots
+}
+
 func (p *Proxy) CacheSnapshots() []CacheSnapshot {
 	p.mu.RLock()
 	sources := make([]*source, 0, len(p.sources))
@@ -419,6 +497,19 @@ func (p *Proxy) beginWorker(state string, src *source, rawURL string, rangeHeade
 			index = candidate
 			break
 		}
+	}
+	return p.beginWorkerLocked(index, state, src, rawURL, rangeHeader)
+}
+
+func (p *Proxy) beginWorkerAt(index int, state string, src *source, rawURL string, rangeHeader string) workerLease {
+	p.metricsMu.Lock()
+	defer p.metricsMu.Unlock()
+	return p.beginWorkerLocked(index, state, src, rawURL, rangeHeader)
+}
+
+func (p *Proxy) beginWorkerLocked(index int, state string, src *source, rawURL string, rangeHeader string) workerLease {
+	if index < 0 || index >= len(p.metrics) {
+		return workerLease{index: -1}
 	}
 	metric := &p.metrics[index]
 	metric.token++
@@ -892,6 +983,7 @@ func (p *Proxy) expandRoutes(src *source, candidates []string, usedFinalHosts ma
 			finalKey := routeKey(result.meta.finalHost, result.candidate)
 			if finalKey != "" {
 				if _, duplicate := usedFinalHosts[finalKey]; duplicate {
+					src.recordRouteCheck(result.candidate, "duplicate", result.meta.finalHost, "same_final_host")
 					logging.Infof(
 						"accelerated input probe entry=%s final=%s result=duplicate_line",
 						routeHost(result.candidate),
@@ -935,12 +1027,15 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 
 	if _, ok := mergeRepresentation(first, next); ok {
 		src.addRoute(candidate, next.finalHost)
+		src.recordRouteCheck(candidate, "active", next.finalHost, "validator_matched")
 		return true
 	}
 	if first.size != next.size {
+		src.recordRouteCheck(candidate, "rejected", next.finalHost, "size_mismatch")
 		return false
 	}
 	if strongETag(first.etag) && strongETag(next.etag) {
+		src.recordRouteCheck(candidate, "rejected", next.finalHost, "etag_mismatch")
 		return false
 	}
 
@@ -953,6 +1048,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 	cacheFirst := src.hasInFlightChunks()
 	fingerprintedFirst, used, err := p.ensureFingerprint(fingerprintCtx, src, firstURL, first, cacheFirst)
 	if err != nil {
+		src.recordRouteCheck(candidate, "rejected", next.finalHost, "primary_fingerprint_error")
 		logging.Infof(
 			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
 			routeHost(firstURL),
@@ -962,6 +1058,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 	}
 	fingerprintedNext, err := p.fingerprintRanges(fingerprintCtx, src, candidate, next, used, false)
 	if err != nil {
+		src.recordRouteCheck(candidate, "rejected", next.finalHost, "candidate_fingerprint_error")
 		logging.Infof(
 			"accelerated input probe entry=%s result=fingerprint_error detail=%q",
 			routeHost(candidate),
@@ -970,6 +1067,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 		return false
 	}
 	if _, ok := mergeRepresentation(fingerprintedFirst, fingerprintedNext); !ok {
+		src.recordRouteCheck(candidate, "rejected", next.finalHost, "fingerprint_mismatch")
 		return false
 	}
 	src.metaMu.Lock()
@@ -979,6 +1077,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 	}
 	src.metaMu.Unlock()
 	src.addRoute(candidate, next.finalHost)
+	src.recordRouteCheck(candidate, "active", next.finalHost, "fingerprint_matched")
 	return true
 }
 
@@ -1026,10 +1125,12 @@ func strongETag(value string) bool {
 }
 
 func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (result metadata, supported bool, resultErr error) {
+	src.recordRouteCheck(rawURL, "probing", "", "checking_range_support")
 	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	req, err := p.upstreamRequest(requestCtx, http.MethodGet, src, rawURL, sizeProbeRange)
 	if err != nil {
 		cancel()
+		src.recordRouteCheck(rawURL, "error", "", "invalid_request")
 		return metadata{}, false, err
 	}
 	resp, err := p.doRequestWithRetry(requestCtx, req, probeRetryAttempts)
@@ -1039,6 +1140,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			reason = "timeout"
 		}
+		src.recordRouteCheck(rawURL, "error", "", reason)
 		logging.Infof(
 			"accelerated input probe entry=%s result=%s detail=%q",
 			routeHost(rawURL),
@@ -1057,6 +1159,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 	}
 	start, _, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
 	if resp.StatusCode != http.StatusPartialContent || !valid || start != 0 || total <= 0 {
+		src.recordRouteCheck(rawURL, "unsupported", routeHost(finalURL), "range_unsupported")
 		logging.Infof(
 			"accelerated input probe entry=%s final=%s status=%d range=%t validator=false result=unsupported",
 			routeHost(rawURL),
@@ -1078,6 +1181,7 @@ func (p *Proxy) probeMetadata(ctx context.Context, src *source, rawURL string) (
 		finalHost:    finalHost,
 	}
 	_, _, hasValidator := representationValidator(meta)
+	src.recordRouteCheck(rawURL, "ready", finalHost, "range_supported")
 	logging.Infof(
 		"accelerated input probe entry=%s final=%s status=%d range=true validator=%t fingerprint=false result=ready",
 		routeHost(rawURL),
@@ -1446,7 +1550,7 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 		go func() {
 			defer wg.Done()
 			for task := range tasks {
-				err := p.ensureChunk(workerCtx, src, meta, task.index, task.routeIndex, task.hedge)
+				err := p.ensureChunk(workerCtx, src, meta, task.index, task.lane, task.routeIndex, task.hedge)
 				select {
 				case results <- chunkResult{index: task.index, lane: task.lane, routeIndex: task.routeIndex, err: err}:
 				case <-workerCtx.Done():
@@ -1561,7 +1665,7 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 	return nil
 }
 
-func (p *Proxy) ensureChunk(ctx context.Context, src *source, meta metadata, index int64, routeIndex int, hedge bool) error {
+func (p *Proxy) ensureChunk(ctx context.Context, src *source, meta metadata, index int64, lane int, routeIndex int, hedge bool) error {
 	for {
 		src.cacheMu.Lock()
 		if src.cacheFile == nil {
@@ -1581,7 +1685,7 @@ func (p *Proxy) ensureChunk(ctx context.Context, src *source, meta metadata, ind
 						existing.attempts++
 						existing.routes[routeIndex] = struct{}{}
 						src.cacheMu.Unlock()
-						return p.runChunkAttempt(ctx, src, meta, index, routeIndex, existing)
+						return p.runChunkAttempt(ctx, src, meta, index, lane, routeIndex, existing)
 					}
 				}
 				done := existing.done
@@ -1604,12 +1708,12 @@ func (p *Proxy) ensureChunk(ctx context.Context, src *source, meta metadata, ind
 		}
 		src.cacheChunks[index] = chunk
 		src.cacheMu.Unlock()
-		return p.runChunkAttempt(ctx, src, meta, index, routeIndex, chunk)
+		return p.runChunkAttempt(ctx, src, meta, index, lane, routeIndex, chunk)
 	}
 }
 
-func (p *Proxy) runChunkAttempt(ctx context.Context, src *source, meta metadata, index int64, routeIndex int, chunk *cacheChunk) error {
-	err := p.downloadChunk(chunk.ctx, src, meta, index, routeIndex)
+func (p *Proxy) runChunkAttempt(ctx context.Context, src *source, meta metadata, index int64, lane int, routeIndex int, chunk *cacheChunk) error {
+	err := p.downloadChunk(chunk.ctx, src, meta, index, lane, routeIndex)
 	src.cacheMu.Lock()
 	if chunk.completed {
 		finalErr := chunk.err
@@ -1646,17 +1750,19 @@ func chunkAttemptResult(attemptErr, finalErr error) error {
 	return finalErr
 }
 
-func (p *Proxy) downloadChunk(ctx context.Context, src *source, meta metadata, index int64, routeIndex int) error {
+func (p *Proxy) downloadChunk(ctx context.Context, src *source, meta metadata, index int64, lane int, routeIndex int) error {
 	start := index * p.chunkSize
 	end := start + p.chunkSize - 1
 	if end >= meta.size {
 		end = meta.size - 1
 	}
-	if err := p.acquire(ctx); err != nil {
-		return err
+	requested := byteRange{
+		start:       start,
+		end:         end,
+		urlIndex:    routeIndex,
+		workerIndex: p.workerMetricIndex(src, lane),
+		fixedWorker: true,
 	}
-	defer p.release()
-	requested := byteRange{start: start, end: end, urlIndex: routeIndex}
 	data, err := p.fetchRange(ctx, src, meta, requested)
 	if err != nil {
 		return err
@@ -1750,6 +1856,19 @@ func (p *Proxy) streamRouteIndexes(src *source) []int {
 	return routes
 }
 
+func (p *Proxy) workerMetricIndex(src *source, lane int) int {
+	if len(p.metrics) == 0 {
+		return 0
+	}
+	if dedicated := src.dedicated.Load(); dedicated >= 0 {
+		return int(dedicated) % len(p.metrics)
+	}
+	if lane < 0 {
+		lane = 0
+	}
+	return lane % len(p.metrics)
+}
+
 func (p *Proxy) routeAssignments() map[*source]int {
 	p.mu.RLock()
 	sources := make([]*source, 0, len(p.sources))
@@ -1761,60 +1880,113 @@ func (p *Proxy) routeAssignments() map[*source]int {
 	sort.Slice(sources, func(i, j int) bool {
 		return sources[i].order < sources[j].order
 	})
-	assignments := make(map[*source]int, len(sources))
-	used := make(map[int]struct{}, len(sources))
-	desiredOwners := make(map[int]*source, len(sources))
-	for _, src := range sources {
-		desiredOwners[int(src.dedicated.Load())] = src
-	}
-	for _, src := range sources {
-		healthy := src.healthyRouteIndexes()
-		if len(healthy) == 0 {
-			continue
-		}
-		desired := int(src.dedicated.Load())
-		selected := -1
-		if containsIndex(healthy, desired) {
-			if _, occupied := used[desired]; !occupied {
-				selected = desired
-			}
-		}
-		if selected < 0 {
-			for _, candidate := range healthy {
-				if _, occupied := used[candidate]; !occupied {
-					if owner, reserved := desiredOwners[candidate]; reserved && owner != src {
-						continue
-					}
-					selected = candidate
-					break
-				}
-			}
-		}
-		if selected < 0 {
-			for _, candidate := range healthy {
-				if _, occupied := used[candidate]; !occupied {
-					selected = candidate
-					break
-				}
-			}
-		}
-		if selected < 0 {
-			selected = healthy[desired%len(healthy)]
-		}
-		assignments[src] = selected
-		used[selected] = struct{}{}
-	}
 	p.mu.RUnlock()
-	return assignments
-}
 
-func containsIndex(indexes []int, target int) bool {
-	for _, index := range indexes {
-		if index == target {
-			return true
+	type choice struct {
+		index int
+		rank  int
+		key   string
+	}
+	type plan struct {
+		src     *source
+		desired int
+		choices []choice
+	}
+	plans := make([]plan, 0, len(sources))
+	reserved := make(map[string]*source, len(sources))
+	for _, src := range sources {
+		src.routeMu.Lock()
+		ranks := make(map[string]int, len(src.urls))
+		for index, candidate := range src.urls {
+			ranks[candidate] = index
+		}
+		buildChoices := func(healthyOnly bool) []choice {
+			var choices []choice
+			for index, candidate := range src.active {
+				if healthyOnly && index < len(src.failures) && src.failures[index] >= 2 {
+					continue
+				}
+				rank, ok := ranks[candidate]
+				if !ok {
+					rank = index
+				}
+				final := ""
+				if index < len(src.finalHosts) {
+					final = src.finalHosts[index]
+				}
+				key := routeKey(final, candidate)
+				if key == "" {
+					key = candidate
+				}
+				choices = append(choices, choice{index: index, rank: rank, key: key})
+			}
+			sort.SliceStable(choices, func(i, j int) bool {
+				return choices[i].rank < choices[j].rank
+			})
+			return choices
+		}
+		choices := buildChoices(true)
+		if len(choices) == 0 {
+			choices = buildChoices(false)
+		}
+		desiredRank := int(src.dedicated.Load())
+		desired := -1
+		for _, candidate := range choices {
+			if candidate.rank == desiredRank {
+				desired = candidate.index
+				if candidate.key != "" {
+					reserved[candidate.key] = src
+				}
+				break
+			}
+		}
+		plans = append(plans, plan{src: src, desired: desired, choices: choices})
+		src.routeMu.Unlock()
+	}
+
+	assignments := make(map[*source]int, len(plans))
+	used := make(map[string]struct{}, len(plans))
+	for _, plan := range plans {
+		selected := choice{index: -1}
+		for _, candidate := range plan.choices {
+			if candidate.index == plan.desired {
+				if _, occupied := used[candidate.key]; !occupied {
+					selected = candidate
+				}
+				break
+			}
+		}
+		if selected.index < 0 {
+			for _, candidate := range plan.choices {
+				if _, occupied := used[candidate.key]; occupied {
+					continue
+				}
+				if owner, held := reserved[candidate.key]; held && owner != plan.src {
+					continue
+				}
+				selected = candidate
+				break
+			}
+		}
+		if selected.index < 0 {
+			for _, candidate := range plan.choices {
+				if _, occupied := used[candidate.key]; !occupied {
+					selected = candidate
+					break
+				}
+			}
+		}
+		if selected.index < 0 && len(plan.choices) > 0 {
+			selected = plan.choices[0]
+		}
+		if selected.index >= 0 {
+			assignments[plan.src] = selected.index
+			if selected.key != "" {
+				used[selected.key] = struct{}{}
+			}
 		}
 	}
-	return false
+	return assignments
 }
 
 func (s *source) healthyRouteIndexes() []int {
@@ -1889,8 +2061,20 @@ func (p *Proxy) routeAttempts(src *source, preferred int) []int {
 		}
 		attempts = append(attempts, index)
 	}
-	add(preferred)
+	preferredHealthy := preferred >= 0 &&
+		preferred < len(src.active) &&
+		(preferred >= len(src.failures) || src.failures[preferred] < 2)
+	if preferredHealthy {
+		add(preferred)
+		return attempts
+	}
 	if src.dedicated.Load() < 0 {
+		for index := range src.active {
+			if index >= len(src.failures) || src.failures[index] < 2 {
+				add(index)
+			}
+		}
+		add(preferred)
 		return attempts
 	}
 	reserved := make(map[int]struct{}, len(assignments))
@@ -1941,49 +2125,6 @@ func (s *source) addRoute(rawURL, finalHost string) {
 	s.active = append(append([]string{}, s.active...), rawURL)
 	s.finalHosts = append(append([]string{}, s.finalHosts...), finalHost)
 	s.failures = append(append([]int{}, s.failures...), 0)
-	s.orderRoutesLocked()
-}
-
-func (s *source) orderRoutesLocked() {
-	if len(s.urls) == 0 || len(s.active) < 2 {
-		return
-	}
-	rank := make(map[string]int, len(s.urls))
-	for index, candidate := range s.urls {
-		rank[candidate] = index
-	}
-	type pair struct {
-		url  string
-		host string
-		fail int
-	}
-	pairs := make([]pair, len(s.active))
-	for index, rawURL := range s.active {
-		item := pair{url: rawURL}
-		if index < len(s.finalHosts) {
-			item.host = s.finalHosts[index]
-		}
-		if index < len(s.failures) {
-			item.fail = s.failures[index]
-		}
-		pairs[index] = item
-	}
-	sort.SliceStable(pairs, func(i, j int) bool {
-		ri, oi := rank[pairs[i].url]
-		rj, oj := rank[pairs[j].url]
-		if oi && oj {
-			return ri < rj
-		}
-		return oi && !oj
-	})
-	s.active = make([]string, len(pairs))
-	s.finalHosts = make([]string, len(pairs))
-	s.failures = make([]int, len(pairs))
-	for index, item := range pairs {
-		s.active[index] = item.url
-		s.finalHosts[index] = item.host
-		s.failures[index] = item.fail
-	}
 }
 
 func (s *source) routeURL(index int) (string, bool) {
@@ -1993,6 +2134,30 @@ func (s *source) routeURL(index int) (string, bool) {
 		return "", false
 	}
 	return s.active[index], true
+}
+
+func (s *source) acquireRoute(ctx context.Context, rawURL string) (func(), error) {
+	s.routeMu.Lock()
+	if len(s.active) < 2 && len(s.urls) <= 1 {
+		s.routeMu.Unlock()
+		return func() {}, nil
+	}
+	if s.routeGates == nil {
+		s.routeGates = make(map[string]chan struct{})
+	}
+	gate := s.routeGates[rawURL]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		s.routeGates[rawURL] = gate
+	}
+	s.routeMu.Unlock()
+
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *source) recordRouteResult(index int, success bool) {
@@ -2006,6 +2171,19 @@ func (s *source) recordRouteResult(index int, success bool) {
 		return
 	}
 	s.failures[index]++
+}
+
+func (s *source) recordRouteCheck(rawURL, state, final, reason string) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if s.routeChecks == nil {
+		s.routeChecks = make(map[string]routeCheck)
+	}
+	s.routeChecks[rawURL] = routeCheck{
+		state:  state,
+		final:  final,
+		reason: reason,
+	}
 }
 
 func (s *source) recordHedgeResult(index int, lost bool) {
@@ -2038,6 +2216,16 @@ func (s *source) hedgeOffset(index int) int64 {
 }
 
 func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadata, rawURL string, requested byteRange) (data []byte, resultErr error) {
+	releaseRoute, err := src.acquireRoute(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseRoute()
+	if err := p.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer p.release()
+
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", requested.start, requested.end)
 	requestCtx, cancel := context.WithTimeout(ctx, chunkTimeout)
 	defer cancel()
@@ -2045,7 +2233,12 @@ func (p *Proxy) fetchRangeFromURL(ctx context.Context, src *source, meta metadat
 	if err != nil {
 		return nil, err
 	}
-	workerID := p.beginWorker("downloading", src, rawURL, rangeHeader)
+	var workerID workerLease
+	if requested.fixedWorker {
+		workerID = p.beginWorkerAt(requested.workerIndex, "downloading", src, rawURL, rangeHeader)
+	} else {
+		workerID = p.beginWorker("downloading", src, rawURL, rangeHeader)
+	}
 	finalURL := ""
 	defer func() {
 		p.endWorker(workerID, int64(len(data)), isWorkerFailure(resultErr), finalURL)

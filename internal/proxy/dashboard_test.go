@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"emby-transcoder/internal/config"
 	"emby-transcoder/internal/transcode"
@@ -23,12 +25,26 @@ func TestDashboardRequiresPasswordAuthentication(t *testing.T) {
 		t.Fatalf("login page status=%d body=%s", loginPage.Code, loginPage.Body.String())
 	}
 
-	status := httptest.NewRecorder()
-	server.ServeHTTP(status, httptest.NewRequest(http.MethodGet, dashboardPrefix+"/api/status", nil))
-	if status.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthorized status code = %d", status.Code)
+	for method, path := range map[string]string{
+		http.MethodGet:  dashboardPrefix + "/api/status",
+		http.MethodPut:  dashboardPrefix + "/api/config",
+		http.MethodPost: dashboardPrefix + "/api/restart",
+	} {
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, httptest.NewRequest(method, path, nil))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthorized %s %s status code = %d", method, path, response.Code)
+		}
 	}
 
+}
+
+func TestDashboardIncludesRouteDiagnostics(t *testing.T) {
+	for _, expected := range []string{"URL 可用性", "URL Availability", "route_checks", "竞速取消", "最终域名重复", "服务配置", "Service Configuration", "restartService"} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Fatalf("dashboard is missing %q", expected)
+		}
+	}
 }
 
 func TestDashboardLoginCreatesOpaqueSessionAndServesStatus(t *testing.T) {
@@ -78,6 +94,86 @@ func TestDashboardLoginCreatesOpaqueSessionAndServesStatus(t *testing.T) {
 	}
 	if !strings.Contains(status.Body.String(), `"workers"`) || !strings.Contains(status.Body.String(), `"sessions"`) {
 		t.Fatalf("status API body = %s", status.Body.String())
+	}
+}
+
+func TestDashboardConfigSaveAndRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	server := newDashboardTestServer(t, "valid-password")
+	server.configPath = path
+	server.cfg.Path = path
+	if err := config.Save(path, server.cfg); err != nil {
+		t.Fatal(err)
+	}
+	restarted := make(chan struct{})
+	server.restartFunc = func() { close(restarted) }
+
+	form := url.Values{"password": []string{"valid-password"}}
+	loginRequest := httptest.NewRequest(http.MethodPost, dashboardPrefix+"/login", strings.NewReader(form.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	login := httptest.NewRecorder()
+	server.ServeHTTP(login, loginRequest)
+	var sessionCookie *http.Cookie
+	for _, cookie := range login.Result().Cookies() {
+		if cookie.Name == dashboardCookieName {
+			sessionCookie = cookie
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("missing dashboard session cookie")
+	}
+
+	getRequest := httptest.NewRequest(http.MethodGet, dashboardPrefix+"/api/config", nil)
+	getRequest.AddCookie(sessionCookie)
+	getResponse := httptest.NewRecorder()
+	server.ServeHTTP(getResponse, getRequest)
+	if getResponse.Code != http.StatusOK || strings.Contains(getResponse.Body.String(), "valid-password") {
+		t.Fatalf("config response status=%d body=%s", getResponse.Code, getResponse.Body.String())
+	}
+
+	edited := server.cfg
+	edited.Server.DashboardPassword = ""
+	edited.Upstream.URL = ""
+	edited.Upstream.URLs = []string{"https://updated.example"}
+	body, err := json.Marshal(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putRequest := httptest.NewRequest(http.MethodPut, dashboardPrefix+"/api/config", strings.NewReader(string(body)))
+	putRequest.AddCookie(sessionCookie)
+	putResponse := httptest.NewRecorder()
+	server.ServeHTTP(putResponse, putRequest)
+	if putResponse.Code != http.StatusOK {
+		t.Fatalf("save status=%d body=%s", putResponse.Code, putResponse.Body.String())
+	}
+	saved, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Upstream.URL != "https://updated.example" || saved.Server.DashboardPassword != "valid-password" {
+		t.Fatalf("saved config = %+v", saved)
+	}
+	refreshRequest := httptest.NewRequest(http.MethodGet, dashboardPrefix+"/api/config", nil)
+	refreshRequest.AddCookie(sessionCookie)
+	refreshResponse := httptest.NewRecorder()
+	server.ServeHTTP(refreshResponse, refreshRequest)
+	if refreshResponse.Code != http.StatusOK ||
+		!strings.Contains(refreshResponse.Body.String(), "https://updated.example") ||
+		strings.Contains(refreshResponse.Body.String(), `"url":`) {
+		t.Fatalf("refreshed config status=%d body=%s", refreshResponse.Code, refreshResponse.Body.String())
+	}
+
+	restartRequest := httptest.NewRequest(http.MethodPost, dashboardPrefix+"/api/restart", nil)
+	restartRequest.AddCookie(sessionCookie)
+	restartResponse := httptest.NewRecorder()
+	server.ServeHTTP(restartResponse, restartRequest)
+	if restartResponse.Code != http.StatusAccepted {
+		t.Fatalf("restart status=%d body=%s", restartResponse.Code, restartResponse.Body.String())
+	}
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("restart callback was not invoked")
 	}
 }
 

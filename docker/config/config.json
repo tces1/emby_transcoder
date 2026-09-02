@@ -14,7 +14,7 @@
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
-    "hardware_decode": "",
+    "hardware_acceleration": false,
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,

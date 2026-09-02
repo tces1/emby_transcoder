@@ -62,7 +62,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     volumes:
-      - ./config/config.json:/app/config/config.json:ro
+      - ./config/config.json:/app/config/config.json
       - ./data/transcode:/var/lib/emby-transcoder/transcode
 ```
 
@@ -79,9 +79,10 @@ cp config/config.json config/config.local.json
 - 将 `upstream.urls` 改成你的 Emby 或 Jellyfin 入口列表；第一个是 API 主线路，失败时自动切换后续线路。
 - 如果客户端通过另一层反向代理访问本服务，设置 `server.public_url`。
 - 设置非空的 `server.dashboard_password` 后才能访问 `/emby_transcoder` 状态后台。
+- 登录状态后台后可切换中英文、编辑并校验配置，以及重启由 Docker 管理的服务；配置文件必须以可写方式挂载。
 - `server.debug` 默认保持 `false`，日志更简洁；需要诊断时改成 `true`。
-- `transcode.hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。
-- Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_decode` 设置为 `vaapi`。
+- `transcode.hardware_acceleration` 设为 `false` 表示不使用硬件加速，走 CPU 转码。
+- Linux 主机有 Intel 或 AMD `/dev/dri` VAAPI 支持时，可将 `transcode.hardware_acceleration` 设置为 `true`。
 - VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 自动使用软件解码/缩放加 VAAPI 编码，避开不支持的 VAProfile。
 - 启动时会探测 VAAPI 可用性，包括设备初始化和 `h264_vaapi`；设备、驱动或 ffmpeg 支持缺失时会启动失败。
 
@@ -89,7 +90,7 @@ cp config/config.json config/config.local.json
 
 ```yaml
 volumes:
-  - ./config/config.local.json:/app/config/config.json:ro
+  - ./config/config.local.json:/app/config/config.json
   - ./data/transcode:/var/lib/emby-transcoder/transcode
 ```
 
@@ -134,7 +135,7 @@ go build ./cmd/emby-transcoder
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
-    "hardware_decode": "",
+    "hardware_acceleration": false,
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
@@ -153,7 +154,7 @@ go build ./cmd/emby-transcoder
 
 `debug` 保持 `false` 时只输出动作级日志；需要 `TRACE_SWITCH` 和请求级诊断时设置为 `true`。
 
-`hardware_decode` 保持 `""` 表示不使用硬件加速，走 CPU 转码。设置为 `vaapi` 可启用 VAAPI 硬件转码，默认设备是 `/dev/dri/renderD128`。
+`hardware_acceleration` 设为 `false` 表示软件解码和软件编码，设为 `true` 启用 VAAPI 硬件转码。`hardware_device` 留空时会规范化为 `/dev/dri/renderD128`，但仅在启用 VAAPI 时使用。旧字段 `hardware_decode` 仍可读取，保存后会自动迁移。
 
 VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接选择软件解码/缩放加 VAAPI 编码，避免先进入不支持的完整硬件管线。如果设备、驱动或 `h264_vaapi` 探测失败，服务会停止启动。
 

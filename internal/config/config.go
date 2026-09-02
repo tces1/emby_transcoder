@@ -3,7 +3,9 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -15,6 +17,7 @@ type Config struct {
 	Upstream  Upstream        `json:"upstream"`
 	Transcode Transcode       `json:"transcode"`
 	Clients   []ClientProfile `json:"clients"`
+	Path      string          `json:"-"`
 }
 
 type Server struct {
@@ -25,7 +28,7 @@ type Server struct {
 }
 
 type Upstream struct {
-	URL  string   `json:"url"`
+	URL  string   `json:"url,omitempty"`
 	URLs []string `json:"urls"`
 }
 
@@ -51,10 +54,52 @@ type Transcode struct {
 	IdleTimeout             time.Duration `json:"-"`
 }
 
+func (t Transcode) MarshalJSON() ([]byte, error) {
+	hardwareDecode := any(t.HardwareDecode)
+	switch strings.ToLower(strings.TrimSpace(t.HardwareDecode)) {
+	case "", "false", "none", "off":
+		hardwareDecode = false
+	case "vaapi":
+		hardwareDecode = true
+	}
+	return json.Marshal(struct {
+		Enabled                 bool   `json:"enabled"`
+		FFmpegPath              string `json:"ffmpeg_path"`
+		TempDir                 string `json:"temp_dir"`
+		HardwareAcceleration    any    `json:"hardware_acceleration"`
+		HardwareDevice          string `json:"hardware_device"`
+		MaxSessions             int    `json:"max_sessions"`
+		DownloadWorkers         int    `json:"download_workers"`
+		DownloadChunkMB         int    `json:"download_chunk_mb"`
+		DownloadBufferMB        int    `json:"download_buffer_mb"`
+		BufferPauseSeconds      int    `json:"buffer_pause_seconds"`
+		BufferResumeSeconds     int    `json:"buffer_resume_seconds"`
+		SegmentSeconds          int    `json:"segment_seconds"`
+		SegmentRetentionSeconds int    `json:"segment_retention_seconds"`
+		IdleTimeoutSeconds      int    `json:"idle_timeout_seconds"`
+	}{
+		Enabled:                 t.Enabled,
+		FFmpegPath:              t.FFmpegPath,
+		TempDir:                 t.TempDir,
+		HardwareAcceleration:    hardwareDecode,
+		HardwareDevice:          t.HardwareDevice,
+		MaxSessions:             t.MaxSessions,
+		DownloadWorkers:         t.DownloadWorkers,
+		DownloadChunkMB:         t.DownloadChunkMB,
+		DownloadBufferMB:        t.DownloadBufferMB,
+		BufferPauseSeconds:      t.BufferPauseSeconds,
+		BufferResumeSeconds:     t.BufferResumeSeconds,
+		SegmentSeconds:          t.SegmentSeconds,
+		SegmentRetentionSeconds: t.SegmentRetentionSeconds,
+		IdleTimeoutSeconds:      t.IdleTimeoutSeconds,
+	})
+}
+
 func (t *Transcode) UnmarshalJSON(data []byte) error {
 	type transcodeAlias Transcode
 	aux := struct {
-		HardwareDecode json.RawMessage `json:"hardware_decode"`
+		HardwareAcceleration json.RawMessage `json:"hardware_acceleration"`
+		HardwareDecode       json.RawMessage `json:"hardware_decode"`
 		*transcodeAlias
 	}{
 		transcodeAlias: (*transcodeAlias)(t),
@@ -62,23 +107,31 @@ func (t *Transcode) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	if len(aux.HardwareDecode) == 0 || string(aux.HardwareDecode) == "null" {
+	raw := aux.HardwareAcceleration
+	if len(raw) == 0 || string(raw) == "null" {
+		raw = aux.HardwareDecode
+	}
+	if len(raw) == 0 || string(raw) == "null" {
 		return nil
 	}
 	var text string
-	if err := json.Unmarshal(aux.HardwareDecode, &text); err == nil {
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if len(aux.HardwareAcceleration) > 0 {
+			return errors.New(`transcode.hardware_acceleration must be a boolean`)
+		}
 		t.HardwareDecode = text
 		return nil
 	}
 	var enabled bool
-	if err := json.Unmarshal(aux.HardwareDecode, &enabled); err == nil {
-		if !enabled {
+	if err := json.Unmarshal(raw, &enabled); err == nil {
+		if enabled {
+			t.HardwareDecode = "vaapi"
+		} else {
 			t.HardwareDecode = "false"
-			return nil
 		}
-		return errors.New(`transcode.hardware_decode boolean true is not supported; use "vaapi"`)
+		return nil
 	}
-	return errors.New(`transcode.hardware_decode must be a string or false`)
+	return errors.New(`transcode.hardware_acceleration must be a boolean`)
 }
 
 type ClientProfile struct {
@@ -99,6 +152,7 @@ func Default() Config {
 			Enabled:                 true,
 			FFmpegPath:              "/usr/bin/ffmpeg",
 			TempDir:                 "/var/lib/emby-transcoder/transcode",
+			HardwareDevice:          "/dev/dri/renderD128",
 			MaxSessions:             2,
 			DownloadWorkers:         1,
 			DownloadChunkMB:         8,
@@ -132,11 +186,78 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
-	normalize(&cfg)
-	if cfg.Upstream.URL == "" {
-		return Config{}, errors.New("upstream.url is required")
+	cfg.Path = path
+	if err := validateAndNormalize(&cfg); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func Parse(data []byte) (Config, error) {
+	cfg := Default()
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateAndNormalize(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func Save(path string, cfg Config) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("config path is not available")
+	}
+	if err := validateAndNormalize(&cfg); err != nil {
+		return err
+	}
+	persisted := cfg
+	if len(persisted.Upstream.URLs) > 0 {
+		persisted.Upstream.URL = ""
+	}
+	data, err := json.MarshalIndent(persisted, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	mode := os.FileMode(0o600)
+	if stat, statErr := os.Stat(path); statErr == nil {
+		mode = stat.Mode().Perm()
+	}
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".config-*.json")
+	if err == nil {
+		tempPath := temp.Name()
+		defer os.Remove(tempPath)
+		if chmodErr := temp.Chmod(mode); chmodErr == nil {
+			if _, writeErr := temp.Write(data); writeErr == nil {
+				if syncErr := temp.Sync(); syncErr == nil {
+					if closeErr := temp.Close(); closeErr == nil {
+						if renameErr := os.Rename(tempPath, path); renameErr == nil {
+							return nil
+						}
+					}
+				}
+			}
+		}
+		_ = temp.Close()
+	}
+	if err := os.WriteFile(path, data, mode); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+func validateAndNormalize(cfg *Config) error {
+	if len(cfg.Upstream.URLs) == 0 && cfg.Upstream.URL != "" {
+		cfg.Upstream.URLs = []string{cfg.Upstream.URL}
+	}
+	normalize(cfg)
+	if cfg.Upstream.URL == "" {
+		return errors.New("upstream.url is required")
+	}
+	return nil
 }
 
 func normalize(cfg *Config) {
@@ -171,7 +292,7 @@ func normalize(cfg *Config) {
 	}
 	cfg.Transcode.HardwareDecode = strings.ToLower(strings.TrimSpace(cfg.Transcode.HardwareDecode))
 	cfg.Transcode.HardwareDevice = strings.TrimSpace(cfg.Transcode.HardwareDevice)
-	if cfg.Transcode.HardwareDecode == "vaapi" && cfg.Transcode.HardwareDevice == "" {
+	if cfg.Transcode.HardwareDevice == "" {
 		cfg.Transcode.HardwareDevice = "/dev/dri/renderD128"
 	}
 	if cfg.Transcode.MaxSessions <= 0 {

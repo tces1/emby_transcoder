@@ -755,6 +755,60 @@ func TestReleaseClearsWorkerMetricsAndRejectsLateUpdates(t *testing.T) {
 	}
 }
 
+func TestRouteSnapshotsExplainCandidateDecisions(t *testing.T) {
+	data := bytes.Repeat([]byte("route-status"), 1024)
+	newOrigin := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+			writeRange(w, data, start, end)
+		}))
+	}
+	first := newOrigin()
+	defer first.Close()
+	second := newOrigin()
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:  2,
+		Origins:  []string{first.URL, second.URL},
+		CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.RegisterSource("item123", "Movie", 11, "https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+
+	snapshots := proxy.RouteSnapshots()
+	if len(snapshots) != 2 {
+		t.Fatalf("route snapshots = %+v", snapshots)
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.SessionID != "item123" ||
+			snapshot.GenerationID != 11 ||
+			!snapshot.Active ||
+			snapshot.State != "active" ||
+			snapshot.Entry == "" ||
+			snapshot.Final == "" {
+			t.Fatalf("route snapshot = %+v", snapshot)
+		}
+	}
+}
+
 func TestMergeAndDownsampleCacheRanges(t *testing.T) {
 	merged := mergeCacheRanges([]CacheRange{
 		{Start: 0, End: 9, State: "cached"},
@@ -956,6 +1010,45 @@ func TestRouteMovesTenChunksAheadAfterThreeHedgeLosses(t *testing.T) {
 	}
 }
 
+func TestFocusedRoutesAllowOneInFlightRequestPerURL(t *testing.T) {
+	src := &source{
+		urls:   []string{"https://route-a/video", "https://route-b/video"},
+		active: []string{"https://route-a/video", "https://route-b/video"},
+	}
+	releaseA, err := src.acquireRoute(context.Background(), src.active[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acquiredA := make(chan func(), 1)
+	go func() {
+		release, err := src.acquireRoute(context.Background(), src.active[0])
+		if err == nil {
+			acquiredA <- release
+		}
+	}()
+	select {
+	case release := <-acquiredA:
+		release()
+		t.Fatal("same URL accepted a second in-flight request")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	releaseB, err := src.acquireRoute(context.Background(), src.active[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseB()
+	releaseA()
+
+	select {
+	case release := <-acquiredA:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("waiting request did not acquire URL after release")
+	}
+}
+
 func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	data := bytes.Repeat([]byte("priority-routes"), 32*1024)
 	var firstRouteTaskOne atomic.Int32
@@ -1045,7 +1138,7 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	releaseSecond()
 }
 
-func TestSharedSessionDoesNotFallBackToSiblingRoute(t *testing.T) {
+func TestSharedSessionRebindsAfterFocusedRouteBecomesUnhealthy(t *testing.T) {
 	src := &source{
 		active:   []string{"route-a", "route-b"},
 		failures: []int{2, 0},
@@ -1054,8 +1147,8 @@ func TestSharedSessionDoesNotFallBackToSiblingRoute(t *testing.T) {
 	proxy := &Proxy{workers: 2, sources: map[string]*source{"one": src}}
 
 	attempts := proxy.routeAttempts(src, 0)
-	if len(attempts) != 1 || attempts[0] != 0 {
-		t.Fatalf("shared session attempts = %v, want only the assigned route", attempts)
+	if len(attempts) < 1 || attempts[0] != 1 {
+		t.Fatalf("shared session attempts = %v, want healthy replacement route first", attempts)
 	}
 }
 

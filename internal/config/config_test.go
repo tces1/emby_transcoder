@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"emby-transcoder/internal/config"
@@ -22,6 +23,9 @@ func TestDefaultConfigIsUsable(t *testing.T) {
 	}
 	if cfg.Transcode.FFmpegPath == "" {
 		t.Fatal("ffmpeg path should default")
+	}
+	if cfg.Transcode.HardwareDevice != "/dev/dri/renderD128" {
+		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
 	}
 	if cfg.Transcode.MaxSessions != 2 {
 		t.Fatalf("max sessions = %d", cfg.Transcode.MaxSessions)
@@ -71,6 +75,9 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	if cfg.Server.Listen != ":9000" {
 		t.Fatalf("listen = %q", cfg.Server.Listen)
 	}
+	if cfg.Path != path {
+		t.Fatalf("config path = %q", cfg.Path)
+	}
 	if cfg.Upstream.URL != "http://emby.local:8096" {
 		t.Fatalf("upstream url = %q", cfg.Upstream.URL)
 	}
@@ -111,6 +118,38 @@ func TestLoadMergesJSONOverDefaults(t *testing.T) {
 	}
 }
 
+func TestSaveAndParseConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Default()
+	cfg.Upstream.URLs = []string{"https://one.example/", "https://two.example"}
+	cfg.Server.DashboardPassword = "secret"
+
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := config.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Upstream.URLs) != 2 || parsed.Upstream.URL != "https://one.example" {
+		t.Fatalf("upstreams = %+v", parsed.Upstream)
+	}
+	if parsed.Server.DashboardPassword != "secret" {
+		t.Fatalf("dashboard password = %q", parsed.Server.DashboardPassword)
+	}
+	if strings.Contains(string(data), `"url":`) {
+		t.Fatalf("saved config contains redundant legacy upstream.url: %s", data)
+	}
+	if !strings.Contains(string(data), `"hardware_acceleration": false`) ||
+		strings.Contains(string(data), `"hardware_decode"`) {
+		t.Fatalf("disabled hardware decode was not saved as a boolean: %s", data)
+	}
+}
+
 func TestLoadSupportsVAAPIHardwareDecode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	err := os.WriteFile(path, []byte(`{
@@ -128,6 +167,9 @@ func TestLoadSupportsVAAPIHardwareDecode(t *testing.T) {
 
 	if cfg.Transcode.HardwareDecode != "vaapi" {
 		t.Fatalf("hardware decode = %q", cfg.Transcode.HardwareDecode)
+	}
+	if len(cfg.Upstream.URLs) != 1 || cfg.Upstream.URLs[0] != "http://emby.local:8096" {
+		t.Fatalf("legacy upstream url was not migrated: %+v", cfg.Upstream)
 	}
 	if cfg.Transcode.HardwareDevice != "/dev/dri/renderD128" {
 		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
@@ -151,5 +193,46 @@ func TestLoadSupportsBooleanFalseHardwareDecode(t *testing.T) {
 
 	if cfg.Transcode.HardwareDecode != "false" {
 		t.Fatalf("hardware decode = %q", cfg.Transcode.HardwareDecode)
+	}
+	if cfg.Transcode.HardwareDevice != "/dev/dri/renderD128" {
+		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
+	}
+}
+
+func TestSaveWritesVAAPIHardwareDecodeAsBooleanTrue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Default()
+	cfg.Transcode.HardwareDecode = "vaapi"
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"hardware_acceleration": true`) ||
+		strings.Contains(string(data), `"hardware_decode"`) {
+		t.Fatalf("VAAPI hardware decode was not saved as boolean true: %s", data)
+	}
+}
+
+func TestLoadSupportsBooleanTrueHardwareDecode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	err := os.WriteFile(path, []byte(`{
+		"upstream": {"urls": ["http://upstream.local"]},
+		"transcode": {"hardware_acceleration": true}
+	}`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Transcode.HardwareDecode != "vaapi" {
+		t.Fatalf("hardware decode = %q", cfg.Transcode.HardwareDecode)
+	}
+	if cfg.Transcode.HardwareDevice != "/dev/dri/renderD128" {
+		t.Fatalf("hardware device = %q", cfg.Transcode.HardwareDevice)
 	}
 }

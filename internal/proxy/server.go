@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"emby-transcoder/internal/config"
 	"emby-transcoder/internal/emby"
@@ -34,6 +36,9 @@ type Server struct {
 	transcodeManager *transcode.Manager
 	inputProxy       *inputproxy.Proxy
 	dashboard        *dashboardAuthStore
+	configPath       string
+	restartFunc      func()
+	restartOnce      sync.Once
 }
 
 var embyTokenPattern = regexp.MustCompile(`(?i)\btoken\s*=\s*"?([^",\s]+)"?`)
@@ -138,6 +143,8 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		transcodeManager: manager,
 		inputProxy:       acceleratedInput,
 		dashboard:        newDashboardAuthStore(),
+		configPath:       cfg.Path,
+		restartFunc:      func() { os.Exit(0) },
 	}, nil
 }
 
