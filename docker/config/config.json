@@ -2,6 +2,7 @@
   "server": {
     "listen": ":8097",
     "public_url": "",
+    "dashboard_password": "",
     "debug": false
   },
   "upstream": {
@@ -13,10 +14,11 @@
     "enabled": true,
     "ffmpeg_path": "/usr/bin/ffmpeg",
     "temp_dir": "/var/lib/emby-transcoder/transcode",
-    "hardware_decode": "",
+    "hardware_acceleration": false,
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
+    "download_mode": "parallel",
     "download_chunk_mb": 8,
     "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,

@@ -3,6 +3,7 @@ package transcode
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,10 +49,27 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "master.m3u8" {
 		logging.Infof("playlist request id=%s start_ticks=%d", id, startTimeTicksFromRawQuery(r.URL.RawQuery))
 		traceSwitch("playlist_request id=%s start_ticks=%d query=%s elapsed=%s", id, startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), time.Since(requestStarted))
-		if info, known := h.Manager.MediaInfo(id); known {
-			if playlist, ready := VirtualVODPlaylist(info, h.Manager.segmentTicks(), r.URL.RawQuery); ready {
-				logging.Infof("playlist virtual id=%s duration=%s", id, formatTicks(info.RunTimeTicks))
-				traceSwitch("playlist_virtual id=%s duration=%s start_ticks=%d query=%s media=%s elapsed=%s", id, formatTicks(info.RunTimeTicks), startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), info.Summary(), time.Since(requestStarted))
+		if info, known := h.Manager.MediaInfo(id); known && info.RunTimeTicks > 0 {
+			session, err := h.ensureFromRequest(id, r)
+			if err != nil {
+				h.writeEnsureError(w, id, err)
+				return
+			}
+			start, ready := h.Manager.PlaylistWindow(id)
+			if session != nil && ready == 0 {
+				firstSegment := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", start))
+				wait := h.startupWait()
+				if !waitForFile(r.Context(), firstSegment, wait) {
+					h.logWaitFailure(r.Context(), "first_segment", id, filepath.Base(firstSegment), wait, requestStarted)
+					http.Error(w, "first segment is not ready", http.StatusGatewayTimeout)
+					return
+				}
+				h.Manager.RecordSegmentReady(id, start)
+				start, ready = h.Manager.PlaylistWindow(id)
+			}
+			if playlist, ok := GrowingMediaPlaylist(info, h.Manager.segmentTicks(), r.URL.RawQuery, start, ready); ok {
+				logging.Infof("playlist growing id=%s duration=%s start=%d ready=%d", id, formatTicks(info.RunTimeTicks), start, ready)
+				traceSwitch("playlist_growing id=%s duration=%s start=%d ready=%d start_ticks=%d query=%s media=%s elapsed=%s", id, formatTicks(info.RunTimeTicks), start, ready, startTimeTicksFromRawQuery(r.URL.RawQuery), redactURLString("?"+r.URL.RawQuery), info.Summary(), time.Since(requestStarted))
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 				w.Header().Set("Cache-Control", "no-store")
 				_, _ = w.Write([]byte(playlist))
@@ -116,7 +134,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "master.m3u8" {
 		wait := h.startupWait()
 		if !waitForFile(r.Context(), filePath, wait) {
-			logging.Errorf("transcode playlist timeout id=%s wait=%s", id, wait)
+			h.logWaitFailure(r.Context(), "playlist", id, name, wait, requestStarted)
 			http.Error(w, "playlist is not ready", http.StatusGatewayTimeout)
 			return
 		}
@@ -125,9 +143,12 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasSuffix(name, ".ts") {
 		wait := h.startupWait()
 		if !waitForFile(r.Context(), filePath, wait) {
-			logging.Errorf("transcode segment timeout id=%s file=%s wait=%s", id, name, wait)
+			h.logWaitFailure(r.Context(), "segment", id, name, wait, requestStarted)
 			http.Error(w, "segment is not ready", http.StatusGatewayTimeout)
 			return
+		}
+		if index, ok := segmentIndexFromName(name); ok {
+			h.Manager.RecordSegmentReady(id, index)
 		}
 		traceSwitch("segment_file_ready id=%s file=%s path=%s elapsed=%s", id, name, filePath, time.Since(requestStarted))
 		w.Header().Set("Content-Type", "video/mp2t")
@@ -206,6 +227,40 @@ func (h Handler) startupWait() time.Duration {
 		return h.StartupWait
 	}
 	return 20 * time.Second
+}
+
+func (h Handler) ensureFromRequest(id string, r *http.Request) (*Session, error) {
+	inputURL := ""
+	if h.InputURLForID != nil {
+		inputURL = h.InputURLForID(id, r)
+	}
+	if inputURL == "" {
+		return nil, nil
+	}
+	return h.Manager.Ensure(id, requestFromHTTP(id, inputURL, r))
+}
+
+func (h Handler) writeEnsureError(w http.ResponseWriter, id string, err error) {
+	logging.Errorf("transcode start error id=%s err=%v", id, err)
+	if errors.Is(err, ErrTooManySessions) {
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
+func (h Handler) logWaitFailure(ctx context.Context, kind, id, name string, wait time.Duration, started time.Time) {
+	reason := "timeout"
+	if ctx.Err() != nil {
+		reason = "canceled"
+	}
+	elapsed := time.Since(started)
+	if name == "" {
+		logging.Errorf("transcode %s %s id=%s wait=%s elapsed=%s", kind, reason, id, wait, elapsed)
+	} else {
+		logging.Errorf("transcode %s %s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, elapsed)
+	}
+	traceSwitch("%s_%s id=%s file=%s wait=%s elapsed=%s", kind, reason, id, name, wait, elapsed)
 }
 
 func segmentReusable(session *Session, segmentIndex int, name string) bool {
@@ -313,10 +368,20 @@ func requestFromHTTP(id string, inputURL string, r *http.Request) Request {
 		ItemID:                  id,
 		MediaSourceID:           query.Get("MediaSourceId"),
 		PlaySessionID:           playSessionID,
+		UpstreamPlaySessionID:   playSessionIDFromURL(inputURL),
 		AudioStreamIndex:        int(int64Query(query.Get("AudioStreamIndex"))),
+		HasAudioStreamIndex:     query.Has("AudioStreamIndex"),
 		StartTimeTicks:          int64Query(query.Get("StartTimeTicks")),
 		RequestedStartTimeTicks: int64Query(query.Get("StartTimeTicks")),
 	}
+}
+
+func playSessionIDFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Query().Get("PlaySessionId")
 }
 
 func int64Query(raw string) int64 {
@@ -348,5 +413,5 @@ func waitForFile(ctx context.Context, path string, timeout time.Duration) bool {
 
 func fileExists(path string) bool {
 	stat, err := os.Stat(path)
-	return err == nil && !stat.IsDir()
+	return err == nil && !stat.IsDir() && stat.Size() > 0
 }

@@ -3,11 +3,16 @@ package inputproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,7 +29,7 @@ func TestProxyDownloadsRangesConcurrentlyAndInOrder(t *testing.T) {
 			return
 		}
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-		if start != 0 || end != 0 {
+		if !isProbeRequest(r) {
 			current := active.Add(1)
 			for {
 				seen := maxActive.Load()
@@ -77,32 +82,180 @@ func TestProxyDownloadsRangesConcurrentlyAndInOrder(t *testing.T) {
 	}
 }
 
+func TestFastRouteHedgesBlockingChunkFromSlowRoute(t *testing.T) {
+	const chunkSize = 1024
+	data := bytes.Repeat([]byte("hedged-download-"), 512)
+	var fastHedged atomic.Bool
+
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if start == chunkSize {
+			fastHedged.Store(true)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer fast.Close()
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if start == chunkSize {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer slow.Close()
+
+	proxy := &Proxy{
+		client:         http.DefaultClient,
+		workers:        2,
+		chunkSize:      chunkSize,
+		prefetchChunks: 4,
+		slots:          make(chan struct{}, 2),
+		origins:        []*url.URL{{Scheme: "http", Host: "fast"}, {Scheme: "http", Host: "slow"}},
+		sources:        make(map[string]*source),
+		metrics:        make([]workerMetric, 2),
+	}
+	src := &source{
+		rawURL:      fast.URL,
+		headers:     make(http.Header),
+		active:      []string{fast.URL, slow.URL},
+		failures:    []int{0, 0},
+		finalHosts:  []string{"fast", "slow"},
+		cacheChunks: make(map[int64]*cacheChunk),
+	}
+	src.dedicated.Store(-1)
+	if err := src.prepareCache(t.TempDir(), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	defer src.closeCache()
+
+	var output bytes.Buffer
+	if err := proxy.streamRanges(context.Background(), &output, src, metadata{size: int64(len(data))}, 0, int64(len(data)-1)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatalf("hedged body differs: got=%d want=%d", output.Len(), len(data))
+	}
+	if !fastHedged.Load() {
+		t.Fatal("fast route did not duplicate the blocking chunk from the slow route")
+	}
+}
+
+func TestRunningStreamActivatesSecondWorkerWhenRouteBecomesReady(t *testing.T) {
+	const chunkSize = 16 << 10
+	data := bytes.Repeat([]byte("dynamic-second-worker"), 64*1024)
+	var firstRequests atomic.Int32
+	var secondRequests atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		firstRequests.Add(1)
+		time.Sleep(5 * time.Millisecond)
+		writeRange(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		secondRequests.Add(1)
+		writeRange(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy := &Proxy{
+		client:         http.DefaultClient,
+		workers:        2,
+		mode:           DownloadModeParallel,
+		chunkSize:      chunkSize,
+		prefetchChunks: 4,
+		slots:          make(chan struct{}, 2),
+		origins:        []*url.URL{{Scheme: "http", Host: "first"}, {Scheme: "http", Host: "second"}},
+		sources:        make(map[string]*source),
+		metrics:        make([]workerMetric, 2),
+	}
+	src := &source{
+		rawURL:      first.URL,
+		headers:     make(http.Header),
+		urls:        []string{first.URL, second.URL},
+		active:      []string{first.URL},
+		finalHosts:  []string{routeHost(first.URL)},
+		failures:    []int{0},
+		cacheChunks: make(map[int64]*cacheChunk),
+	}
+	src.dedicated.Store(-1)
+	if err := src.prepareCache(t.TempDir(), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	defer src.closeCache()
+
+	var output bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.streamRanges(context.Background(), &output, src, metadata{size: int64(len(data))}, 0, int64(len(data)-1))
+	}()
+	deadline := time.Now().Add(time.Second)
+	for firstRequests.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	src.acceptRoute(second.URL, routeHost(second.URL), -1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not finish")
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatalf("dynamic worker body differs: got=%d want=%d", output.Len(), len(data))
+	}
+	if secondRequests.Load() == 0 {
+		t.Fatal("second worker did not receive tasks after its route became ready")
+	}
+}
+
 func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	data := bytes.Repeat([]byte("two-origin-media"), 32*1024)
 	var firstChunks atomic.Int32
 	var secondChunks atomic.Int32
-	var thirdChunks atomic.Int32
+	var thirdRequests atomic.Int32
 	newOrigin := func(counter *atomic.Int32) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				counter.Add(1)
 			}
 			writeRange(w, data, start, end)
 		}))
 	}
+	canceled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(8 * time.Second):
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer canceled.Close()
 	first := newOrigin(&firstChunks)
 	defer first.Close()
 	second := newOrigin(&secondChunks)
 	defer second.Close()
-	third := newOrigin(&thirdChunks)
+	third := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		thirdRequests.Add(1)
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
 	defer third.Close()
 
 	proxy, err := New(Options{
 		Workers:    2,
 		ChunkSize:  32 << 10,
 		BufferSize: 64 << 10,
-		Origins:    []string{first.URL, second.URL, third.URL},
+		Origins:    []string{canceled.URL, first.URL, second.URL, third.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +266,7 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -129,8 +283,1051 @@ func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
 		t.Fatalf("chunks were not distributed across both origins: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
 	}
-	if thirdChunks.Load() != 0 {
-		t.Fatalf("standby third origin received %d chunks", thirdChunks.Load())
+	if thirdRequests.Load() != 0 {
+		t.Fatalf("standby third origin received %d requests", thirdRequests.Load())
+	}
+}
+
+func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
+	data := bytes.Repeat([]byte("fingerprinted-media"), 32*1024)
+	var firstChunks atomic.Int32
+	var secondChunks atomic.Int32
+	newOrigin := func(counter *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+			if !isProbeRequest(r) {
+				counter.Add(1)
+			}
+			writeRangeWithoutValidator(w, data, start, end)
+		}))
+	}
+	first := newOrigin(&firstChunks)
+	defer first.Close()
+	second := newOrigin(&secondChunks)
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("fingerprinted body differs: got=%d want=%d", len(body), len(data))
+	}
+	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
+		t.Fatalf("fingerprinted routes were not both used: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
+	}
+}
+
+func TestFailoverModeUsesOneRouteUntilItBecomesUnhealthy(t *testing.T) {
+	data := bytes.Repeat([]byte("failover-mode"), 16*1024)
+	var primaryChunks atomic.Int32
+	var primaryProbes atomic.Int32
+	var standbyChunks atomic.Int32
+	var replacementProbes atomic.Int32
+	var replacementReady atomic.Bool
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if !isProbeRequest(r) {
+			primaryChunks.Add(1)
+			http.Error(w, "primary failed", http.StatusServiceUnavailable)
+			return
+		}
+		primaryProbes.Add(1)
+		writeRange(w, data, start, end)
+	}))
+	defer primary.Close()
+	standby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			time.Sleep(25 * time.Millisecond)
+		} else {
+			standbyChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer standby.Close()
+	replacement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !replacementReady.Load() {
+			http.Error(w, "replacement not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			replacementProbes.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer replacement.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		Mode:       DownloadModeFailover,
+		ChunkSize:  16 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{primary.URL, standby.URL, replacement.URL},
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+	var activeRoutes, standbyRoutes int
+	for _, snapshot := range proxy.RouteSnapshots() {
+		switch snapshot.State {
+		case "active":
+			activeRoutes++
+		case "standby":
+			standbyRoutes++
+		}
+	}
+	if activeRoutes != 1 || standbyRoutes != 1 {
+		t.Fatalf("failover route states active=%d standby=%d", activeRoutes, standbyRoutes)
+	}
+	replacementReady.Store(true)
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("failover body differs: got=%d want=%d", len(body), len(data))
+	}
+	if primaryChunks.Load() != 1 {
+		t.Fatalf("primary failures = %d, want immediate failover", primaryChunks.Load())
+	}
+	if standbyChunks.Load() == 0 {
+		t.Fatal("standby route was not activated after primary became unhealthy")
+	}
+	deadline := time.Now().Add(time.Second)
+	for primaryProbes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if primaryProbes.Load() < 2 {
+		t.Fatal("standby replenishment did not restart probing from the first URL")
+	}
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		activeRoutes, standbyRoutes = 0, 0
+		for _, snapshot := range proxy.RouteSnapshots() {
+			switch snapshot.State {
+			case "active":
+				activeRoutes++
+			case "standby":
+				standbyRoutes++
+			}
+		}
+		if activeRoutes == 1 && standbyRoutes == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("replacement route did not become standby: %+v", proxy.RouteSnapshots())
+}
+
+func TestParallelModeReplenishesFailedFocusedRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("parallel-replenish"), 2048)
+	var primaryProbes atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			primaryProbes.Add(1)
+			writeRange(w, data, start, end)
+			return
+		}
+		http.Error(w, "temporary primary failure", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer backup.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		Mode:       DownloadModeParallel,
+		ChunkSize:  16 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{primary.URL, backup.URL},
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+	src.metaMu.Lock()
+	meta := *src.meta
+	src.metaMu.Unlock()
+
+	chunk, err := proxy.fetchRange(context.Background(), src, meta, byteRange{start: 0, end: 16383, urlIndex: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(chunk, data[:16384]) {
+		t.Fatal("parallel fallback returned different data")
+	}
+	deadline := time.Now().Add(time.Second)
+	for primaryProbes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if primaryProbes.Load() < 2 {
+		t.Fatal("parallel mode did not restart replenishment from the first URL")
+	}
+}
+
+func TestProxyServesAfterFirstRouteBeforeSecondProbeCompletes(t *testing.T) {
+	data := bytes.Repeat([]byte("first-route-first"), 32*1024)
+	releaseSecond := make(chan struct{})
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseSecond
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("first-route GET waited %s for the second probe", time.Since(started))
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("early body differs: got=%d want=%d", len(body), len(data))
+	}
+
+	close(releaseSecond)
+	waitForRouteExpansion(t, registeredSource(t, proxy, localURL))
+	src := registeredSource(t, proxy, localURL)
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 2 {
+		t.Fatalf("active final hosts = %v", got)
+	}
+}
+
+func TestProxyDefersFingerprintUntilSecondRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("fingerprint-later"), 32*1024)
+	var firstRanges []string
+	var firstMu sync.Mutex
+	releaseSecond := make(chan struct{})
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstMu.Lock()
+		firstRanges = append(firstRanges, r.Header.Get("Range"))
+		firstMu.Unlock()
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseSecond
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Head(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	firstMu.Lock()
+	probeCount := 0
+	for _, value := range firstRanges {
+		if strings.HasPrefix(value, "bytes=0-") && isProbeRange(value) {
+			probeCount++
+		}
+	}
+	firstMu.Unlock()
+	if probeCount != 1 {
+		t.Fatalf("first-route probe ranges before second line = %v", firstRanges)
+	}
+
+	close(releaseSecond)
+	waitForRouteExpansion(t, registeredSource(t, proxy, localURL))
+	src := registeredSource(t, proxy, localURL)
+	if !src.meta.hasFingerprint {
+		t.Fatal("expected fingerprint after adopting the second route")
+	}
+	if len(src.active) != 2 {
+		t.Fatalf("active routes = %v", src.active)
+	}
+}
+
+func TestProxyExpandsSecondRouteWithoutWaitingOnCanceledEntrance(t *testing.T) {
+	data := bytes.Repeat([]byte("expand-past-canceled"), 32*1024)
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	canceled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(8 * time.Second):
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer canceled.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{canceled.URL, first.URL, second.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	src := probeRegisteredSource(t, proxy, localURL)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("second-route expand waited %s on canceled entrance", elapsed)
+	}
+	hosts := uniqueRouteHosts(src.active, src.finalHosts)
+	if len(hosts) != 2 {
+		t.Fatalf("active final hosts = %v", hosts)
+	}
+	canceledHost := canonicalHost(routeHost(canceled.URL))
+	for _, host := range hosts {
+		if canonicalHost(host) == canceledHost {
+			t.Fatalf("canceled entrance was kept as a download route: %v", hosts)
+		}
+	}
+}
+
+func TestRemainingCandidatesDeprioritizesLaunchedEntrances(t *testing.T) {
+	got := remainingCandidates(
+		[]string{"tv", "media1", "media2", "media3"},
+		[]string{"media1"},
+		[]string{"tv", "media1"},
+	)
+	want := []string{"media2", "media3", "tv"}
+	if len(got) != len(want) {
+		t.Fatalf("remaining = %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("remaining = %v want %v", got, want)
+		}
+	}
+}
+
+func TestProxyFirstRouteProbeUsesSizeRangeAndIgnoresBody(t *testing.T) {
+	data := bytes.Repeat([]byte("size-probe-body"), 16*1024)
+	var ranges []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		ranges = append(ranges, rangeHeader)
+		mu.Unlock()
+		if rangeHeader == sizeProbeRange {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusPartialContent)
+			return
+		}
+		start, end := requestedBounds(t, rangeHeader, int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{Workers: 1, ChunkSize: 16 << 10, BufferSize: 32 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	foundSizeProbe := false
+	for _, value := range ranges {
+		if value == sizeProbeRange {
+			foundSizeProbe = true
+		}
+		if strings.HasPrefix(value, "bytes=0-") && value != sizeProbeRange && isProbeRange(value) {
+			t.Fatalf("first-route probe still requested a 64KiB sample: %v", ranges)
+		}
+	}
+	if !foundSizeProbe {
+		t.Fatalf("expected %s size probe, ranges=%v", sizeProbeRange, ranges)
+	}
+}
+
+func TestProxyFirstRouteProbeDoesNotHoldDownloadSlot(t *testing.T) {
+	data := bytes.Repeat([]byte("slot-free-probe"), 16*1024)
+	blockBody := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == sizeProbeRange {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusPartialContent)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-blockBody
+			return
+		}
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+	defer close(blockBody)
+
+	proxy, err := New(Options{Workers: 1, ChunkSize: 16 << 10, BufferSize: 32 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	started := time.Now()
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("download waited %s for a blocked size-probe body", time.Since(started))
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
+	}
+}
+
+func TestProxyCachesCompletedChunksInSparseFile(t *testing.T) {
+	data := bytes.Repeat([]byte("disk-backed-cache"), 32*1024)
+	var chunkRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			chunkRequests.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	cacheDir := t.TempDir()
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		CacheDir:   cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+
+	readRange := func() []byte {
+		req, err := http.NewRequest(http.MethodGet, localURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Range", "bytes=0-65535")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	if body := readRange(); !bytes.Equal(body, data[:65536]) {
+		t.Fatal("first cached range differs")
+	}
+	firstRequests := chunkRequests.Load()
+	if body := readRange(); !bytes.Equal(body, data[:65536]) {
+		t.Fatal("second cached range differs")
+	}
+	if chunkRequests.Load() != firstRequests {
+		t.Fatalf("cached range was downloaded again: before=%d after=%d", firstRequests, chunkRequests.Load())
+	}
+
+	src.cacheMu.Lock()
+	cachePath := src.cachePath
+	src.cacheMu.Unlock()
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(len(data)) {
+		t.Fatalf("sparse cache size=%d want=%d", info.Size(), len(data))
+	}
+	release()
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("cache file was not removed: %v", err)
+	}
+}
+
+func TestProxyCacheSnapshotsReportsCachedBytes(t *testing.T) {
+	data := bytes.Repeat([]byte("cache-snapshot"), 16*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  16 << 10,
+		BufferSize: 32 << 10,
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.RegisterSource("sess-chart", "Snapshot Movie", 7, upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	req, err := http.NewRequest(http.MethodGet, localURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-32767")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data[:32768]) {
+		t.Fatal("downloaded range differs")
+	}
+
+	snapshots := proxy.CacheSnapshots()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots = %+v", snapshots)
+	}
+	snap := snapshots[0]
+	if snap.SessionID != "sess-chart" || snap.GenerationID != 7 || snap.Size != int64(len(data)) || snap.CachedBytes < 32768 {
+		t.Fatalf("cache snapshot = %+v", snap)
+	}
+	for _, worker := range proxy.Snapshot() {
+		if worker.TotalBytes > 0 && worker.GenerationID != 7 {
+			t.Fatalf("worker generation = %d, want 7", worker.GenerationID)
+		}
+	}
+	if len(snap.Ranges) == 0 || snap.Ranges[0].State != "cached" || snap.Ranges[0].Start != 0 {
+		t.Fatalf("cache ranges = %+v", snap.Ranges)
+	}
+}
+
+func TestReleaseClearsWorkerMetricsAndRejectsLateUpdates(t *testing.T) {
+	proxy, err := New(Options{Workers: 2, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+
+	localURL, release, err := proxy.RegisterSource("item123", "Movie", 9, "https://example.com/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Trim(parsed.Path, "/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+
+	lease := proxy.beginWorker("downloading", src, src.rawURL, "bytes=0-1023")
+	proxy.addWorkerBytes(lease, 512)
+	release()
+	proxy.endWorker(lease, 1024, false, src.rawURL)
+	proxy.addWorkerBytes(lease, 512)
+
+	snapshot := proxy.Snapshot()[lease.index]
+	if snapshot.State != "idle" ||
+		snapshot.SessionID != "" ||
+		snapshot.GenerationID != 0 ||
+		snapshot.VideoName != "" ||
+		snapshot.Route != "" ||
+		snapshot.ByteRange != "" ||
+		snapshot.DownloadBPS != 0 ||
+		snapshot.TotalBytes != 0 {
+		t.Fatalf("released worker retained stale metrics: %+v", snapshot)
+	}
+}
+
+func TestRouteSnapshotsExplainCandidateDecisions(t *testing.T) {
+	data := bytes.Repeat([]byte("route-status"), 1024)
+	newOrigin := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+			writeRange(w, data, start, end)
+		}))
+	}
+	first := newOrigin()
+	defer first.Close()
+	second := newOrigin()
+	defer second.Close()
+
+	proxy, err := New(Options{
+		Workers:  2,
+		Origins:  []string{first.URL, second.URL},
+		CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.RegisterSource("item123", "Movie", 11, "https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+
+	snapshots := proxy.RouteSnapshots()
+	if len(snapshots) != 2 {
+		t.Fatalf("route snapshots = %+v", snapshots)
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.SessionID != "item123" ||
+			snapshot.GenerationID != 11 ||
+			!snapshot.Active ||
+			snapshot.State != "active" ||
+			snapshot.Entry == "" ||
+			snapshot.Final == "" {
+			t.Fatalf("route snapshot = %+v", snapshot)
+		}
+	}
+	bound := make(map[string]struct{})
+	for _, worker := range proxy.Snapshot() {
+		if worker.BoundEntry == "" || worker.BoundFinal == "" {
+			t.Fatalf("worker binding = %+v", worker)
+		}
+		bound[worker.BoundEntry] = struct{}{}
+	}
+	if len(bound) != 2 {
+		t.Fatalf("workers are not bound to distinct entries: %+v", proxy.Snapshot())
+	}
+}
+
+func TestMergeAndDownsampleCacheRanges(t *testing.T) {
+	merged := mergeCacheRanges([]CacheRange{
+		{Start: 0, End: 9, State: "cached"},
+		{Start: 10, End: 19, State: "cached"},
+		{Start: 30, End: 39, State: "downloading"},
+	})
+	if len(merged) != 2 || merged[0].End != 19 || merged[1].State != "downloading" {
+		t.Fatalf("merged = %+v", merged)
+	}
+
+	var ranges []CacheRange
+	for i := 0; i < 200; i++ {
+		if i >= 80 && i < 120 {
+			continue
+		}
+		start := int64(i * 10)
+		ranges = append(ranges, CacheRange{Start: start, End: start + 4, State: "cached"})
+	}
+	downsampled := downsampleCacheRanges(ranges, 2000, 40)
+	if len(downsampled) != 2 {
+		t.Fatalf("downsampled = %+v", downsampled)
+	}
+	if downsampled[0].Start != 0 || downsampled[1].End < 1990 {
+		t.Fatalf("downsampled = %+v", downsampled)
+	}
+}
+
+func TestProxyRemovesStaleCacheFilesOnStartup(t *testing.T) {
+	cacheDir := t.TempDir()
+	stale := filepath.Join(cacheDir, "input-stale.cache")
+	unrelated := filepath.Join(cacheDir, "keep.txt")
+	if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unrelated, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := New(Options{Workers: 1, CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale cache was not removed: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file was removed: %v", err)
+	}
+}
+
+func TestProxyUsesStandbyWhenFirstBatchCannotFillWorkers(t *testing.T) {
+	data := bytes.Repeat([]byte("second-worker-standby"), 32*1024)
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer second.Close()
+	var standbyRequests atomic.Int32
+	standby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		standbyRequests.Add(1)
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRangeWithoutValidator(w, data, start, end)
+	}))
+	defer standby.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{first.URL, second.URL, standby.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("body differs: got=%d want=%d", len(body), len(data))
+	}
+	if standbyRequests.Load() == 0 {
+		t.Fatal("expected standby route to fill the second worker")
+	}
+}
+
+func TestProxyRetriesTransientChunkFailure(t *testing.T) {
+	data := bytes.Repeat([]byte("retryable-chunk"), 32*1024)
+	var attempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) && attempts.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+			return
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Options{
+		Workers:    1,
+		ChunkSize:  32 << 10,
+		BufferSize: 32 << 10,
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register(upstream.URL+"/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	req, err := http.NewRequest(http.MethodGet, localURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-32767")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data[:32768]) || attempts.Load() < 2 {
+		t.Fatalf("retry body=%d attempts=%d", len(body), attempts.Load())
+	}
+}
+
+func TestCanceledRangeDoesNotPenalizeRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("canceled request should not reach upstream")
+	}))
+	defer upstream.Close()
+
+	src := &source{
+		rawURL:   upstream.URL,
+		headers:  make(http.Header),
+		active:   []string{upstream.URL},
+		failures: []int{1},
+	}
+	src.dedicated.Store(-1)
+	proxy := &Proxy{
+		client:  http.DefaultClient,
+		workers: 1,
+		sources: map[string]*source{"one": src},
+		metrics: make([]workerMetric, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := proxy.fetchRange(ctx, src, metadata{size: 1024}, byteRange{start: 0, end: 1023})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetch error = %v, want context canceled", err)
+	}
+
+	src.routeMu.Lock()
+	failures := src.failures[0]
+	src.routeMu.Unlock()
+	if failures != 1 {
+		t.Fatalf("route failures = %d, want unchanged count 1", failures)
+	}
+}
+
+func TestRouteMovesTenChunksAheadAfterThreeHedgeLosses(t *testing.T) {
+	src := &source{active: []string{"fast", "slow"}}
+
+	for range hedgeLossThreshold {
+		src.recordHedgeResult(1, true)
+	}
+	if got := src.hedgeOffset(1); got != hedgeChunkOffset {
+		t.Fatalf("hedge offset = %d, want %d", got, hedgeChunkOffset)
+	}
+
+	src.recordHedgeResult(1, false)
+	if got := src.hedgeOffset(1); got != 0 {
+		t.Fatalf("hedge offset after success = %d, want 0", got)
+	}
+}
+
+func TestFocusedRoutesAllowOneInFlightRequestPerURL(t *testing.T) {
+	src := &source{
+		urls:   []string{"https://route-a/video", "https://route-b/video"},
+		active: []string{"https://route-a/video", "https://route-b/video"},
+	}
+	releaseA, err := src.acquireRoute(context.Background(), src.active[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acquiredA := make(chan func(), 1)
+	go func() {
+		release, err := src.acquireRoute(context.Background(), src.active[0])
+		if err == nil {
+			acquiredA <- release
+		}
+	}()
+	select {
+	case release := <-acquiredA:
+		release()
+		t.Fatal("same URL accepted a second in-flight request")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	releaseB, err := src.acquireRoute(context.Background(), src.active[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseB()
+	releaseA()
+
+	select {
+	case release := <-acquiredA:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("waiting request did not acquire URL after release")
 	}
 }
 
@@ -143,7 +1340,7 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	newOrigin := func(taskOne, taskTwo *atomic.Int32) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				switch r.URL.Path {
 				case "/task-one.mkv":
 					taskOne.Add(1)
@@ -179,6 +1376,8 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer releaseSecond()
+	probeRegisteredSource(t, proxy, firstURL)
+	probeRegisteredSource(t, proxy, secondURL)
 
 	var wg sync.WaitGroup
 	errorsByRequest := make(chan error, 2)
@@ -219,17 +1418,19 @@ func TestProxyAssignsTwoSessionsToSeparatePriorityRoutes(t *testing.T) {
 	}
 
 	releaseSecond()
-	resp, err := http.Get(firstURL)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestSharedSessionRebindsAfterFocusedRouteBecomesUnhealthy(t *testing.T) {
+	src := &source{
+		active:   []string{"route-a", "route-b"},
+		failures: []int{2, 0},
 	}
-	_, err = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if secondRouteTaskOne.Load() == 0 {
-		t.Fatal("remaining session did not return to dual-route mode")
+	src.dedicated.Store(-1)
+	proxy := &Proxy{workers: 2, sources: map[string]*source{"one": src}}
+
+	attempts := proxy.routeAttempts(src, 0)
+	if len(attempts) < 1 || attempts[0] != 1 {
+		t.Fatalf("shared session attempts = %v, want healthy replacement route first", attempts)
 	}
 }
 
@@ -267,7 +1468,7 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 				return
 			}
 			start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-			if start != 0 || end != 0 {
+			if !isProbeRequest(r) {
 				counter.Add(1)
 			}
 			writeRange(w, data, start, end)
@@ -305,6 +1506,7 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 		t.Fatal(err)
 	}
 	defer release()
+	probeRegisteredSource(t, proxy, localURL)
 
 	resp, err := http.Get(localURL)
 	if err != nil {
@@ -320,6 +1522,125 @@ func TestProxyDistributesChunksAcrossEntrancesThatRedirectToMediaHosts(t *testin
 	}
 	if firstChunks.Load() == 0 || secondChunks.Load() == 0 {
 		t.Fatalf("redirected chunks were not distributed: first=%d second=%d", firstChunks.Load(), secondChunks.Load())
+	}
+}
+
+func TestProxySkipsSharedFinalHostAndUsesNextDistinctRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("distinct-final-hosts"), 32*1024)
+	var sharedChunks atomic.Int32
+	var distinctChunks atomic.Int32
+	var unusedRequests atomic.Int32
+	sharedMedia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			sharedChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer sharedMedia.Close()
+	distinctMedia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !isProbeRequest(r) {
+			distinctChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer distinctMedia.Close()
+	newEntrance := func(mediaURL string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, mediaURL+r.URL.RequestURI(), http.StatusFound)
+		}))
+	}
+	firstEntrance := newEntrance(sharedMedia.URL)
+	defer firstEntrance.Close()
+	duplicateEntrance := newEntrance(sharedMedia.URL)
+	defer duplicateEntrance.Close()
+	distinctEntrance := newEntrance(distinctMedia.URL)
+	defer distinctEntrance.Close()
+	unused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unusedRequests.Add(1)
+		http.Error(w, "unused", http.StatusServiceUnavailable)
+	}))
+	defer unused.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		ChunkSize:  32 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{firstEntrance.URL, duplicateEntrance.URL, distinctEntrance.URL, unused.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	src := probeRegisteredSource(t, proxy, localURL)
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("shared-line body differs: got=%d want=%d", len(body), len(data))
+	}
+	if sharedChunks.Load() == 0 || distinctChunks.Load() == 0 {
+		t.Fatalf("distinct final hosts were not both used: shared=%d distinct=%d", sharedChunks.Load(), distinctChunks.Load())
+	}
+	if unusedRequests.Load() != 0 {
+		t.Fatalf("standby origin received %d requests after two distinct lines were found", unusedRequests.Load())
+	}
+
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 2 {
+		t.Fatalf("active final hosts = %v", got)
+	}
+}
+
+func TestProxyKeepsSingleRouteWhenEntrancesShareAFinalHost(t *testing.T) {
+	data := bytes.Repeat([]byte("shared-final-host"), 32*1024)
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer media.Close()
+	newEntrance := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, media.URL+r.URL.RequestURI(), http.StatusFound)
+		}))
+	}
+	first := newEntrance()
+	defer first.Close()
+	second := newEntrance()
+	defer second.Close()
+
+	proxy, err := New(Options{Workers: 2, Origins: []string{first.URL, second.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	src := &source{
+		rawURL:  "https://original.invalid/video.mp4",
+		headers: make(http.Header),
+		urls:    []string{first.URL, second.URL},
+	}
+	_, supported, err := proxy.sourceMetadata(context.Background(), src)
+	if err != nil || !supported {
+		t.Fatalf("metadata supported=%t err=%v", supported, err)
+	}
+	waitForRouteExpansion(t, src)
+	if len(src.active) != 1 {
+		t.Fatalf("active routes = %v", src.active)
+	}
+	if got := uniqueRouteHosts(src.active, src.finalHosts); len(got) != 1 {
+		t.Fatalf("final hosts = %v", got)
 	}
 }
 
@@ -374,7 +1695,7 @@ func TestProxyBoundsPrefetchWindowWhenFirstChunkIsSlow(t *testing.T) {
 	var started atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
-		if start != 0 || end != 0 {
+		if !isProbeRequest(r) {
 			started.Add(1)
 		}
 		if start == 0 && end == chunkSize-1 {
@@ -415,13 +1736,13 @@ func TestProxyBoundsPrefetchWindowWhenFirstChunkIsSlow(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(time.Second)
-	for started.Load() < 2 && time.Now().Before(deadline) {
+	for started.Load() < 4 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(25 * time.Millisecond)
-	if got := started.Load(); got != 2 {
+	if got := started.Load(); got != 4 {
 		close(firstChunkGate)
-		t.Fatalf("prefetch window started %d chunks, want 2", got)
+		t.Fatalf("prefetch window started %d chunks, want 4", got)
 	}
 	close(firstChunkGate)
 	select {
@@ -555,7 +1876,7 @@ func TestProxyRejectsChangedRepresentation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
 		etag := `"version-2"`
-		if start == 0 && end == 0 {
+		if isProbeRequest(r) {
 			etag = `"version-1"`
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
@@ -612,7 +1933,8 @@ func TestProxyExcludesOriginWithDifferentRepresentation(t *testing.T) {
 	if err != nil || !supported {
 		t.Fatalf("metadata supported=%t err=%v", supported, err)
 	}
-	if len(src.active) != 1 || src.active[0] != first.URL {
+	waitForRouteExpansion(t, src)
+	if len(src.active) != 1 {
 		t.Fatalf("active routes = %v", src.active)
 	}
 }
@@ -704,6 +2026,65 @@ func requestedBounds(t *testing.T, value string, size int64) (int64, int64) {
 	return start, end
 }
 
+func isProbeRequest(r *http.Request) bool {
+	return isProbeRange(r.Header.Get("Range"))
+}
+
+func isProbeRange(value string) bool {
+	raw := strings.TrimPrefix(value, "bytes=")
+	parts := strings.SplitN(raw, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	start, startErr := strconv.ParseInt(parts[0], 10, 64)
+	end, endErr := strconv.ParseInt(parts[1], 10, 64)
+	if startErr != nil || endErr != nil {
+		return false
+	}
+	if start == 0 && end == 0 {
+		return true
+	}
+	return end-start+1 == probeSampleSize
+}
+
+func registeredSource(t *testing.T, proxy *Proxy, localURL string) *source {
+	t.Helper()
+	token := strings.TrimPrefix(localURL, proxy.baseURL+"/")
+	proxy.mu.RLock()
+	src := proxy.sources[token]
+	proxy.mu.RUnlock()
+	if src == nil {
+		t.Fatal("registered source not found")
+	}
+	return src
+}
+
+func waitForRouteExpansion(t *testing.T, src *source) {
+	t.Helper()
+	if src == nil || src.expandDone == nil {
+		return
+	}
+	select {
+	case <-src.expandDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for additional download routes")
+	}
+}
+
+func probeRegisteredSource(t *testing.T, proxy *Proxy, localURL string) *source {
+	t.Helper()
+	src := registeredSource(t, proxy, localURL)
+	resp, err := http.Head(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	waitForRouteExpansion(t, src)
+	return src
+}
+
 func writeRange(w http.ResponseWriter, data []byte, start, end int64) {
 	if end >= int64(len(data)) {
 		end = int64(len(data)) - 1
@@ -713,6 +2094,18 @@ func writeRange(w http.ResponseWriter, data []byte, start, end int64) {
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.Header().Set("ETag", `"test-etag"`)
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(data[start : end+1])
+}
+
+func writeRangeWithoutValidator(w http.ResponseWriter, data []byte, start, end int64) {
+	if end >= int64(len(data)) {
+		end = int64(len(data)) - 1
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(data[start : end+1])
 }

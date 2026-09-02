@@ -47,20 +47,22 @@ func TestFailoverTransportSwitchesAndKeepsHealthyRoute(t *testing.T) {
 	}
 }
 
-func TestFailoverTransportDoesNotReplayPlaybackInfoPost(t *testing.T) {
+func TestFailoverTransportReplaysPlaybackInfoPostWhenBodyCanBeReplayed(t *testing.T) {
 	routes := []*url.URL{
 		mustParseUpstreamURL(t, "https://primary.example"),
 		mustParseUpstreamURL(t, "https://backup.example"),
 	}
 	var backupBody string
+	var hosts []string
 	base := failoverRoundTripper(func(req *http.Request) (*http.Response, error) {
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			return nil, err
 		}
 		_ = req.Body.Close()
+		hosts = append(hosts, req.URL.Host)
 		if req.URL.Host == "primary.example" {
-			return failoverResponse(http.StatusBadGateway, "bad gateway"), nil
+			return nil, errors.New("EOF")
 		}
 		backupBody = string(body)
 		return failoverResponse(http.StatusOK, "ok"), nil
@@ -76,8 +78,11 @@ func TestFailoverTransportDoesNotReplayPlaybackInfoPost(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway || backupBody != "" {
-		t.Fatalf("status=%d backup body=%q", resp.StatusCode, backupBody)
+	if resp.StatusCode != http.StatusOK || backupBody != "request-body" {
+		t.Fatalf("status=%d backup body=%q hosts=%v", resp.StatusCode, backupBody, hosts)
+	}
+	if got := strings.Join(hosts, ","); got != "primary.example,backup.example" {
+		t.Fatalf("attempted hosts = %s", got)
 	}
 }
 

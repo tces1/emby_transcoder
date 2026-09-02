@@ -58,9 +58,17 @@ func TestBuildFFmpegArgsAppliesLocalSeekBeforeInputAndKeepsOutputOffset(t *testi
 	if listSizeIndex < 0 || args[listSizeIndex+1] != "0" {
 		t.Fatalf("expected unbounded HLS list size, args=%v", args)
 	}
+	flagsIndex := slices.Index(args, "-hls_flags")
+	if flagsIndex < 0 || args[flagsIndex+1] != "independent_segments+temp_file" {
+		t.Fatalf("expected HLS temp_file flag, args=%v", args)
+	}
 	hlsTimeIndex := slices.Index(args, "-hls_time")
 	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
 		t.Fatalf("expected default HLS segment duration, args=%v", args)
+	}
+	initTimeIndex := slices.Index(args, "-hls_init_time")
+	if initTimeIndex < 0 || args[initTimeIndex+1] != "1" {
+		t.Fatalf("expected first HLS segment to use hls_init_time 1, args=%v", args)
 	}
 	if args[len(args)-1] != filepath.Join(session.Dir, "master.m3u8") {
 		t.Fatalf("playlist output = %q", args[len(args)-1])
@@ -79,6 +87,10 @@ func TestBuildFFmpegArgsUsesConfiguredSegmentDuration(t *testing.T) {
 	hlsTimeIndex := slices.Index(args, "-hls_time")
 	if hlsTimeIndex < 0 || args[hlsTimeIndex+1] != "2" {
 		t.Fatalf("expected configured HLS segment duration, args=%v", args)
+	}
+	initTimeIndex := slices.Index(args, "-hls_init_time")
+	if initTimeIndex < 0 || args[initTimeIndex+1] != "1" {
+		t.Fatalf("expected first HLS segment shorter than configured duration, args=%v", args)
 	}
 }
 
@@ -126,6 +138,59 @@ func TestManagerStatusSnapshotReportsVideoAndUploadRate(t *testing.T) {
 		t.Fatalf("status = %+v", statuses[0])
 	}
 	manager.Close()
+}
+
+func TestManagerStatusSnapshotReportsTranscodeBuffer(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	t.Cleanup(manager.Close)
+	session, err := manager.Ensure("item123", Request{
+		InputURL: "http://upstream/video",
+		Media:    MediaInfo{Name: "Buffered Movie", RunTimeTicks: 120 * timeSecondTicks},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for segment := 0; segment <= 9; segment++ {
+		path := filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", segment))
+		if err := os.WriteFile(path, []byte("ts"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager.RecordSegmentRequest(session.ID, 9)
+
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	status := statuses[0]
+	if status.GeneratedSeconds != 20 || status.BufferSeconds != 2 {
+		t.Fatalf("buffer status = %+v", status)
+	}
+	if status.RuntimeSeconds != 120 || status.BufferPauseSeconds != 300 || status.BufferResumeSeconds != 120 {
+		t.Fatalf("buffer thresholds = %+v", status)
+	}
+}
+
+func TestManagerStatusSnapshotIgnoresInFlightSegments(t *testing.T) {
+	manager := NewManager(Options{TempDir: t.TempDir()})
+	t.Cleanup(manager.Close)
+	session, err := manager.Ensure("item123", Request{
+		InputURL: "http://upstream/video",
+		Media:    MediaInfo{Name: "Buffered Movie", RunTimeTicks: 120 * timeSecondTicks},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordSegmentRequest(session.ID, 4)
+
+	statuses := manager.StatusSnapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	status := statuses[0]
+	if status.GeneratedSeconds != 0 || status.BufferSeconds != 0 {
+		t.Fatalf("in-flight buffer should be empty: %+v", status)
+	}
 }
 
 func TestManagerIgnoresUploadFromReplacedSession(t *testing.T) {
@@ -196,7 +261,41 @@ func TestFFmpegRunnerUsesAcceleratedInputAndReleasesIt(t *testing.T) {
 	}
 }
 
-func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
+func TestFFmpegProcessIsNotDoneUntilAcceleratedInputIsReleased(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := &blockingReleaseInputProxy{
+		releaseStarted: make(chan struct{}),
+		allowRelease:   make(chan struct{}),
+	}
+	runner := FFmpegRunner{Path: ffmpegPath, InputProxy: input}
+	process, err := runner.Start(context.Background(), &Session{ID: "item123", Dir: dir}, Request{InputURL: "http://upstream/video"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execProcess := process.(*execProcess)
+
+	select {
+	case <-input.releaseStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("input release did not start")
+	}
+	if execProcess.waitForExit(20 * time.Millisecond) {
+		t.Fatal("process reported done before input release completed")
+	}
+	close(input.allowRelease)
+	if !execProcess.waitForExit(time.Second) {
+		t.Fatal("process did not report done after input release")
+	}
+}
+
+func TestBuildFFmpegArgsKeepsOutputLowLatencyWithoutUnsafeInputFlags(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
 		Dir: t.TempDir(),
@@ -204,12 +303,12 @@ func TestBuildFFmpegArgsUsesLowLatencyTranscodeSettings(t *testing.T) {
 
 	args := buildFFmpegArgs(session, Request{InputURL: "http://upstream/stream"})
 
-	for _, want := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0"} {
+	for _, want := range []string{"-tune", "zerolatency", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0", "-hls_init_time", "1"} {
 		if !slices.Contains(args, want) {
 			t.Fatalf("missing low-latency arg %q in %v", want, args)
 		}
 	}
-	for _, risky := range []string{"-analyzeduration", "-probesize"} {
+	for _, risky := range []string{"-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "-probesize"} {
 		if slices.Contains(args, risky) {
 			t.Fatalf("should not force risky probing arg %q for mkv/dts inputs: %v", risky, args)
 		}
@@ -220,6 +319,18 @@ type recordingInputProxy struct {
 	rawURL   string
 	headers  http.Header
 	released chan struct{}
+}
+
+type blockingReleaseInputProxy struct {
+	releaseStarted chan struct{}
+	allowRelease   chan struct{}
+}
+
+func (p *blockingReleaseInputProxy) Register(string, http.Header) (string, func(), error) {
+	return "http://127.0.0.1:12345/input", func() {
+		close(p.releaseStarted)
+		<-p.allowRelease
+	}, nil
 }
 
 func (p *recordingInputProxy) Register(rawURL string, headers http.Header) (string, func(), error) {
@@ -276,6 +387,9 @@ func TestBuildFFmpegArgsUsesFullVAAPITranscodePipeline(t *testing.T) {
 	if outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
 		t.Fatalf("missing VAAPI hardware frame output: %v", args)
 	}
+	if slices.Contains(args, "-vaapi_device") {
+		t.Fatalf("full VAAPI pipeline must not initialize a second device: %v", args)
+	}
 	codecIndex := slices.Index(args, "-c:v")
 	if codecIndex < 0 || args[codecIndex+1] != "h264_vaapi" {
 		t.Fatalf("expected VAAPI H.264 encoder, args=%v", args)
@@ -324,6 +438,20 @@ func TestBuildFFmpegArgsUsesVAAPIEncodeFallbackPipeline(t *testing.T) {
 	}
 }
 
+func TestSelectHardwarePipelineUsesEncodeFallbackFor4KHEVCMain8(t *testing.T) {
+	info := MediaInfo{
+		VideoCodec:    "hevc",
+		VideoProfile:  "Main",
+		VideoBitDepth: 8,
+		VideoPixFmt:   "yuv420p",
+		Width:         3840,
+		Height:        2160,
+	}
+	if got := selectHardwarePipeline(info, "vaapi-full"); got != "vaapi-encode" {
+		t.Fatalf("pipeline = %q, want vaapi-encode", got)
+	}
+}
+
 func TestBuildFFmpegArgsUsesVAAPIHybridPipelineForHEVCMain10(t *testing.T) {
 	session := &Session{
 		ID:  "item123",
@@ -360,8 +488,8 @@ func TestBuildFFmpegArgsUsesVAAPIHybridPipelineForHEVCMain10(t *testing.T) {
 	if outputFormatIndex := slices.Index(args, "-hwaccel_output_format"); outputFormatIndex < 0 || args[outputFormatIndex+1] != "vaapi" {
 		t.Fatalf("missing VAAPI surface output: %v", args)
 	}
-	if deviceIndex := slices.Index(args, "-vaapi_device"); deviceIndex < 0 || args[deviceIndex+1] != "/dev/dri/renderD128" {
-		t.Fatalf("missing VAAPI upload/encode device: %v", args)
+	if slices.Contains(args, "-vaapi_device") {
+		t.Fatalf("hybrid pipeline must not initialize a second VAAPI device: %v", args)
 	}
 	vfIndex := slices.Index(args, "-vf")
 	if vfIndex < 0 {
@@ -511,6 +639,29 @@ func TestBuildFFmpegArgsMapsRequestedAudioStreamIndex(t *testing.T) {
 
 	args := buildFFmpegArgs(session, request)
 
+	mapIndexes := allIndexes(args, "-map")
+	if len(mapIndexes) < 2 {
+		t.Fatalf("missing map args: %v", args)
+	}
+	if got := args[mapIndexes[1]+1]; got != "0:a:1?" {
+		t.Fatalf("audio map = %q, args=%v", got, args)
+	}
+}
+
+func TestBuildFFmpegArgsMapsExplicitAudioStreamIndexZero(t *testing.T) {
+	session := &Session{
+		ID:  "item123",
+		Dir: t.TempDir(),
+		Media: MediaInfo{AudioStreams: []AudioStreamInfo{
+			{Index: 2, Ordinal: 0, Codec: "aac"},
+			{Index: 0, Ordinal: 1, Codec: "eac3"},
+		}},
+	}
+	args := buildFFmpegArgs(session, Request{
+		InputURL:            "http://upstream/stream?AudioStreamIndex=0",
+		AudioStreamIndex:    0,
+		HasAudioStreamIndex: true,
+	})
 	mapIndexes := allIndexes(args, "-map")
 	if len(mapIndexes) < 2 {
 		t.Fatalf("missing map args: %v", args)

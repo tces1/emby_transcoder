@@ -95,8 +95,11 @@ func requestForUpstream(req *http.Request, upstream *url.URL, replay bool) (*htt
 }
 
 func requestRetryable(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
 	switch req.Method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 		return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 	default:
 		return false

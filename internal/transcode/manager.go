@@ -26,6 +26,7 @@ const defaultRestartGraceTimeout = 500 * time.Millisecond
 const maxTranscodeWidth = 1920
 const maxTranscodeHeight = 1080
 const lowLatencyGOP = 25
+const hlsInitTimeSeconds = 1
 
 type Options struct {
 	MaxSessions           int
@@ -47,12 +48,16 @@ type Options struct {
 }
 
 type Request struct {
-	InputURL                string
-	Headers                 http.Header
-	ItemID                  string
-	MediaSourceID           string
-	PlaySessionID           string
+	InputURL      string
+	Headers       http.Header
+	ItemID        string
+	MediaSourceID string
+	// PlaySessionID identifies the client playback lifecycle.
+	PlaySessionID string
+	// UpstreamPlaySessionID belongs to the media URL returned by Emby.
+	UpstreamPlaySessionID   string
 	AudioStreamIndex        int
+	HasAudioStreamIndex     bool
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
@@ -70,16 +75,20 @@ type PlaybackEvent struct {
 }
 
 type Session struct {
-	ID                      string
-	ItemID                  string
-	MediaSourceID           string
+	ID            string
+	ItemID        string
+	MediaSourceID string
+	// PlaySessionID is the immutable client playback identity.
 	PlaySessionID           string
+	UpstreamPlaySessionID   string
+	GenerationID            uint64
 	AudioStreamIndex        int
 	StartTimeTicks          int64
 	RequestedStartTimeTicks int64
 	SegmentStartIndex       int
 	OldestSegmentKept       int
 	HighestSegmentSeen      int
+	ReadySegmentCount       int
 	SegmentTicks            int64
 	Media                   MediaInfo
 	Dir                     string
@@ -102,14 +111,20 @@ type Session struct {
 }
 
 type SessionStatus struct {
-	ID               string  `json:"id"`
-	VideoName        string  `json:"video_name"`
-	State            string  `json:"state"`
-	HardwarePipeline string  `json:"hardware_pipeline"`
-	TranscodeSpeed   float64 `json:"transcode_speed"`
-	UploadBPS        float64 `json:"upload_bps"`
-	UploadedBytes    int64   `json:"uploaded_bytes"`
-	PositionTicks    int64   `json:"position_ticks"`
+	ID                  string  `json:"id"`
+	GenerationID        uint64  `json:"generation_id"`
+	VideoName           string  `json:"video_name"`
+	State               string  `json:"state"`
+	HardwarePipeline    string  `json:"hardware_pipeline"`
+	TranscodeSpeed      float64 `json:"transcode_speed"`
+	UploadBPS           float64 `json:"upload_bps"`
+	UploadedBytes       int64   `json:"uploaded_bytes"`
+	PositionTicks       int64   `json:"position_ticks"`
+	BufferSeconds       float64 `json:"buffer_seconds"`
+	GeneratedSeconds    float64 `json:"generated_seconds"`
+	RuntimeSeconds      float64 `json:"runtime_seconds"`
+	BufferPauseSeconds  float64 `json:"buffer_pause_seconds"`
+	BufferResumeSeconds float64 `json:"buffer_resume_seconds"`
 }
 
 type Process interface {
@@ -125,7 +140,7 @@ type InputProxy interface {
 }
 
 type detailedInputProxy interface {
-	RegisterSource(id string, name string, rawURL string, headers http.Header) (string, func(), error)
+	RegisterSource(id string, name string, generation uint64, rawURL string, headers http.Header) (string, func(), error)
 }
 
 type Manager struct {
@@ -134,6 +149,7 @@ type Manager struct {
 	sessions            map[string]*Session
 	media               map[string]MediaInfo
 	vaapiEncodeFallback map[string]bool
+	nextGeneration      atomic.Uint64
 }
 
 func NewManager(options Options) *Manager {
@@ -384,6 +400,7 @@ func (m *Manager) MediaInfo(id string) (MediaInfo, bool) {
 }
 
 func (m *Manager) Ensure(id string, request Request) (*Session, error) {
+	request = m.normalizedRequest(request)
 	for {
 		var stale *Session
 		fastStop := false
@@ -438,7 +455,8 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 			return nil, errors.New("input url is required")
 		}
 
-		dir := filepath.Join(m.options.TempDir, id)
+		generation := m.nextGeneration.Add(1)
+		dir := filepath.Join(m.options.TempDir, fmt.Sprintf("%s-g%d", id, generation))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			m.mu.Unlock()
 			return nil, err
@@ -446,6 +464,7 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		session := &Session{
 			ID:               id,
+			GenerationID:     generation,
 			Dir:              dir,
 			InputURL:         request.InputURL,
 			LastAccess:       now,
@@ -471,7 +490,7 @@ func (m *Manager) Ensure(id string, request Request) (*Session, error) {
 		if session.MediaSourceID == "" {
 			session.MediaSourceID = session.Media.SourceID
 		}
-		traceSwitch("manager_create id=%s item=%s media_source=%s play_session=%s start_ticks=%d segment_start=%d dir=%s input=%s media=%s", id, session.ItemID, session.MediaSourceID, session.PlaySessionID, session.StartTimeTicks, session.SegmentStartIndex, dir, redactURLString(request.InputURL), session.Media.Summary())
+		traceSwitch("manager_create id=%s generation=%d item=%s media_source=%s client_play_session=%s upstream_play_session=%s start_ticks=%d segment_start=%d dir=%s input=%s media=%s", id, session.GenerationID, session.ItemID, session.MediaSourceID, session.PlaySessionID, session.UpstreamPlaySessionID, session.StartTimeTicks, session.SegmentStartIndex, dir, redactURLString(request.InputURL), session.Media.Summary())
 
 		if m.options.Runner != nil {
 			process, err := m.options.Runner.Start(ctx, session, request)
@@ -501,6 +520,17 @@ func (m *Manager) Get(id string) (*Session, bool) {
 		session.LastMediaAccess = now
 	}
 	return session, ok
+}
+
+func (m *Manager) PlaylistWindow(id string) (start, ready int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	if !ok {
+		return 0, 0
+	}
+	refreshReadySegments(session)
+	return session.SegmentStartIndex, session.ReadySegmentCount
 }
 
 func (m *Manager) RecordSessionUpload(session *Session, bytes int64) {
@@ -550,15 +580,22 @@ func (m *Manager) StatusSnapshot() []SessionStatus {
 				speed = process.TranscodeSpeed()
 			}
 		}
+		generated, _, buffered := sessionBufferTicks(session)
 		statuses = append(statuses, SessionStatus{
-			ID:               session.ID,
-			VideoName:        name,
-			State:            state,
-			HardwarePipeline: session.HardwarePipeline,
-			TranscodeSpeed:   speed,
-			UploadBPS:        session.uploadBPS,
-			UploadedBytes:    session.UploadedBytes,
-			PositionTicks:    session.PositionTicks,
+			ID:                  session.ID,
+			GenerationID:        session.GenerationID,
+			VideoName:           name,
+			State:               state,
+			HardwarePipeline:    session.HardwarePipeline,
+			TranscodeSpeed:      speed,
+			UploadBPS:           session.uploadBPS,
+			UploadedBytes:       session.UploadedBytes,
+			PositionTicks:       session.PositionTicks,
+			BufferSeconds:       ticksFloatSeconds(buffered),
+			GeneratedSeconds:    ticksFloatSeconds(generated),
+			RuntimeSeconds:      ticksFloatSeconds(session.Media.RunTimeTicks),
+			BufferPauseSeconds:  m.options.BufferPauseThreshold.Seconds(),
+			BufferResumeSeconds: m.options.BufferResumeThreshold.Seconds(),
 		})
 	}
 	return statuses
@@ -584,6 +621,23 @@ func (m *Manager) RecordSegmentRequest(id string, segmentIndex int) {
 	}
 }
 
+func (m *Manager) RecordSegmentReady(id string, segmentIndex int) {
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if segmentIndex >= session.SegmentStartIndex {
+		refreshReadySegments(session)
+	}
+	action, ok := m.bufferActionLocked(session)
+	m.mu.Unlock()
+	if ok {
+		m.applyBufferAction(action)
+	}
+}
+
 func (m *Manager) RecordProgress(event PlaybackEvent) int {
 	m.mu.Lock()
 	now := time.Now()
@@ -600,7 +654,7 @@ func (m *Manager) RecordProgress(event PlaybackEvent) int {
 		if event.MediaSourceID != "" {
 			session.MediaSourceID = event.MediaSourceID
 		}
-		if event.PlaySessionID != "" {
+		if event.PlaySessionID != "" && session.PlaySessionID == "" {
 			session.PlaySessionID = event.PlaySessionID
 		}
 		session.LastAccess = now
@@ -737,6 +791,18 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.SegmentRequest && session.OldestSegmentKept > session.SegmentStartIndex && request.SegmentStartIndex < session.OldestSegmentKept {
 		return true
 	}
+	if request.PlaySessionID != "" && session.PlaySessionID != "" && request.PlaySessionID != session.PlaySessionID {
+		return true
+	}
+	if request.AudioStreamIndex != session.AudioStreamIndex {
+		return true
+	}
+	if request.InputURL != "" && session.InputURL != "" && !segmentInputCompatible(session.InputURL, request.InputURL) {
+		return true
+	}
+	if !request.SegmentRequest {
+		return playlistSeekChanged(session, request)
+	}
 	if request.StartTimeTicks != session.StartTimeTicks {
 		return true
 	}
@@ -746,10 +812,32 @@ func shouldRestart(session *Session, request Request) bool {
 	if request.SegmentStartIndex != session.SegmentStartIndex {
 		return true
 	}
-	if request.AudioStreamIndex != session.AudioStreamIndex {
-		return true
+	return false
+}
+
+func playlistSeekChanged(session *Session, request Request) bool {
+	requested := request.RequestedStartTimeTicks
+	if requested == 0 {
+		requested = request.StartTimeTicks
 	}
-	return request.InputURL != "" && session.InputURL != "" && request.InputURL != session.InputURL
+	current := session.RequestedStartTimeTicks
+	if current == 0 {
+		current = session.StartTimeTicks
+	}
+	return requested != current
+}
+
+func (m *Manager) normalizedRequest(request Request) Request {
+	if request.RequestedStartTimeTicks == 0 {
+		request.RequestedStartTimeTicks = request.StartTimeTicks
+	}
+	if request.SegmentRequest || request.SegmentStartIndex != 0 || request.StartTimeTicks <= 0 {
+		return request
+	}
+	segmentTicks := m.segmentTicks()
+	request.SegmentStartIndex = int(request.StartTimeTicks / segmentTicks)
+	request.StartTimeTicks = int64(request.SegmentStartIndex) * segmentTicks
+	return request
 }
 
 func touchSession(session *Session, request Request, now time.Time, mediaAccess bool) {
@@ -757,7 +845,7 @@ func touchSession(session *Session, request Request, now time.Time, mediaAccess 
 	if mediaAccess {
 		session.LastMediaAccess = now
 	}
-	if request.InputURL != "" {
+	if request.InputURL != "" && session.InputURL == "" {
 		session.InputURL = request.InputURL
 	}
 	if request.ItemID != "" {
@@ -766,8 +854,11 @@ func touchSession(session *Session, request Request, now time.Time, mediaAccess 
 	if request.MediaSourceID != "" {
 		session.MediaSourceID = request.MediaSourceID
 	}
-	if request.PlaySessionID != "" {
+	if request.PlaySessionID != "" && session.PlaySessionID == "" {
 		session.PlaySessionID = request.PlaySessionID
+	}
+	if request.UpstreamPlaySessionID != "" && session.UpstreamPlaySessionID == "" {
+		session.UpstreamPlaySessionID = request.UpstreamPlaySessionID
 	}
 	session.AudioStreamIndex = request.AudioStreamIndex
 	session.StartTimeTicks = request.StartTimeTicks
@@ -865,22 +956,7 @@ func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {
 	if !ok {
 		return bufferAction{}, false
 	}
-	baseTicks := session.StartTimeTicks
-	if baseTicks < 0 {
-		baseTicks = 0
-	}
-	generatedTicks := baseTicks
-	if session.HighestSegmentSeen >= session.SegmentStartIndex {
-		generatedTicks += int64(session.HighestSegmentSeen-session.SegmentStartIndex+1) * sessionSegmentTicks(session)
-	}
-	playedTicks := session.PositionTicks
-	if playedTicks < baseTicks {
-		playedTicks = baseTicks
-	}
-	bufferTicks := generatedTicks - playedTicks
-	if bufferTicks < 0 {
-		bufferTicks = 0
-	}
+	_, _, bufferTicks := sessionBufferTicks(session)
 
 	if session.bufferPaused {
 		if bufferTicks < durationToTicks(m.options.BufferResumeThreshold) {
@@ -894,6 +970,50 @@ func (m *Manager) bufferActionLocked(session *Session) (bufferAction, bool) {
 		return bufferAction{sessionID: session.ID, process: process, pause: true, bufferTicks: bufferTicks}, true
 	}
 	return bufferAction{}, false
+}
+
+func sessionBufferTicks(session *Session) (generatedTicks, playedTicks, bufferTicks int64) {
+	if session == nil {
+		return 0, 0, 0
+	}
+	refreshReadySegments(session)
+	baseTicks := session.StartTimeTicks
+	if baseTicks < 0 {
+		baseTicks = 0
+	}
+	generatedTicks = baseTicks + int64(session.ReadySegmentCount)*sessionSegmentTicks(session)
+	playedTicks = session.PositionTicks
+	if playedTicks < baseTicks {
+		playedTicks = baseTicks
+	}
+	if requestTicks := int64(session.HighestSegmentSeen) * sessionSegmentTicks(session); requestTicks > playedTicks {
+		playedTicks = requestTicks
+	}
+	bufferTicks = generatedTicks - playedTicks
+	if bufferTicks < 0 {
+		bufferTicks = 0
+	}
+	return generatedTicks, playedTicks, bufferTicks
+}
+
+const maxReadySegmentScan = 256
+
+func sessionSegmentPath(session *Session, index int) string {
+	return filepath.Join(session.Dir, fmt.Sprintf("segment_%05d.ts", index))
+}
+
+func refreshReadySegments(session *Session) {
+	if session == nil || session.Dir == "" {
+		return
+	}
+	next := session.SegmentStartIndex + session.ReadySegmentCount
+	for scanned := 0; scanned < maxReadySegmentScan; scanned++ {
+		if !fileExists(sessionSegmentPath(session, next)) {
+			return
+		}
+		session.ReadySegmentCount++
+		next++
+	}
 }
 
 func (m *Manager) applyBufferAction(action bufferAction) {
@@ -1273,7 +1393,7 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 		var release func()
 		var err error
 		if detailed, ok := r.InputProxy.(detailedInputProxy); ok {
-			localURL, release, err = detailed.RegisterSource(session.ID, session.Media.Name, request.InputURL, request.Headers)
+			localURL, release, err = detailed.RegisterSource(session.ID, session.Media.Name, session.GenerationID, request.InputURL, request.Headers)
 		} else {
 			localURL, release, err = r.InputProxy.Register(request.InputURL, request.Headers)
 		}
@@ -1317,11 +1437,9 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 	process := &execProcess{cmd: cmd, logFile: logFile, stdin: stdin, doneCh: make(chan struct{})}
 	go process.readProgress(progressOutput)
 	go func() {
-		defer releaseInput()
 		err := cmd.Wait()
-		process.done.Store(true)
-		close(process.doneCh)
 		_ = logFile.Close()
+		releaseInput()
 		if err != nil {
 			logging.Infof("transcode exit id=%s err=%v", session.ID, err)
 			if archivedPath, archiveErr := archiveFailedTranscodeLog(session, logPath); archiveErr != nil {
@@ -1330,10 +1448,14 @@ func (r FFmpegRunner) Start(ctx context.Context, session *Session, request Reque
 				logging.Infof("transcode log archived id=%s path=%s", session.ID, archivedPath)
 			}
 			logging.Debugf("ffmpeg exited id=%s err=%v log=%s", session.ID, err, logPath)
+			process.done.Store(true)
+			close(process.doneCh)
 			return
 		}
 		logging.Infof("transcode exit id=%s", session.ID)
 		logging.Debugf("ffmpeg exited id=%s err=nil log=%s", session.ID, logPath)
+		process.done.Store(true)
+		close(process.doneCh)
 	}()
 	return process, nil
 }
@@ -1356,6 +1478,9 @@ func selectHardwarePipeline(info MediaInfo, current string) string {
 	if pipeline != "vaapi-full" {
 		return current
 	}
+	if needsVAAPIEncodeFallback(info) {
+		return "vaapi-encode"
+	}
 	if needsVAAPIHybridPipeline(info) {
 		return "vaapi-hybrid"
 	}
@@ -1376,6 +1501,17 @@ func needsVAAPIHybridPipeline(info MediaInfo) bool {
 		return true
 	}
 	return false
+}
+
+func needsVAAPIEncodeFallback(info MediaInfo) bool {
+	codec := strings.ToLower(strings.TrimSpace(info.VideoCodec))
+	if codec != "hevc" && codec != "h265" {
+		return false
+	}
+	if needsVAAPIHybridPipeline(info) {
+		return false
+	}
+	return info.Width > maxTranscodeWidth || info.Height > maxTranscodeHeight
 }
 
 func archiveFailedTranscodeLog(session *Session, logPath string) (string, error) {
@@ -1442,8 +1578,6 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 		"-loglevel", "info",
 		"-progress", "pipe:1",
 		"-nostats",
-		"-fflags", "nobuffer",
-		"-flags", "low_delay",
 	}
 	if headerText := ffmpegHeaders(request.Headers); headerText != "" {
 		args = append(args, "-headers", headerText)
@@ -1470,9 +1604,10 @@ func buildFFmpegArgs(session *Session, request Request, options ...FFmpegOptions
 	}
 	args = append(args,
 		"-f", "hls",
+		"-hls_init_time", strconv.Itoa(hlsInitTimeSeconds),
 		"-hls_time", hlsTimeValue(sessionSegmentTicks(session)),
 		"-hls_list_size", "0",
-		"-hls_flags", "independent_segments",
+		"-hls_flags", "independent_segments+temp_file",
 		"-start_number", strconv.Itoa(session.SegmentStartIndex),
 		"-hls_segment_filename", segmentPattern,
 		playlist,
@@ -1551,7 +1686,7 @@ func vaapiHybridFilter(options FFmpegOptions) string {
 }
 
 func audioMapArg(session *Session, request Request) string {
-	if request.AudioStreamIndex != 0 && session != nil {
+	if (request.HasAudioStreamIndex || request.AudioStreamIndex != 0) && session != nil {
 		for _, audio := range session.Media.AudioStreams {
 			if audio.Index == request.AudioStreamIndex {
 				return fmt.Sprintf("0:a:%d?", audio.Ordinal)
@@ -1567,7 +1702,6 @@ func appendHardwareDecodeArgs(args []string, options FFmpegOptions) []string {
 		args = append(args, "-hwaccel", "vaapi")
 		if device := strings.TrimSpace(options.HardwareDevice); device != "" {
 			args = append(args, "-hwaccel_device", device)
-			args = append(args, "-vaapi_device", device)
 		}
 		args = append(args, "-hwaccel_output_format", "vaapi")
 		return args

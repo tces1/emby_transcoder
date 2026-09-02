@@ -9,13 +9,24 @@ import (
 	"time"
 )
 
+func TestRequestFromHTTPSeparatesClientAndUpstreamPlaySessionIDs(t *testing.T) {
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00000.ts?CurrentPlaySessionId=current-session&PlaySessionId=query-session", nil)
+
+	request := requestFromHTTP("item123", "http://upstream/stream?PlaySessionId=upstream-session", req)
+
+	if request.PlaySessionID != "query-session" {
+		t.Fatalf("client play session id = %q", request.PlaySessionID)
+	}
+	if request.UpstreamPlaySessionID != "upstream-session" {
+		t.Fatalf("upstream play session id = %q", request.UpstreamPlaySessionID)
+	}
+}
+
 func TestRequestFromHTTPUsesCurrentPlaySessionIDFallback(t *testing.T) {
-	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/segment_00000.ts?CurrentPlaySessionId=current-session", nil)
-
+	req := httptest.NewRequest("GET", "/streambridge/transcode/item123/master.m3u8?CurrentPlaySessionId=current-session", nil)
 	request := requestFromHTTP("item123", "http://upstream/stream", req)
-
 	if request.PlaySessionID != "current-session" {
-		t.Fatalf("play session id = %q", request.PlaySessionID)
+		t.Fatalf("client play session id = %q", request.PlaySessionID)
 	}
 }
 
@@ -65,6 +76,15 @@ func TestSegmentInputCompatibleIgnoresPlaybackSessionOptions(t *testing.T) {
 
 	if !segmentInputCompatible(existing, next) {
 		t.Fatal("expected compatible input when only playback-session options change")
+	}
+}
+
+func TestSegmentInputCompatibleIgnoresDirectStreamPlaySessionId(t *testing.T) {
+	existing := "https://tv.example/videos/260981/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-a&api_key=secret"
+	next := "https://tv.example/videos/260981/original.mp4?DeviceId=dev1&MediaSourceId=source1&PlaySessionId=session-b&api_key=secret"
+
+	if !segmentInputCompatible(existing, next) {
+		t.Fatal("expected compatible input when only upstream PlaySessionId changes")
 	}
 }
 

@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
 	"emby-transcoder/internal/config"
 	"emby-transcoder/internal/emby"
@@ -34,6 +36,9 @@ type Server struct {
 	transcodeManager *transcode.Manager
 	inputProxy       *inputproxy.Proxy
 	dashboard        *dashboardAuthStore
+	configPath       string
+	restartFunc      func()
+	restartOnce      sync.Once
 }
 
 var embyTokenPattern = regexp.MustCompile(`(?i)\btoken\s*=\s*"?([^",\s]+)"?`)
@@ -61,21 +66,28 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		}
 		acceleratedInput, err = inputproxy.New(inputproxy.Options{
 			Workers:    cfg.Transcode.DownloadWorkers,
+			Mode:       cfg.Transcode.DownloadMode,
 			ChunkSize:  int64(cfg.Transcode.DownloadChunkMB) << 20,
 			BufferSize: int64(cfg.Transcode.DownloadBufferMB) << 20,
 			Transport:  transport,
 			Origins:    downloadOrigins,
+			CacheDir:   filepath.Join(cfg.Transcode.TempDir, "input-cache"),
 		})
 		if err != nil {
 			return nil, err
 		}
 		logging.Infof(
-			"accelerated input configured workers=%d chunk_mb=%d buffer_mb=%d routes=%d",
+			"accelerated input configured workers=%d mode=%s chunk_mb=%d buffer_mb=%d routes=%d",
 			acceleratedInput.Workers(),
+			cfg.Transcode.DownloadMode,
 			cfg.Transcode.DownloadChunkMB,
 			cfg.Transcode.DownloadBufferMB,
 			len(downloadOrigins),
 		)
+	}
+	var managerInputProxy transcode.InputProxy
+	if acceleratedInput != nil {
+		managerInputProxy = acceleratedInput
 	}
 
 	manager, err := transcode.NewManagerStrict(transcode.Options{
@@ -84,7 +96,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		FFmpegPath:            cfg.Transcode.FFmpegPath,
 		HardwareDecode:        cfg.Transcode.HardwareDecode,
 		HardwareDevice:        cfg.Transcode.HardwareDevice,
-		InputProxy:            acceleratedInput,
+		InputProxy:            managerInputProxy,
 		BufferPauseThreshold:  cfg.Transcode.BufferPause,
 		BufferResumeThreshold: cfg.Transcode.BufferResume,
 		SegmentDuration:       cfg.Transcode.SegmentDuration,
@@ -133,6 +145,8 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		transcodeManager: manager,
 		inputProxy:       acceleratedInput,
 		dashboard:        newDashboardAuthStore(),
+		configPath:       cfg.Path,
+		restartFunc:      func() { os.Exit(0) },
 	}, nil
 }
 
@@ -232,6 +246,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(upstreamReq)
 	if err != nil {
+		logging.Errorf("playbackinfo upstream error item=%s err=%v", itemIDFromPlaybackPath(r.URL.Path), err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -311,7 +326,6 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 					mediaInfo.Summary(),
 				)
 			}
-			s.prewarmPlaybackInfoTranscode(r, report)
 		}
 		if err == nil && !changed {
 			logging.Infof("playbackinfo unchanged item=%s reason=no_media_sources", itemID)
@@ -356,86 +370,6 @@ func resolveMediaInputURL(responseRequest *http.Request, fallback *url.URL, raw 
 	origin.RawQuery = ""
 	origin.Fragment = ""
 	return origin.ResolveReference(reference).String()
-}
-
-func (s *Server) prewarmPlaybackInfoTranscode(r *http.Request, report emby.RewriteReport) {
-	if s.transcodeManager == nil || len(report.Sources) == 0 {
-		return
-	}
-	itemID := report.ItemID
-	source := report.Sources[0]
-	audioStreamIndex := preferredAudioStreamIndex(source.AudioStreams)
-	if raw := r.URL.Query().Get("AudioStreamIndex"); raw != "" {
-		audioStreamIndex = int(int64Query(raw))
-	}
-	inputURL := prewarmTranscodeInputURL(s.upstream, itemID, source.ID, audioStreamIndex, r)
-	request := transcode.Request{
-		InputURL:                inputURL,
-		Headers:                 r.Header.Clone(),
-		ItemID:                  itemID,
-		MediaSourceID:           source.ID,
-		PlaySessionID:           source.SessionID,
-		AudioStreamIndex:        audioStreamIndex,
-		StartTimeTicks:          int64Query(r.URL.Query().Get("StartTimeTicks")),
-		RequestedStartTimeTicks: int64Query(r.URL.Query().Get("StartTimeTicks")),
-	}
-	if info, ok := s.transcodeManager.MediaInfo(source.SessionID); ok {
-		request.Media = info
-		if info.InputURL != "" {
-			inputURL = info.InputURL
-			request.InputURL = info.InputURL
-		}
-	}
-	logging.Infof(
-		"playbackinfo prewarm request item=%s source=%s query=%s input=%s",
-		itemID,
-		source.ID,
-		redactURLString("?"+r.URL.RawQuery),
-		redactURLString(inputURL),
-	)
-	started := time.Now()
-	go func() {
-		if _, ok := s.transcodeManager.Get(source.SessionID); ok {
-			logging.Debugf("playbackinfo prewarm skipped item=%s source=%s reason=session_exists", itemID, source.ID)
-			return
-		}
-		session, err := s.transcodeManager.Ensure(source.SessionID, request)
-		if err != nil {
-			logging.Debugf("playbackinfo prewarm skipped item=%s source=%s err=%v", itemID, source.ID, err)
-			return
-		}
-		logging.Infof("playbackinfo prewarm item=%s source=%s elapsed=%s", itemID, source.ID, time.Since(started))
-		logging.Debugf("playbackinfo prewarm detail item=%s source=%s input=%s session_dir=%s", itemID, source.ID, redactURLString(inputURL), session.Dir)
-	}()
-}
-
-func int64Query(raw string) int64 {
-	value, _ := strconv.ParseInt(raw, 10, 64)
-	return value
-}
-
-func preferredAudioStreamIndex(streams []emby.AudioStreamReport) int {
-	if len(streams) == 0 {
-		return 0
-	}
-	return streams[0].Index
-}
-
-func prewarmTranscodeInputURL(upstream *url.URL, id string, mediaSourceID string, audioStreamIndex int, r *http.Request) string {
-	u := *upstream
-	u.Path = singleJoiningSlash(upstream.Path, path.Join("/emby/Videos", id, "stream"))
-	query := authAwareQuery(r)
-	query.Del("reqformat")
-	query.Set("AutoOpenLiveStream", "true")
-	query.Set("IsPlayback", "true")
-	if mediaSourceID != "" {
-		query.Set("MediaSourceId", mediaSourceID)
-	}
-	if audioStreamIndex > 0 {
-		query.Set("AudioStreamIndex", strconv.Itoa(audioStreamIndex))
-	}
-	u.RawQuery = query.Encode()
-	return u.String()
 }
 
 func transcodeInputURL(upstream *url.URL, id string, r *http.Request) string {

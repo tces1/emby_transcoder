@@ -13,7 +13,7 @@ const (
 	defaultSegmentTicks       = 2 * timeSecondTicks
 )
 
-func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (string, bool) {
+func GrowingMediaPlaylist(info MediaInfo, segmentTicks int64, rawQuery string, firstIndex, readyCount int) (string, bool) {
 	if info.RunTimeTicks <= 0 || segmentTicks <= 0 {
 		return "", false
 	}
@@ -22,19 +22,37 @@ func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (st
 	if segmentCount <= 0 {
 		return "", false
 	}
+	if firstIndex < 0 {
+		firstIndex = 0
+	}
+	if firstIndex >= segmentCount {
+		firstIndex = segmentCount - 1
+	}
+	if readyCount < 0 {
+		readyCount = 0
+	}
+	ready := readyCount > 0
 
 	var builder strings.Builder
 	builder.WriteString("#EXTM3U\n")
 	builder.WriteString("#EXT-X-VERSION:6\n")
 	builder.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(ticksFloatSeconds(segmentTicks)))))
-	builder.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-	if startTicks := startTimeTicksFromRawQuery(rawQuery); startTicks > 0 {
+	if ready {
+		builder.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	} else {
+		builder.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
+	}
+	if startTicks := startTimeTicksFromRawQuery(rawQuery); ready && startTicks > 0 {
 		builder.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", ticksFloatSeconds(startTicks)))
 	}
 	builder.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	builder.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 
-	for index := 0; index < segmentCount; index++ {
+	listed := 0
+	if ready {
+		listed = segmentCount
+	}
+	for index := 0; index < listed; index++ {
 		segmentStart := int64(index) * segmentTicks
 		durationTicks := min(segmentTicks, info.RunTimeTicks-segmentStart)
 		builder.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", ticksFloatSeconds(durationTicks)))
@@ -52,7 +70,9 @@ func VirtualVODPlaylist(info MediaInfo, segmentTicks int64, rawQuery string) (st
 		builder.WriteString(strconv.FormatInt(durationTicks, 10))
 		builder.WriteString("\n")
 	}
-	builder.WriteString("#EXT-X-ENDLIST\n")
+	if ready {
+		builder.WriteString("#EXT-X-ENDLIST\n")
+	}
 	return builder.String(), true
 }
 

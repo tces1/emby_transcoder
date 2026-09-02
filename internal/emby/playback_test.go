@@ -83,8 +83,41 @@ func TestRewritePlaybackInfoAddsSourceParametersWhenClientOmitsThem(t *testing.T
 	}
 }
 
+func TestRewritePlaybackInfoUsesDeclaredDefaultAudioStream(t *testing.T) {
+	input := []byte(`{"MediaSources":[{"Id":"source1","DefaultAudioStreamIndex":2,"SupportsDirectPlay":true,"MediaStreams":[{"Type":"Audio","Index":1,"Codec":"dts"},{"Type":"Audio","Index":2,"Codec":"aac","IsDefault":true}]}]}`)
+
+	out, changed, err := emby.RewritePlaybackInfo(input, "item123", "http://proxy.local", "IsPlayback=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected rewrite to change response")
+	}
+	if !bytes.Contains(out, []byte(`AudioStreamIndex=2`)) {
+		t.Fatalf("missing declared default audio stream: %s", out)
+	}
+	if bytes.Contains(out, []byte(`AudioStreamIndex=1`)) {
+		t.Fatalf("rewrite selected the first stream instead of the default: %s", out)
+	}
+}
+
+func TestRewritePlaybackInfoDoesNotGuessAmongMultipleAudioStreams(t *testing.T) {
+	input := []byte(`{"MediaSources":[{"Id":"source1","DefaultAudioStreamIndex":99,"SupportsDirectPlay":true,"MediaStreams":[{"Type":"Audio","Index":1,"Codec":"dts"},{"Type":"Audio","Index":2,"Codec":"aac"}]}]}`)
+
+	out, changed, err := emby.RewritePlaybackInfo(input, "item123", "http://proxy.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected rewrite to change response")
+	}
+	if bytes.Contains(out, []byte(`AudioStreamIndex=`)) {
+		t.Fatalf("rewrite guessed an audio stream without a declared default: %s", out)
+	}
+}
+
 func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
-	input := []byte(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Path":"/media/Movie.mkv","Container":"mkv","Bitrate":80000000,"RunTimeTicks":72000000000,"SupportsDirectPlay":true,"DirectStreamUrl":"/Videos/1/stream","MediaStreams":[{"Type":"Video","Index":0,"Codec":"hevc","Profile":"Main 10","BitDepth":10,"PixelFormat":"yuv420p10le","Width":3840,"Height":2160},{"Type":"Audio","Index":1,"Codec":"dts","Channels":6,"DisplayTitle":"DTS 5.1"},{"Type":"Audio","Index":2,"Codec":"aac","Channels":2,"DisplayTitle":"AAC 2.0"}]}]}`)
+	input := []byte(`{"MediaSources":[{"Id":"source1","Name":"4K - 80 Mbps","Path":"/media/Movie.mkv","Container":"mkv","Bitrate":80000000,"RunTimeTicks":72000000000,"DefaultAudioStreamIndex":2,"SupportsDirectPlay":true,"DirectStreamUrl":"/Videos/1/stream","MediaStreams":[{"Type":"Video","Index":0,"Codec":"hevc","Profile":"Main 10","BitDepth":10,"PixelFormat":"yuv420p10le","Width":3840,"Height":2160},{"Type":"Audio","Index":1,"Codec":"dts","Channels":6,"DisplayTitle":"DTS 5.1"},{"Type":"Audio","Index":2,"Codec":"aac","Channels":2,"DisplayTitle":"AAC 2.0","IsDefault":true}]}]}`)
 
 	_, changed, report, err := emby.RewritePlaybackInfoWithReport(input, "item123", "http://proxy.local")
 	if err != nil {
@@ -106,7 +139,7 @@ func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
 	if source.BeforeDirectStreamURL != "/Videos/1/stream" {
 		t.Fatalf("direct stream url = %q", source.BeforeDirectStreamURL)
 	}
-	if source.AfterTranscodingURL != "/streambridge/transcode/item123/master.m3u8?AudioStreamIndex=1&MediaSourceId=source1" {
+	if source.AfterTranscodingURL != "/streambridge/transcode/item123/master.m3u8?AudioStreamIndex=2&MediaSourceId=source1" {
 		t.Fatalf("after url = %q", source.AfterTranscodingURL)
 	}
 	if source.SessionID != "item123" {
@@ -124,7 +157,7 @@ func TestRewritePlaybackInfoWithReportDescribesSources(t *testing.T) {
 	if source.VideoCodec != "hevc" || source.VideoProfile != "Main 10" || source.VideoBitDepth != 10 || source.Width != 3840 || source.Height != 2160 {
 		t.Fatalf("video = %s %s %dbit %dx%d", source.VideoCodec, source.VideoProfile, source.VideoBitDepth, source.Width, source.Height)
 	}
-	if source.AudioCodec != "dts" || source.AudioChannels != 6 || source.AudioTitle != "DTS 5.1" {
+	if source.AudioCodec != "aac" || source.AudioChannels != 2 || source.AudioTitle != "AAC 2.0" {
 		t.Fatalf("audio = %s channels=%d title=%q", source.AudioCodec, source.AudioChannels, source.AudioTitle)
 	}
 	if len(source.AudioStreams) != 2 {
