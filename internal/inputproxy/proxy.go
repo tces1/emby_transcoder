@@ -1633,17 +1633,20 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 	firstChunk := start / p.chunkSize
 	lastChunk := end / p.chunkSize
 	chunkCount := int(lastChunk-firstChunk) + 1
-	routes := p.streamRouteIndexes(src)
-	if len(routes) > chunkCount {
-		routes = routes[:chunkCount]
+	workerCount := p.workers
+	if workerCount > chunkCount {
+		workerCount = chunkCount
+	}
+	if workerCount < 1 {
+		workerCount = 1
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	tasks := make(chan chunkTask, len(routes))
+	tasks := make(chan chunkTask, workerCount)
 	results := make(chan chunkResult)
-	pending := make(map[int64]chunkResult, len(routes))
+	pending := make(map[int64]chunkResult, workerCount)
 	var wg sync.WaitGroup
-	for range routes {
+	for range workerCount {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1667,12 +1670,12 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 	}()
 
 	nextWrite := firstChunk
-	busyLanes := make(map[int]bool, len(routes))
-	activeRoutes := make(map[int64]map[int]struct{}, len(routes))
+	busyLanes := make(map[int]bool, workerCount)
+	activeRoutes := make(map[int64]map[int]struct{}, workerCount)
 	launch := func(index int64, lane int, routeIndex int, hedge bool) {
 		busyLanes[lane] = true
 		if activeRoutes[index] == nil {
-			activeRoutes[index] = make(map[int]struct{}, len(routes))
+			activeRoutes[index] = make(map[int]struct{}, workerCount)
 		}
 		activeRoutes[index][routeIndex] = struct{}{}
 		tasks <- chunkTask{index: index, lane: lane, routeIndex: routeIndex, hedge: hedge}
@@ -1697,6 +1700,10 @@ func (p *Proxy) streamRanges(ctx context.Context, dst io.Writer, src *source, me
 		return 0, false
 	}
 	schedule := func() {
+		routes := p.streamRouteIndexes(src)
+		if len(routes) > workerCount {
+			routes = routes[:workerCount]
+		}
 		if current := activeRoutes[nextWrite]; len(current) > 0 {
 			for lane, routeIndex := range routes {
 				if busyLanes[lane] {

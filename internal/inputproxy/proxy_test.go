@@ -145,6 +145,78 @@ func TestFastRouteHedgesBlockingChunkFromSlowRoute(t *testing.T) {
 	}
 }
 
+func TestRunningStreamActivatesSecondWorkerWhenRouteBecomesReady(t *testing.T) {
+	const chunkSize = 16 << 10
+	data := bytes.Repeat([]byte("dynamic-second-worker"), 64*1024)
+	var firstRequests atomic.Int32
+	var secondRequests atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		firstRequests.Add(1)
+		time.Sleep(5 * time.Millisecond)
+		writeRange(w, data, start, end)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		secondRequests.Add(1)
+		writeRange(w, data, start, end)
+	}))
+	defer second.Close()
+
+	proxy := &Proxy{
+		client:         http.DefaultClient,
+		workers:        2,
+		mode:           DownloadModeParallel,
+		chunkSize:      chunkSize,
+		prefetchChunks: 4,
+		slots:          make(chan struct{}, 2),
+		origins:        []*url.URL{{Scheme: "http", Host: "first"}, {Scheme: "http", Host: "second"}},
+		sources:        make(map[string]*source),
+		metrics:        make([]workerMetric, 2),
+	}
+	src := &source{
+		rawURL:      first.URL,
+		headers:     make(http.Header),
+		urls:        []string{first.URL, second.URL},
+		active:      []string{first.URL},
+		finalHosts:  []string{routeHost(first.URL)},
+		failures:    []int{0},
+		cacheChunks: make(map[int64]*cacheChunk),
+	}
+	src.dedicated.Store(-1)
+	if err := src.prepareCache(t.TempDir(), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	defer src.closeCache()
+
+	var output bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.streamRanges(context.Background(), &output, src, metadata{size: int64(len(data))}, 0, int64(len(data)-1))
+	}()
+	deadline := time.Now().Add(time.Second)
+	for firstRequests.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	src.acceptRoute(second.URL, routeHost(second.URL), -1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not finish")
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatalf("dynamic worker body differs: got=%d want=%d", output.Len(), len(data))
+	}
+	if secondRequests.Load() == 0 {
+		t.Fatal("second worker did not receive tasks after its route became ready")
+	}
+}
+
 func TestProxyDistributesTwoWorkersAcrossOrigins(t *testing.T) {
 	data := bytes.Repeat([]byte("two-origin-media"), 32*1024)
 	var firstChunks atomic.Int32
