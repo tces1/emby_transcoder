@@ -40,6 +40,7 @@ type Transcode struct {
 	HardwareDevice          string        `json:"hardware_device"`
 	MaxSessions             int           `json:"max_sessions"`
 	DownloadWorkers         int           `json:"download_workers"`
+	DownloadMode            string        `json:"download_mode"`
 	DownloadChunkMB         int           `json:"download_chunk_mb"`
 	DownloadBufferMB        int           `json:"download_buffer_mb"`
 	BufferPauseSeconds      int           `json:"buffer_pause_seconds"`
@@ -70,6 +71,7 @@ func (t Transcode) MarshalJSON() ([]byte, error) {
 		HardwareDevice          string `json:"hardware_device"`
 		MaxSessions             int    `json:"max_sessions"`
 		DownloadWorkers         int    `json:"download_workers"`
+		DownloadMode            string `json:"download_mode"`
 		DownloadChunkMB         int    `json:"download_chunk_mb"`
 		DownloadBufferMB        int    `json:"download_buffer_mb"`
 		BufferPauseSeconds      int    `json:"buffer_pause_seconds"`
@@ -85,6 +87,7 @@ func (t Transcode) MarshalJSON() ([]byte, error) {
 		HardwareDevice:          t.HardwareDevice,
 		MaxSessions:             t.MaxSessions,
 		DownloadWorkers:         t.DownloadWorkers,
+		DownloadMode:            t.DownloadMode,
 		DownloadChunkMB:         t.DownloadChunkMB,
 		DownloadBufferMB:        t.DownloadBufferMB,
 		BufferPauseSeconds:      t.BufferPauseSeconds,
@@ -155,6 +158,7 @@ func Default() Config {
 			HardwareDevice:          "/dev/dri/renderD128",
 			MaxSessions:             2,
 			DownloadWorkers:         1,
+			DownloadMode:            "parallel",
 			DownloadChunkMB:         8,
 			DownloadBufferMB:        64,
 			BufferPauseSeconds:      300,
@@ -257,6 +261,11 @@ func validateAndNormalize(cfg *Config) error {
 	if cfg.Upstream.URL == "" {
 		return errors.New("upstream.url is required")
 	}
+	switch cfg.Transcode.DownloadMode {
+	case "parallel", "failover":
+	default:
+		return fmt.Errorf("transcode.download_mode must be parallel or failover, got %q", cfg.Transcode.DownloadMode)
+	}
 	return nil
 }
 
@@ -303,6 +312,10 @@ func normalize(cfg *Config) {
 	}
 	if cfg.Transcode.DownloadWorkers > maxDownloadWorkers {
 		cfg.Transcode.DownloadWorkers = maxDownloadWorkers
+	}
+	cfg.Transcode.DownloadMode = strings.ToLower(strings.TrimSpace(cfg.Transcode.DownloadMode))
+	if cfg.Transcode.DownloadMode == "" {
+		cfg.Transcode.DownloadMode = "parallel"
 	}
 	if cfg.Transcode.DownloadChunkMB <= 0 {
 		cfg.Transcode.DownloadChunkMB = 8

@@ -38,6 +38,9 @@ func TestDefaultConfigIsUsable(t *testing.T) {
 			cfg.Transcode.DownloadBufferMB,
 		)
 	}
+	if cfg.Transcode.DownloadMode != "parallel" {
+		t.Fatalf("download mode = %q", cfg.Transcode.DownloadMode)
+	}
 	if cfg.Transcode.BufferPauseSeconds != 300 {
 		t.Fatalf("buffer pause seconds = %d", cfg.Transcode.BufferPauseSeconds)
 	}
@@ -147,6 +150,16 @@ func TestSaveAndParseConfig(t *testing.T) {
 	if !strings.Contains(string(data), `"hardware_acceleration": false`) ||
 		strings.Contains(string(data), `"hardware_decode"`) {
 		t.Fatalf("disabled hardware decode was not saved as a boolean: %s", data)
+	}
+}
+
+func TestParseRejectsInvalidDownloadMode(t *testing.T) {
+	_, err := config.Parse([]byte(`{
+		"upstream": {"urls": ["http://upstream.local"]},
+		"transcode": {"download_mode": "invalid"}
+	}`))
+	if err == nil {
+		t.Fatal("expected invalid download mode to fail")
 	}
 }
 

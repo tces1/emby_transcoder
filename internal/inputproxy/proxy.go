@@ -24,6 +24,9 @@ import (
 )
 
 const (
+	DownloadModeParallel = "parallel"
+	DownloadModeFailover = "failover"
+
 	defaultChunkSize   = 8 << 20
 	defaultBufferSize  = 64 << 20
 	maxWorkers         = 2
@@ -46,6 +49,7 @@ var (
 
 type Options struct {
 	Workers    int
+	Mode       string
 	ChunkSize  int64
 	BufferSize int64
 	Transport  http.RoundTripper
@@ -58,6 +62,7 @@ type Options struct {
 type Proxy struct {
 	client         *http.Client
 	workers        int
+	mode           string
 	chunkSize      int64
 	listener       net.Listener
 	server         *http.Server
@@ -93,21 +98,24 @@ type source struct {
 	unsupported bool
 	fallbackLog sync.Once
 
-	routeMu     sync.Mutex
-	failures    []int
-	hedgeLoss   map[string]int
-	routeChecks map[string]routeCheck
-	routeGates  map[string]chan struct{}
-	dedicated   atomic.Int32
+	routeMu       sync.Mutex
+	failures      []int
+	hedgeLoss     map[string]int
+	routeChecks   map[string]routeCheck
+	routeGates    map[string]chan struct{}
+	failoverFocus string
+	dedicated     atomic.Int32
 
 	cacheMu     sync.Mutex
 	cacheFile   *os.File
 	cachePath   string
 	cacheChunks map[int64]*cacheChunk
 
-	closed     atomic.Bool
-	expandDone chan struct{}
-	expandOnce sync.Once
+	closed         atomic.Bool
+	recovering     atomic.Bool
+	needsReplenish atomic.Bool
+	expandDone     chan struct{}
+	expandOnce     sync.Once
 }
 
 type WorkerSnapshot struct {
@@ -247,6 +255,13 @@ func New(options Options) (*Proxy, error) {
 	if workers > maxBufferedChunks {
 		workers = maxBufferedChunks
 	}
+	mode := strings.ToLower(strings.TrimSpace(options.Mode))
+	if mode == "" {
+		mode = DownloadModeParallel
+	}
+	if mode != DownloadModeParallel && mode != DownloadModeFailover {
+		return nil, fmt.Errorf("invalid download mode %q", options.Mode)
+	}
 	transport := options.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -274,6 +289,7 @@ func New(options Options) (*Proxy, error) {
 			CheckRedirect: safeRedirect,
 		},
 		workers:        workers,
+		mode:           mode,
 		chunkSize:      chunkSize,
 		listener:       listener,
 		baseURL:        "http://" + listener.Addr().String(),
@@ -371,6 +387,10 @@ func (p *Proxy) RouteSnapshots() []RouteSnapshot {
 
 	var snapshots []RouteSnapshot
 	for _, src := range sources {
+		focused := make(map[int]struct{})
+		for _, index := range p.streamRouteIndexes(src) {
+			focused[index] = struct{}{}
+		}
 		src.routeMu.Lock()
 		for _, candidate := range src.urls {
 			check := src.routeChecks[candidate]
@@ -401,6 +421,14 @@ func (p *Proxy) RouteSnapshots() []RouteSnapshot {
 				if snapshot.Failures >= 2 {
 					snapshot.State = "unhealthy"
 					snapshot.Reason = "consecutive_failures"
+				} else if p.mode == DownloadModeFailover {
+					if _, selected := focused[index]; !selected {
+						snapshot.State = "standby"
+						snapshot.Reason = "failover_standby"
+					} else {
+						snapshot.State = "active"
+						snapshot.Reason = "accepted"
+					}
 				} else {
 					snapshot.State = "active"
 					snapshot.Reason = "accepted"
@@ -989,7 +1017,15 @@ func (p *Proxy) expandRoutes(src *source, candidates []string, usedFinalHosts ma
 						routeHost(result.candidate),
 						result.meta.finalHost,
 					)
-				} else if p.adoptAdditionalRoute(ctx, src, result.candidate, result.meta) {
+				} else {
+					recoverIndex := -1
+					if index, recovering := src.failedRouteIndex(result.candidate); recovering {
+						recoverIndex = index
+					}
+					if !p.adoptRoute(ctx, src, result.candidate, result.meta, recoverIndex) {
+						launchMore()
+						continue
+					}
 					usedFinalHosts[finalKey] = struct{}{}
 					active := activeCount(src)
 					logging.Infof(
@@ -1008,14 +1044,27 @@ func (p *Proxy) expandRoutes(src *source, candidates []string, usedFinalHosts ma
 	}
 }
 
-func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate string, next metadata) bool {
+func (p *Proxy) adoptRoute(ctx context.Context, src *source, candidate string, next metadata, recoverIndex int) bool {
 	src.routeMu.Lock()
 	if len(src.active) == 0 {
 		src.routeMu.Unlock()
 		return false
 	}
-	firstURL := src.active[0]
+	firstURL := ""
+	firstFinalHost := ""
+	for index, candidate := range src.active {
+		if index >= len(src.failures) || src.failures[index] < 2 {
+			firstURL = candidate
+			if index < len(src.finalHosts) {
+				firstFinalHost = src.finalHosts[index]
+			}
+			break
+		}
+	}
 	src.routeMu.Unlock()
+	if firstURL == "" {
+		return false
+	}
 
 	src.metaMu.Lock()
 	if src.meta == nil {
@@ -1024,9 +1073,12 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 	}
 	first := *src.meta
 	src.metaMu.Unlock()
+	if firstFinalHost != "" {
+		first.finalHost = firstFinalHost
+	}
 
 	if _, ok := mergeRepresentation(first, next); ok {
-		src.addRoute(candidate, next.finalHost)
+		src.acceptRoute(candidate, next.finalHost, recoverIndex)
 		src.recordRouteCheck(candidate, "active", next.finalHost, "validator_matched")
 		return true
 	}
@@ -1076,7 +1128,7 @@ func (p *Proxy) adoptAdditionalRoute(ctx context.Context, src *source, candidate
 		src.meta = &updated
 	}
 	src.metaMu.Unlock()
-	src.addRoute(candidate, next.finalHost)
+	src.acceptRoute(candidate, next.finalHost, recoverIndex)
 	src.recordRouteCheck(candidate, "active", next.finalHost, "fingerprint_matched")
 	return true
 }
@@ -1116,7 +1168,13 @@ func routeKey(finalHost, candidate string) string {
 func activeCount(src *source) int {
 	src.routeMu.Lock()
 	defer src.routeMu.Unlock()
-	return len(src.active)
+	count := 0
+	for index := range src.active {
+		if index >= len(src.failures) || src.failures[index] < 2 {
+			count++
+		}
+	}
+	return count
 }
 
 func strongETag(value string) bool {
@@ -1842,6 +1900,9 @@ func (p *Proxy) streamRouteIndexes(src *source) []int {
 		}
 		return healthy[:1]
 	}
+	if p.mode == DownloadModeFailover {
+		return []int{src.failoverRouteIndex()}
+	}
 	limit := p.routeLimit(src)
 	if limit > len(healthy) {
 		limit = len(healthy)
@@ -2006,6 +2067,43 @@ func (s *source) healthyRouteIndexes() []int {
 	return indexes
 }
 
+func (s *source) failoverRouteIndex() int {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	for index, candidate := range s.active {
+		if candidate == s.failoverFocus &&
+			(index >= len(s.failures) || s.failures[index] < 2) {
+			return index
+		}
+	}
+	for index, candidate := range s.active {
+		if index >= len(s.failures) || s.failures[index] < 2 {
+			s.failoverFocus = candidate
+			return index
+		}
+	}
+	return 0
+}
+
+func (s *source) setFailoverFocus(index int) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if index >= 0 && index < len(s.active) {
+		s.failoverFocus = s.active[index]
+	}
+}
+
+func (s *source) failedRouteIndex(candidate string) (int, bool) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	for index, active := range s.active {
+		if active == candidate && index < len(s.failures) && s.failures[index] >= 2 {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
 func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requested byteRange) ([]byte, error) {
 	if _, ok := src.routeURL(0); !ok {
 		return nil, errors.New("no active accelerated input route")
@@ -2020,6 +2118,12 @@ func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requ
 			data, err := p.fetchRangeFromURL(ctx, src, meta, rawURL, requested)
 			if err == nil {
 				src.recordRouteResult(index, true)
+				if p.mode == DownloadModeFailover {
+					src.setFailoverFocus(index)
+				}
+				if src.needsReplenish.Swap(false) {
+					p.replenishRoutePool(src)
+				}
 				return data, nil
 			}
 			lastErr = err
@@ -2027,6 +2131,8 @@ func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requ
 				return nil, err
 			}
 			src.recordRouteResult(index, false)
+			src.markRouteUnhealthy(index)
+			src.needsReplenish.Store(true)
 			logging.Infof(
 				"accelerated input chunk route=%s range=%d-%d attempt=%d result=error detail=%q",
 				routeHost(rawURL),
@@ -2046,6 +2152,9 @@ func (p *Proxy) fetchRange(ctx context.Context, src *source, meta metadata, requ
 }
 
 func (p *Proxy) routeAttempts(src *source, preferred int) []int {
+	if p.mode == DownloadModeFailover && src.dedicated.Load() < 0 {
+		preferred = src.failoverRouteIndex()
+	}
 	assignments := p.routeAssignments()
 	src.routeMu.Lock()
 	defer src.routeMu.Unlock()
@@ -2117,11 +2226,25 @@ func (s *source) replaceRoutes(active, finalHosts []string) {
 	s.active = append([]string{}, active...)
 	s.finalHosts = append([]string{}, finalHosts...)
 	s.failures = make([]int, len(active))
+	if len(active) > 0 {
+		s.failoverFocus = active[0]
+	}
 }
 
-func (s *source) addRoute(rawURL, finalHost string) {
+func (s *source) acceptRoute(rawURL, finalHost string, recoverIndex int) {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
+	if recoverIndex >= 0 &&
+		recoverIndex < len(s.active) &&
+		s.active[recoverIndex] == rawURL {
+		if recoverIndex < len(s.finalHosts) {
+			s.finalHosts[recoverIndex] = finalHost
+		}
+		if recoverIndex < len(s.failures) {
+			s.failures[recoverIndex] = 0
+		}
+		return
+	}
 	s.active = append(append([]string{}, s.active...), rawURL)
 	s.finalHosts = append(append([]string{}, s.finalHosts...), finalHost)
 	s.failures = append(append([]int{}, s.failures...), 0)
@@ -2171,6 +2294,70 @@ func (s *source) recordRouteResult(index int, success bool) {
 		return
 	}
 	s.failures[index]++
+}
+
+func (s *source) markRouteUnhealthy(index int) {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if index < 0 || index >= len(s.failures) {
+		return
+	}
+	if s.failures[index] < 2 {
+		s.failures[index] = 2
+	}
+}
+
+func (p *Proxy) replenishRoutePool(src *source) {
+	if src == nil ||
+		src.closed.Load() ||
+		!src.recovering.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer src.recovering.Store(false)
+		src.routeMu.Lock()
+		active := append([]string(nil), src.active...)
+		finalHosts := append([]string(nil), src.finalHosts...)
+		candidates := append([]string(nil), src.urls...)
+		failures := append([]int(nil), src.failures...)
+		src.routeMu.Unlock()
+
+		healthy := make(map[string]struct{}, len(active))
+		for index, candidate := range active {
+			if index >= len(failures) || failures[index] < 2 {
+				healthy[candidate] = struct{}{}
+			}
+		}
+		remaining := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			if _, inUse := healthy[candidate]; !inUse {
+				remaining = append(remaining, candidate)
+			}
+		}
+		if len(remaining) == 0 {
+			return
+		}
+		usedFinalHosts := make(map[string]struct{}, len(active))
+		for index, candidate := range active {
+			if index < len(failures) && failures[index] >= 2 {
+				continue
+			}
+			finalHost := ""
+			if index < len(finalHosts) {
+				finalHost = finalHosts[index]
+			}
+			if key := routeKey(finalHost, candidate); key != "" {
+				usedFinalHosts[key] = struct{}{}
+			}
+		}
+		logging.Infof(
+			"accelerated input route replenish source=%s mode=%s candidates=%d",
+			sourceLabel(src.rawURL),
+			p.mode,
+			len(remaining),
+		)
+		p.expandRoutes(src, remaining, usedFinalHosts, p.workers, len(candidates))
+	}()
 }
 
 func (s *source) recordRouteCheck(rawURL, state, final, reason string) {

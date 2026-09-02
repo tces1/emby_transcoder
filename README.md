@@ -139,6 +139,7 @@ go build ./cmd/emby-transcoder
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
+    "download_mode": "parallel",
     "download_chunk_mb": 8,
     "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,
@@ -160,6 +161,8 @@ VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接
 
 `download_workers` 控制 FFmpeg 输入侧的全局并发 Range 下载数。默认值 `1` 表示关闭加速并让 FFmpeg 直接访问上游；设置为 `2` 可启用双路下载。为避免上游将额外连接计为多路播放，程序会硬性限制整个进程最多同时发出 `2` 个上游 Range 请求，即使配置了更大的值也不会突破。`download_chunk_mb` 是每个 Range 分块大小，`download_buffer_mb` 限制稀疏文件的前向预读窗口，推荐使用 `2 / 8 / 64`。分块通过 `WriteAt` 写入 `<temp_dir>/input-cache/` 下的正确偏移，FFmpeg 经本地可 Seek HTTP 读取；会话结束后缓存自动删除。第一条可用线路确认 Range 和文件大小后立刻开始给 FFmpeg 送数据；第二条不同最终域的线路在后台继续探测。没有 ETag/Last-Modified 时，才会再对文件头、中间和末尾各 64 KiB 抽样做 SHA-256 指纹，用来对齐第二条线。不支持字节范围或内容不一致时才回退到普通转发。
 
+`download_mode` 默认为 `"parallel"`，两个 Worker 固定使用不同的可用 URL 并行下载；设为 `"failover"` 时只使用主线路，另一条已验证线路保持待命。两种模式都会在真实下载失败后从 `urls[0]` 重新循环探测和补位；已恢复的旧线路可再次加入，但正常取消不会触发切换。
+
 多个线路入口写入 `upstream.urls`。第一个入口是 API 主线路；GET、HEAD、OPTIONS 等可安全重试的请求发生连接错误或返回 502/503/504 时，服务会切换并记住可用的备用入口。POST 等非幂等请求不会自动重放，避免同一操作执行两次。旧的单值 `upstream.url` 格式仍然兼容。
 
 数组顺序同时表示媒体线路优先级。只有一个转码会话时，优先使用前两条健康线路并发下载，其余线路待命；有两个转码会话时，先启动的会话固定使用第一条健康线路，第二个会话使用第二条。任一会话结束后，剩余会话自动恢复双线路模式。线路连续失败后会按数组顺序切换到下一条，但全局上游连接数始终不超过 `2`。
@@ -174,7 +177,8 @@ VAAPI 默认使用硬件解码和 `h264_vaapi` 编码；4K HEVC Main 8 会直接
   ]
 },
 "transcode": {
-  "download_workers": 2
+  "download_workers": 2,
+  "download_mode": "parallel"
 }
 ```
 

@@ -18,6 +18,7 @@
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
+    "download_mode": "parallel",
     "download_chunk_mb": 8,
     "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,

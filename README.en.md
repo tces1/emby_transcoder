@@ -137,6 +137,7 @@ Copy `config.example.json` and change the upstream URL:
     "hardware_device": "/dev/dri/renderD128",
     "max_sessions": 2,
     "download_workers": 1,
+    "download_mode": "parallel",
     "download_chunk_mb": 8,
     "download_buffer_mb": 64,
     "buffer_pause_seconds": 300,
@@ -155,6 +156,8 @@ VAAPI normally uses hardware decode plus `h264_vaapi`. 4K HEVC Main 8 selects so
 
 `download_workers` controls global concurrent HTTP Range downloads for FFmpeg input. The default `1` disables acceleration and lets FFmpeg access the upstream directly; set it to `2` to enable dual-stream downloading. To avoid having extra connections counted as additional playback streams, the process enforces a hard global limit of `2` upstream Range requests even when a larger value is configured. `download_chunk_mb` sets each range size and `download_buffer_mb` bounds sparse-file read-ahead; `2 / 8 / 64` is the recommended starting point. Chunks are written with `WriteAt` to their correct offsets under `<temp_dir>/input-cache/`, exposed to FFmpeg through seekable loopback HTTP, and deleted when the session ends. The first usable route starts feeding FFmpeg as soon as Range support and file size are confirmed; a second distinct final host is probed in the background. When ETag/Last-Modified is absent, 64 KiB samples from the head, middle, and tail are hashed only to align that second route. Normal forwarding is used only when byte ranges are unavailable or content differs.
 
+`download_mode` defaults to `"parallel"`, where two focused workers use distinct usable URLs concurrently. Set it to `"failover"` to keep one validated route on standby. Both modes restart route probing at `urls[0]` after a real download failure so recovered routes can rejoin the pool; normal cancellations do not trigger failover.
+
 When the same upstream has multiple entrances, configure them directly in `upstream.urls`. The first is the primary API route. For safely retryable GET, HEAD, and OPTIONS requests, a connection error or 502/503/504 response switches the service to a working backup route. Non-idempotent requests such as POST are not replayed, preventing duplicate operations. The legacy single-value `upstream.url` remains supported.
 
 Array order is also media-route priority. With one transcode session, the first two healthy routes download concurrently while later routes remain on standby. With two sessions, the earlier session is pinned to the first healthy route and the second session to the next one. When either session ends, the remaining session automatically returns to dual-route mode. Repeated route failures advance to the next configured route, while global upstream concurrency always remains capped at `2`.
@@ -169,7 +172,8 @@ With dual downloading enabled, the project preserves the real `DirectStreamUrl` 
   ]
 },
 "transcode": {
-  "download_workers": 2
+  "download_workers": 2,
+  "download_mode": "parallel"
 }
 ```
 

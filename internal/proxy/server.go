@@ -66,6 +66,7 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 		}
 		acceleratedInput, err = inputproxy.New(inputproxy.Options{
 			Workers:    cfg.Transcode.DownloadWorkers,
+			Mode:       cfg.Transcode.DownloadMode,
 			ChunkSize:  int64(cfg.Transcode.DownloadChunkMB) << 20,
 			BufferSize: int64(cfg.Transcode.DownloadBufferMB) << 20,
 			Transport:  transport,
@@ -76,8 +77,9 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) (*Server, 
 			return nil, err
 		}
 		logging.Infof(
-			"accelerated input configured workers=%d chunk_mb=%d buffer_mb=%d routes=%d",
+			"accelerated input configured workers=%d mode=%s chunk_mb=%d buffer_mb=%d routes=%d",
 			acceleratedInput.Workers(),
+			cfg.Transcode.DownloadMode,
 			cfg.Transcode.DownloadChunkMB,
 			cfg.Transcode.DownloadBufferMB,
 			len(downloadOrigins),

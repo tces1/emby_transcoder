@@ -32,6 +32,8 @@ Edit `config/config.json` before startup, or copy it to `config/config.local.jso
 - software and VAAPI compatibility pipelines cap output at 1920x1080 while preserving aspect ratio
 - `transcode.segment_seconds` controls HLS segment duration; default `2` balances startup latency with segment count
 - set `transcode.download_workers` to `2` to assemble dual HTTP Range downloads in a sparse file with `8` MB chunks and `64` MB read-ahead; the process hard-limits upstream concurrency to `2`
+- set `transcode.download_mode` to `parallel` for two focused active routes or `failover` for one active route plus a validated standby
+- both download modes replenish failed routes by probing again from the beginning of `upstream.urls`
 - with two `upstream.urls`, media workers preserve the PlaybackInfo `DirectStreamUrl`, alternate requests through both entrances, and follow each entrance's redirect to its actual media host
 - `upstream.urls` order is route priority: one session uses the first two healthy routes, while two sessions are pinned one route each; later entries are failover routes
 - media download starts as soon as the first usable route confirms Range support; a second distinct final host is probed in the background

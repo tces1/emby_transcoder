@@ -268,6 +268,206 @@ func TestProxyUsesSampleFingerprintWhenValidatorsAreMissing(t *testing.T) {
 	}
 }
 
+func TestFailoverModeUsesOneRouteUntilItBecomesUnhealthy(t *testing.T) {
+	data := bytes.Repeat([]byte("failover-mode"), 16*1024)
+	var primaryChunks atomic.Int32
+	var primaryProbes atomic.Int32
+	var standbyChunks atomic.Int32
+	var replacementProbes atomic.Int32
+	var replacementReady atomic.Bool
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if !isProbeRequest(r) {
+			primaryChunks.Add(1)
+			http.Error(w, "primary failed", http.StatusServiceUnavailable)
+			return
+		}
+		primaryProbes.Add(1)
+		writeRange(w, data, start, end)
+	}))
+	defer primary.Close()
+	standby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			time.Sleep(25 * time.Millisecond)
+		} else {
+			standbyChunks.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer standby.Close()
+	replacement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		if !replacementReady.Load() {
+			http.Error(w, "replacement not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			replacementProbes.Add(1)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer replacement.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		Mode:       DownloadModeFailover,
+		ChunkSize:  16 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{primary.URL, standby.URL, replacement.URL},
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+	var activeRoutes, standbyRoutes int
+	for _, snapshot := range proxy.RouteSnapshots() {
+		switch snapshot.State {
+		case "active":
+			activeRoutes++
+		case "standby":
+			standbyRoutes++
+		}
+	}
+	if activeRoutes != 1 || standbyRoutes != 1 {
+		t.Fatalf("failover route states active=%d standby=%d", activeRoutes, standbyRoutes)
+	}
+	replacementReady.Store(true)
+
+	resp, err := http.Get(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(body, data) {
+		t.Fatalf("failover body differs: got=%d want=%d", len(body), len(data))
+	}
+	if primaryChunks.Load() != 1 {
+		t.Fatalf("primary failures = %d, want immediate failover", primaryChunks.Load())
+	}
+	if standbyChunks.Load() == 0 {
+		t.Fatal("standby route was not activated after primary became unhealthy")
+	}
+	deadline := time.Now().Add(time.Second)
+	for primaryProbes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if primaryProbes.Load() < 2 {
+		t.Fatal("standby replenishment did not restart probing from the first URL")
+	}
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		activeRoutes, standbyRoutes = 0, 0
+		for _, snapshot := range proxy.RouteSnapshots() {
+			switch snapshot.State {
+			case "active":
+				activeRoutes++
+			case "standby":
+				standbyRoutes++
+			}
+		}
+		if activeRoutes == 1 && standbyRoutes == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("replacement route did not become standby: %+v", proxy.RouteSnapshots())
+}
+
+func TestParallelModeReplenishesFailedFocusedRoute(t *testing.T) {
+	data := bytes.Repeat([]byte("parallel-replenish"), 2048)
+	var primaryProbes atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			primaryProbes.Add(1)
+			writeRange(w, data, start, end)
+			return
+		}
+		http.Error(w, "temporary primary failure", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := requestedBounds(t, r.Header.Get("Range"), int64(len(data)))
+		w.Header().Set("ETag", `"same-media"`)
+		if isProbeRequest(r) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		writeRange(w, data, start, end)
+	}))
+	defer backup.Close()
+
+	proxy, err := New(Options{
+		Workers:    2,
+		Mode:       DownloadModeParallel,
+		ChunkSize:  16 << 10,
+		BufferSize: 64 << 10,
+		Origins:    []string{primary.URL, backup.URL},
+		CacheDir:   t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProxy(t, proxy)
+	localURL, release, err := proxy.Register("https://original.invalid/video.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	probeRegisteredSource(t, proxy, localURL)
+
+	parsed, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	src := proxy.sources[strings.Trim(parsed.Path, "/")]
+	proxy.mu.RUnlock()
+	waitForRouteExpansion(t, src)
+	src.metaMu.Lock()
+	meta := *src.meta
+	src.metaMu.Unlock()
+
+	chunk, err := proxy.fetchRange(context.Background(), src, meta, byteRange{start: 0, end: 16383, urlIndex: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(chunk, data[:16384]) {
+		t.Fatal("parallel fallback returned different data")
+	}
+	deadline := time.Now().Add(time.Second)
+	for primaryProbes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if primaryProbes.Load() < 2 {
+		t.Fatal("parallel mode did not restart replenishment from the first URL")
+	}
+}
+
 func TestProxyServesAfterFirstRouteBeforeSecondProbeCompletes(t *testing.T) {
 	data := bytes.Repeat([]byte("first-route-first"), 32*1024)
 	releaseSecond := make(chan struct{})
