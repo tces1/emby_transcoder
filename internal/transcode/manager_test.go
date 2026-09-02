@@ -952,7 +952,7 @@ func TestHandlerStartsTranscodeBeforeServingGrowingPlaylist(t *testing.T) {
 	if time.Since(started) < 20*time.Millisecond {
 		t.Fatal("playlist returned before the first segment was ready")
 	}
-	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:EVENT") {
+	if !strings.Contains(rec.Body.String(), "#EXT-X-PLAYLIST-TYPE:VOD") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "segment_00000.ts") {
@@ -1024,7 +1024,7 @@ func TestHandlerVirtualPlaylistSeekDoesNotRestartOnSegmentAndReload(t *testing.T
 	if playlistRec.Code != http.StatusOK {
 		t.Fatalf("playlist status = %d body=%s", playlistRec.Code, playlistRec.Body.String())
 	}
-	if !strings.Contains(playlistRec.Body.String(), "#EXT-X-MEDIA-SEQUENCE:320") ||
+	if !strings.Contains(playlistRec.Body.String(), "#EXT-X-MEDIA-SEQUENCE:0") ||
 		!strings.Contains(playlistRec.Body.String(), "segment_00320.ts") {
 		t.Fatalf("seek playlist = %s", playlistRec.Body.String())
 	}

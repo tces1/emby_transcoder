@@ -25,37 +25,39 @@ func TestGrowingMediaPlaylistAdvertisesNoSegmentBeforeFirstIsReady(t *testing.T)
 	}
 }
 
-func TestGrowingMediaPlaylistIncludesReadySegmentsAndOneLookahead(t *testing.T) {
+func TestGrowingMediaPlaylistPublishesSeekableVODAfterFirstSegment(t *testing.T) {
 	playlist, ok := GrowingMediaPlaylist(MediaInfo{RunTimeTicks: 10_500_0000}, defaultSegmentTicks, "X-Emby-Token=abc", 0, 2)
 	if !ok {
 		t.Fatal("expected growing playlist")
 	}
-	for _, segment := range []string{"segment_00000.ts", "segment_00001.ts", "segment_00002.ts"} {
+	for _, segment := range []string{"segment_00000.ts", "segment_00001.ts", "segment_00005.ts"} {
 		if !strings.Contains(playlist, segment) {
 			t.Fatalf("missing %s: %s", segment, playlist)
 		}
 	}
-	if strings.Contains(playlist, "segment_00003.ts") || strings.Contains(playlist, "#EXT-X-ENDLIST") {
-		t.Fatalf("playlist advertised beyond lookahead: %s", playlist)
+	if !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") ||
+		!strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("playlist is not seekable VOD: %s", playlist)
 	}
 }
 
-func TestGrowingMediaPlaylistSeekStartsAtRequestedWindow(t *testing.T) {
+func TestGrowingMediaPlaylistKeepsFullTimelineForSeek(t *testing.T) {
 	playlist, ok := GrowingMediaPlaylist(MediaInfo{RunTimeTicks: 3600 * timeSecondTicks}, defaultSegmentTicks, "StartTimeTicks=6418677540", 320, 1)
 	if !ok {
 		t.Fatal("expected growing playlist")
 	}
-	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:320") ||
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:0") ||
 		!strings.Contains(playlist, "segment_00320.ts") {
-		t.Fatalf("seek playlist is not aligned: %s", playlist)
+		t.Fatalf("seek playlist is missing the requested segment: %s", playlist)
 	}
-	if strings.Contains(playlist, "segment_00000.ts") || strings.Contains(playlist, "#EXT-X-START") {
-		t.Fatalf("seek playlist referenced the title beginning: %s", playlist)
+	if !strings.Contains(playlist, "segment_00000.ts") ||
+		!strings.Contains(playlist, "#EXT-X-START:TIME-OFFSET=641.868") {
+		t.Fatalf("seek playlist is missing the full timeline or start offset: %s", playlist)
 	}
 }
 
-func TestGrowingMediaPlaylistEndsOnlyWhenAllSegmentsAreReady(t *testing.T) {
-	playlist, ok := GrowingMediaPlaylist(MediaInfo{RunTimeTicks: 5 * timeSecondTicks}, 2*timeSecondTicks, "", 0, 3)
+func TestGrowingMediaPlaylistEndsAfterFirstSegmentIsReady(t *testing.T) {
+	playlist, ok := GrowingMediaPlaylist(MediaInfo{RunTimeTicks: 5 * timeSecondTicks}, 2*timeSecondTicks, "", 0, 1)
 	if !ok {
 		t.Fatal("expected growing playlist")
 	}

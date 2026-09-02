@@ -125,6 +125,8 @@ type WorkerSnapshot struct {
 	GenerationID uint64  `json:"generation_id,omitempty"`
 	VideoName    string  `json:"video_name,omitempty"`
 	Route        string  `json:"route,omitempty"`
+	BoundEntry   string  `json:"bound_entry,omitempty"`
+	BoundFinal   string  `json:"bound_final,omitempty"`
 	ByteRange    string  `json:"byte_range,omitempty"`
 	DownloadBPS  float64 `json:"download_bps"`
 	TotalBytes   int64   `json:"total_bytes"`
@@ -315,6 +317,7 @@ func (p *Proxy) Workers() int {
 }
 
 func (p *Proxy) Snapshot() []WorkerSnapshot {
+	bindings := p.workerBindings()
 	p.metricsMu.Lock()
 	defer p.metricsMu.Unlock()
 	now := time.Now()
@@ -342,6 +345,8 @@ func (p *Proxy) Snapshot() []WorkerSnapshot {
 			GenerationID: metric.generationID,
 			VideoName:    metric.videoName,
 			Route:        metric.route,
+			BoundEntry:   bindings[index].entry,
+			BoundFinal:   bindings[index].final,
 			ByteRange:    metric.byteRange,
 			DownloadBPS:  speed,
 			TotalBytes:   metric.totalBytes,
@@ -349,6 +354,41 @@ func (p *Proxy) Snapshot() []WorkerSnapshot {
 		}
 	}
 	return snapshots
+}
+
+type workerBinding struct {
+	entry string
+	final string
+}
+
+func (p *Proxy) workerBindings() map[int]workerBinding {
+	p.mu.RLock()
+	sources := make([]*source, 0, len(p.sources))
+	for _, src := range p.sources {
+		sources = append(sources, src)
+	}
+	p.mu.RUnlock()
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].order < sources[j].order
+	})
+
+	bindings := make(map[int]workerBinding, p.workers)
+	for _, src := range sources {
+		routes := p.streamRouteIndexes(src)
+		src.routeMu.Lock()
+		for lane, routeIndex := range routes {
+			if routeIndex < 0 || routeIndex >= len(src.active) {
+				continue
+			}
+			binding := workerBinding{entry: routeHost(src.active[routeIndex])}
+			if routeIndex < len(src.finalHosts) {
+				binding.final = src.finalHosts[routeIndex]
+			}
+			bindings[p.workerMetricIndex(src, lane)] = binding
+		}
+		src.routeMu.Unlock()
+	}
+	return bindings
 }
 
 func (p *Proxy) SessionRoutes() map[string][]string {

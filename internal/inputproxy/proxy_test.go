@@ -1007,6 +1007,16 @@ func TestRouteSnapshotsExplainCandidateDecisions(t *testing.T) {
 			t.Fatalf("route snapshot = %+v", snapshot)
 		}
 	}
+	bound := make(map[string]struct{})
+	for _, worker := range proxy.Snapshot() {
+		if worker.BoundEntry == "" || worker.BoundFinal == "" {
+			t.Fatalf("worker binding = %+v", worker)
+		}
+		bound[worker.BoundEntry] = struct{}{}
+	}
+	if len(bound) != 2 {
+		t.Fatalf("workers are not bound to distinct entries: %+v", proxy.Snapshot())
+	}
 }
 
 func TestMergeAndDownsampleCacheRanges(t *testing.T) {
