@@ -11,16 +11,31 @@
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#configuration)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Emby-Transcoder is a lightweight Go reverse proxy that adds local FFmpeg HLS transcoding fallback for Emby and Jellyfin clients.
+Emby-Transcoder does exactly two things: it uses the playback routes your Emby provider already gives you to download one movie over several connections at once, and it uses the GPU in your NAS to decode and encode.
 
-It is intentionally narrow: normal API traffic is forwarded to the upstream server, while selected clients can receive a proxy-provided HLS `TranscodingUrl` when they request `PlaybackInfo`.
+**One: stack playback routes to speed up the download.** Providers usually hand out capacity as "concurrent streams". Watching one title normally uses a single route, so you only get that one route's bandwidth. This program uses two routes at the same time, issuing HTTP Range requests for different byte ranges of the same file, assembling them into a local file, and feeding that to FFmpeg. The two routes' bandwidth adds up, which makes startup and seeking steadier. So the provider does not count the extra connections as multiple playbacks, the global upstream connection count is hard-capped at 2 no matter what the config says.
+
+**Two: encode and decode on the NAS GPU.** Transcoding runs on your own machine through VAAPI on `/dev/dri`, meaning Intel integrated graphics or an AMD GPU. The CPU only moves bytes around instead of software-decoding 4K. With no usable GPU, or if you would rather not use one, set `transcode.hardware_acceleration` to `false` and everything runs on the CPU.
+
+Beyond that it is a plain transparent reverse proxy: ordinary API traffic is forwarded to upstream Emby / Jellyfin untouched, and only clients matching your config rules get a proxy-provided HLS `TranscodingUrl` back from `PlaybackInfo`.
+
+Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
+
+## Check These First
+
+- Your provider must give you two or more usable entry domains. With a single route there is nothing to accelerate and the proxy falls back to plain forwarding.
+- Upstream must support HTTP Range requests, otherwise it also falls back to plain forwarding.
+- GPU acceleration needs a Linux amd64 host with a working `/dev/dri` device and VAAPI drivers.
+- This will not make your provider faster. It only puts the routes and the GPU you already have to work.
 
 ## How It Works
 
 ![Emby-Transcoder dual-route download and single FFmpeg VAAPI pipeline](docs/images/transcode-pipeline.svg)
 
-## Current Scope
+## What It Actually Does
 
+- Dual-route HTTP Range downloads, assembling chunks by offset in a local sparse cache that FFmpeg reads through seekable loopback HTTP.
+- VAAPI hardware decode and encode, preferring the full hardware pipeline when supported and falling back to CPU transcoding otherwise.
 - Native Linux-friendly Go binary.
 - Transparent reverse proxy for ordinary Emby/Jellyfin requests.
 - Client profile matching by `User-Agent`, `X-Emby-Authorization`, and `X-MediaBrowser-Token`.
@@ -29,12 +44,9 @@ It is intentionally narrow: normal API traffic is forwarded to the upstream serv
 - Audio track selection through Emby `AudioStreamIndex`, with local transcode restart on audio changes.
 - Playback lifecycle tracking through Emby `/Sessions/Playing*` check-ins plus HLS access.
 - Conservative output target: H.264 video, AAC audio, HLS MPEG-TS segments.
-- Software and VAAPI compatibility pipelines cap video at 1920x1080, while the full VAAPI path is preferred when supported.
+- Software and VAAPI compatibility pipelines cap video at 1920x1080.
 - Transcoding starts only when the client requests an HLS playlist or segment, so browsing details does not pre-download media.
 - FFmpeg uses low-latency startup and GOP settings to cut first-segment delay.
-- Optional dual-route HTTP Range workers assemble chunks by offset in a local sparse cache that FFmpeg reads through seekable loopback HTTP.
-
-Not included: virtual libraries, RSS, cover generation, scraping, database storage, or a management UI.
 
 ## Run
 

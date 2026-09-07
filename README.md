@@ -11,16 +11,31 @@
 [![VAAPI](https://img.shields.io/badge/hardware-VAAPI-green)](#配置)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客户端补充本地 FFmpeg HLS 转码能力。
+Emby-Transcoder 能做的事情就两件：用 Emby 服务商给你的播放线路，多条一起下同一部片子；再用 NAS 上的显卡做解码和编码。
 
-它的目标很窄：普通 API 请求继续透明转发到上游服务；命中配置规则的客户端请求 `PlaybackInfo` 时，会收到由代理提供的 HLS `TranscodingUrl`。
+**一、把多条播放线路凑起来加速下载。** 服务商通常按“同时播放数”给你线路。平时看一部片子只占一条，速度也就是那一条线的速度。这个程序会同时用两条线路，对同一个文件的不同字节区间发 HTTP Range 请求，下到本地拼成完整文件，再喂给 FFmpeg。两条线的带宽叠在一起，起播和拖动会稳一些。为了不让服务商把这些额外连接算成多路播放，全局上游连接数被硬性限制为 2，配置里写更大的值也不会突破。
+
+**二、用 NAS 的显卡做编解码。** 转码跑在你自己的机器上，走 `/dev/dri` 的 VAAPI，也就是 Intel 核显或 AMD 显卡。CPU 只负责搬数据，不用去软解 4K。没有可用显卡，或者不想开，把 `transcode.hardware_acceleration` 关掉就是纯 CPU 软转码。
+
+除此之外它就是个透明反向代理：普通 API 请求原样转发给上游 Emby / Jellyfin；只有命中配置规则的客户端在请求 `PlaybackInfo` 时，才会拿到由本程序提供的 HLS `TranscodingUrl`。
+
+它不做这些：虚拟媒体库、RSS、封面生成、刮削、数据库存储、媒体管理界面。
+
+## 先确认这几件事
+
+- 服务商得给你至少 2 个可用入口域名。只有一条线时没有加速可言，程序会退回普通转发。
+- 上游必须支持 HTTP Range 请求，否则同上，退回普通转发。
+- 显卡加速需要 Linux amd64 主机、可用的 `/dev/dri` 设备和 VAAPI 驱动。
+- 它不会让你的服务商变快，只是把你本来就能用的线路和你本来就有的显卡用上。
 
 ## 工作方式
 
 ![Emby-Transcoder 双线路下载与单 FFmpeg VAAPI 转码管线](docs/images/transcode-pipeline.svg)
 
-## 当前功能
+## 具体做了什么
 
+- 双线路 HTTP Range 下载，分块按偏移写入本地稀疏缓存，再通过可 Seek 的本地 HTTP 喂给 FFmpeg。
+- VAAPI 硬件解码和编码，可用时优先走完整硬件管线；不可用时退回 CPU 软转码。
 - 原生 Go 二进制，适合 Linux 部署。
 - 普通 Emby/Jellyfin 请求透明反向代理。
 - 按 `User-Agent`、`X-Emby-Authorization` 和 `X-MediaBrowser-Token` 匹配客户端配置。
@@ -29,12 +44,9 @@ Emby-Transcoder 是一个轻量级 Go 反向代理，为 Emby 和 Jellyfin 客�
 - 支持通过 Emby `AudioStreamIndex` 选择音轨，切换音轨时会重启本地转码。
 - 通过 Emby `/Sessions/Playing*` check-in 和 HLS 访问跟踪播放生命周期。
 - 输出目标保守固定为 H.264 视频、AAC 音频、HLS MPEG-TS 分片。
-- 软件转码和 VAAPI 兼容管线会把视频限制到 1920x1080；可用时优先使用完整 VAAPI 管线。
+- 软件转码和 VAAPI 兼容管线会把视频限制到 1920x1080。
 - 仅在客户端请求 HLS playlist 或分片时启动转码，浏览详情页不会预下载。
 - FFmpeg 使用低延迟启动和 GOP 参数，降低首分片延迟。
-- 可选用双线路 HTTP Range 下载，将分块按偏移写入本地稀疏缓存，再通过可 Seek 的本地 HTTP 输入 FFmpeg。
-
-不包含：虚拟媒体库、RSS、封面生成、刮削、数据库存储或管理 UI。
 
 ## 直接运行
 
